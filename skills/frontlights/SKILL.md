@@ -73,6 +73,20 @@ in the CLI: this stage never calls `AskUserQuestion`.
   claude rc
   ```
 
+In the same stage, run the read-only `python
+"${CLAUDE_PLUGIN_ROOT}/scripts/frontlights.py" update-check`. Still ask nothing:
+
+- **`update_available`:** say in one line, in Portuguese, that version
+  `<published>` is out and this session runs `<installed>`; show each entry of
+  `commands` in its own code block; add that the Desktop must be restarted and
+  `/frontlights` run again for the new version to apply; then go on in this
+  session.
+- **`current`:** say nothing about it.
+- **`unavailable`:** say in one line that the update could not be checked, and
+  go on.
+
+Never run the update commands yourself unless the user asks.
+
 A candidate proves a process, never a connected phone. Record in the handoff and
 in the authorization's `monitoring` block, when one exists, with the session
 identity and the time:

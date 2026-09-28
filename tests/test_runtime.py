@@ -681,5 +681,67 @@ class MonitoringTests(unittest.TestCase):
                         frontlights.authorize(bad, operation)
 
 
+class UpdateCheckTests(unittest.TestCase):
+    """Warn about a newer published version without relying on the stale local clone."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.plugin_root = Path(self.tmp.name, 'plugin')
+        self.config_dir = Path(self.tmp.name, 'config')
+        Path(self.plugin_root, '.claude-plugin').mkdir(parents=True)
+        Path(self.config_dir, 'plugins').mkdir(parents=True)
+        self.write(self.plugin_root / '.claude-plugin' / 'plugin.json', {'name': 'pilot', 'version': '0.7.2'})
+        self.write(self.plugin_root / '.claude-plugin' / 'marketplace.json', {'name': 'market', 'plugins': []})
+        self.known({'source': 'github', 'repo': 'OWNER/REPOSITORY'})
+
+    def write(self, path, data):
+        Path(path).write_text(json.dumps(data), encoding='utf-8')
+
+    def known(self, source):
+        self.write(self.config_dir / 'plugins' / 'known_marketplaces.json', {'market': {'source': source}})
+
+    def check(self, published=None, error=None):
+        body = json.dumps({'name': 'market', 'plugins': [{'name': 'pilot', 'version': published}]})
+        fake = patch.object(frontlights, 'fetch_text', side_effect=error, return_value=body)
+        with fake as fetch:
+            result = frontlights.update_check(self.plugin_root, self.config_dir)
+        return result, fetch
+
+    def test_newer_published_version_lists_both_commands(self):
+        result, fetch = self.check('0.10.0')
+        self.assertEqual(result['status'], 'update_available')
+        self.assertEqual(result['commands'], ['claude plugin marketplace update market',
+                                              'claude plugin update pilot@market'])
+        self.assertEqual(fetch.call_args[0][0], 'https://raw.githubusercontent.com/OWNER/REPOSITORY'
+                                                '/HEAD/.claude-plugin/marketplace.json')
+
+    def test_same_or_older_published_version_is_current(self):
+        for published in ('0.7.2', '0.7.1'):
+            with self.subTest(published=published):
+                result, _ = self.check(published)
+                self.assertEqual(result['status'], 'current')
+                self.assertNotIn('commands', result)
+
+    def test_git_url_source_resolves_to_the_same_repository(self):
+        self.known({'source': 'git', 'url': 'https://github.com/OWNER/REPOSITORY.git'})
+        result, fetch = self.check('0.8.0')
+        self.assertEqual(result['status'], 'update_available')
+        self.assertIn('/OWNER/REPOSITORY/', fetch.call_args[0][0])
+
+    def test_network_failure_or_unknown_source_is_unavailable_not_current(self):
+        result, _ = self.check(error=OSError('offline'))
+        self.assertEqual(result['status'], 'unavailable')
+        self.assertNotIn('offline', json.dumps(result))
+        self.known({'source': 'directory', 'path': 'somewhere'})
+        result, fetch = self.check('9.9.9')
+        self.assertEqual(result['status'], 'unavailable')
+        fetch.assert_not_called()
+
+    def test_non_numeric_version_is_never_compared(self):
+        result, _ = self.check('latest')
+        self.assertEqual(result['status'], 'unavailable')
+
+
 if __name__ == '__main__':
     unittest.main()

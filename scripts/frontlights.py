@@ -580,6 +580,72 @@ def monitoring(root, since=None):
     return result
 
 
+PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+
+
+def version_key(value):
+    """`1.2.3` as a comparable tuple; None for anything else, never a guess."""
+    if not isinstance(value, str) or not re.fullmatch(r'\d+(\.\d+)*', value.strip()):
+        return None
+    return tuple(int(part) for part in value.strip().split('.'))
+
+
+def marketplace_repo(source):
+    """owner/name of a GitHub-hosted marketplace source, or None."""
+    if not isinstance(source, dict):
+        return None
+    if source.get('source') == 'github' and repository(source.get('repo')):
+        return source['repo']
+    match = re.fullmatch(r'(?:https://|git@)github\.com[/:]([^/\s]+/[^/\s]+?)(?:\.git)?/?',
+                         str(source.get('url') or ''))
+    return match.group(1) if source.get('source') == 'git' and match else None
+
+
+def fetch_text(url):
+    with urllib.request.urlopen(urllib.request.Request(url), timeout=10) as response:
+        raw = response.read(1_000_001)
+    require(len(raw) <= 1_000_000, 'published manifest exceeds limit')
+    return raw.decode('utf-8-sig')
+
+
+def update_check(plugin_root=PLUGIN_ROOT, config_dir=None):
+    """Compare the running plugin's version with the one published on GitHub.
+
+    The desktop Update button compares against the local marketplace clone,
+    which a third-party marketplace refreshes only on demand, so the published
+    manifest is read from the source itself. Read only; it never updates.
+    """
+    plugin = load(Path(plugin_root) / '.claude-plugin' / 'plugin.json')
+    market_name = load(Path(plugin_root) / '.claude-plugin' / 'marketplace.json')['name']
+    result = {'checked_at': dt.datetime.now(dt.timezone.utc).isoformat(),
+              'plugin': plugin['name'], 'marketplace': market_name,
+              'installed': plugin.get('version'), 'published': None}
+    config_dir = Path(config_dir or os.environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude')
+    try:
+        known = load(config_dir / 'plugins' / 'known_marketplaces.json')
+        repo = marketplace_repo((known.get(market_name) or {}).get('source'))
+        require(repo, 'marketplace is not hosted on GitHub')
+        url = f'https://raw.githubusercontent.com/{repo}/HEAD/.claude-plugin/marketplace.json'
+        result['source'] = url
+        entry = next(p for p in json.loads(fetch_text(url))['plugins'] if p.get('name') == plugin['name'])
+        result['published'] = entry.get('version')
+    except (ValueError, OSError, KeyError, TypeError, StopIteration, AttributeError):
+        result['status'] = 'unavailable'
+        result['reason'] = 'published version could not be read; check the network and the marketplace source'
+        return result
+    installed, published = version_key(result['installed']), version_key(result['published'])
+    if installed is None or published is None:
+        result['status'] = 'unavailable'
+        result['reason'] = 'version is not numeric'
+    elif published > installed:
+        result['status'] = 'update_available'
+        result['commands'] = [f'claude plugin marketplace update {market_name}',
+                              f'claude plugin update {plugin["name"]}@{market_name}']
+    else:
+        result['status'] = 'current'
+    return result
+
+
 def load(path):
     return json.loads(Path(path).read_text(encoding='utf-8-sig'))
 
@@ -608,6 +674,7 @@ def main():
     p = sub.add_parser('monitoring')
     p.add_argument('--root', default='.')
     p.add_argument('--since', help='ISO 8601 session start; marks older hosts')
+    sub.add_parser('update-check')
     for name in ('checkpoint', 'resume'):
         p = sub.add_parser(name)
         p.add_argument('--root', required=True)
@@ -638,6 +705,8 @@ def main():
             result = git_evidence(args.root)
         elif args.command == 'monitoring':
             result = monitoring(args.root, args.since)
+        elif args.command == 'update-check':
+            result = update_check()
         elif args.command == 'checkpoint':
             result = checkpoint(args.root, load(args.issue), args.handoff, args.next_step)
         elif args.command == 'resume':

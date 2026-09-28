@@ -141,7 +141,9 @@ uma rota JSON de observações. Integrações ausentes são informadas explicita
 
 ## Fluxo de trabalho e utilitários
 
-Verificação do host do Remote Control (sem pergunta; orienta `claude rc` quando falta) →
+Verificação do host do Remote Control (sem pergunta; orienta `claude rc` quando falta)
+e de atualização do plugin (sem pergunta; mostra os dois comandos de atualização
+quando há versão nova no GitHub) →
 pedido e dimensionamento → inspeção → entrevista de decisões → PRD mostrado na
 íntegra e aprovado →
 plano de issues verticais aprovado e publicado → autorização delimitada de
@@ -161,6 +163,7 @@ python scripts/frontlights.py validate-plan --plan examples/plan.json
 python scripts/frontlights.py schedule --plan examples/plan.json --limit 2
 python scripts/frontlights.py context --used 85000 --reserve 15000
 python scripts/frontlights.py monitoring --root .
+python scripts/frontlights.py update-check
 python -m unittest discover -s tests -v
 python -m compileall -q scripts tests
 claude plugin validate . --json
