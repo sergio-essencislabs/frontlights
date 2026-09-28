@@ -48,6 +48,14 @@ When exploring the codebase, read `CONTEXT.md` (if it exists) so test names and
 interface vocabulary match the project's domain language, and respect ADRs in the
 area you're touching.
 
+Follow the conventions recorded in the issue's `## Approach and conventions` and
+in the discovery log: structure, naming, error handling, libraries and test
+style of the surrounding code. Break a convention only where that section names
+the approved break. Finding mid-work that the pattern is concretely worse, or
+that the approved approach does not fit, parks the issue and returns the
+question to the coordinator's `AskUserQuestion`; never switch approach or
+pattern silently.
+
 ### What a good test is
 
 Tests verify behavior through public interfaces, not implementation details. Code

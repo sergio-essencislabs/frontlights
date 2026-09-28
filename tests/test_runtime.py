@@ -38,6 +38,20 @@ class ReleaseManifestTests(unittest.TestCase):
         self.assertIn('Atualizar a sprint e o roadmap de acordo com o RoadS?', stage1)
         self.assertLess(stage1.index('roadmap_sync.py'), stage1.index('Then choose the lightest path'))
 
+    def test_grilling_always_proposes_approaches_that_respect_the_code_pattern(self):
+        skill = ROOT / 'skills' / 'frontlights'
+        grilling = (skill / 'references' / 'grilling.md').read_text(encoding='utf-8')
+        self.assertIn('at least three genuinely different approaches', grilling)
+        self.assertIn('never removes the solution round', grilling)
+        self.assertIn('The existing pattern is the default.', grilling)
+        self.assertIn('Never decide alone that the interview is over.', grilling)
+        self.assertLess(grilling.index('## 2. Project conventions'), grilling.index('## 3. Solution round'))
+        stage3 = (skill / 'SKILL.md').read_text(encoding='utf-8').split('## 3.')[1].split('## 4.')[0]
+        self.assertIn('never skips the solution round', stage3)
+        for template in ('discovery.md', 'issue.md', 'prd.md'):
+            with self.subTest(template=template):
+                self.assertIn('onventions', (ROOT / 'templates' / template).read_text(encoding='utf-8'))
+
     def test_example_config_carries_only_generic_placeholders(self):
         example = json.loads((ROOT / 'examples' / 'config.json').read_text(encoding='utf-8'))
         sync = example['roadmapSync']

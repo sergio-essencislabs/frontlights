@@ -183,6 +183,13 @@ plano de issues verticais aprovado e publicado → autorização delimitada de
 implementação → desenvolvimento orientado a testes (TDD), revisão e evidências.
 Uma issue vertical entrega um resultado observável de ponta a ponta, incluindo as
 camadas necessárias, em vez de separar tickets apenas por banco de dados, API ou tela.
+Na entrevista, depois de confirmar o problema (numa só pergunta quando a issue já
+o define), a skill levanta as convenções do código afetado e propõe ao menos três
+abordagens de implementação realmente diferentes. Cada uma informa se segue ou
+quebra o padrão do projeto e o custo disso. Em seguida, a skill percorre os ramos
+de decisão da abordagem escolhida, e é o usuário quem decide quando parar. O
+padrão existente é o preferido; ele só é quebrado quando for comprovadamente pior
+para o caso.
 Toda pergunta ao usuário usa `AskUserQuestion`, sempre com opções. A conversa
 segue no idioma do usuário. Nada é aprovado sem que o texto completo tenha
 sido mostrado antes. O GitHub é a fonte oficial;

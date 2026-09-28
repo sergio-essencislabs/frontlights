@@ -10,6 +10,12 @@ PRD: <approved revision/link>
 
 - [ ] <observable result>
 
+## Approach and conventions
+
+Chosen approach (rejected alternatives in the PRD or discovery log) and the
+project conventions to follow, with example paths. Any approved break of the
+pattern is named here with its reason.
+
 ## Seams under test
 
 - <public interface> — <acceptance behavior observed there>

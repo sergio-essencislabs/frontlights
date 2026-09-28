@@ -2,7 +2,8 @@
 
 Read the discovery log, repository instructions and relevant implementation.
 Use `templates/prd.md`; a trivial change may use one compact issue-ready brief.
-Include users, measurable outcome, current/proposed behavior, scope/non-scope,
+Include the chosen approach with its rejected alternatives and the project
+conventions it follows or deliberately breaks, users, measurable outcome, current/proposed behavior, scope/non-scope,
 observable acceptance criteria, constraints, dependencies, risks, rollout and
 rollback when applicable, open questions and evidence links. Mark inapplicable
 sections with a reason rather than inventing work.

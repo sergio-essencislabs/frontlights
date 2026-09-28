@@ -7,7 +7,7 @@ integer IDs are proposal IDs only; remap every dependency to real GitHub numbers
 after creation and verify links. Local status is always a timestamped snapshot.
 
 Each issue must have outcome, boundaries/non-goals, observable acceptance,
-seams under test, tests, dependency IDs, concrete ownership (or `*` when unknown), risks and a
+approach and conventions to follow, seams under test, tests, dependency IDs, concrete ownership (or `*` when unknown), risks and a
 session-sized end-to-end demonstration. Do not split by UI/API/database layers.
 For an observation editor, prefer "save one observation and see it after reload"
 with UI/API/storage/tests in one slice, then "edit with conflict feedback", then

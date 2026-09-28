@@ -137,11 +137,13 @@ for the usual kinds of work.
 Then choose the lightest path that still fits, and say which one you chose and
 why in one sentence:
 
-- **Direct.** A small, well-understood, low-risk change or a question you can
-  answer. Skip stages 3 to 5 entirely. Confirm the intent, do the work, report
+- **Direct.** A small, well-understood, low-risk change with a single obvious
+  implementation that follows the project's existing pattern, or a question you
+  can answer. If two or more reasonable implementations exist, it is not Direct. Skip stages 3 to 5 entirely. Confirm the intent, do the work, report
   what you measured. Do not manufacture a PRD or an issue for it.
 - **Short.** A bounded piece of work whose shape is clear but whose details are
-  not. Grill (stage 3), show the plan in full and get it approved, implement
+  not, including work that starts from an existing issue. Grill (stage 3, with
+  its mandatory solution round), show the plan in full and get it approved, implement
   under stage 6. Publish issues only if the user wants them.
 - **Full.** A feature or body of work with real uncertainty, several slices or
   more than one person involved. Run stages 3 to 6 as written.
@@ -198,8 +200,13 @@ unavailable integrations accurately.
 
 ## 3. Grill
 
-Read `references/grilling.md`. Resolve outcome, users, constraints, priority, scope
-and trade-offs in batches of focused questions with options. Keep facts,
+Read `references/grilling.md`. Ask the depth, confirm the problem (in one
+question when an issue already settles it), record the project's conventions,
+then propose at least three genuinely different implementation approaches with
+their pattern fit, walk the chosen approach's decision tree and let the user
+decide when to stop. An issue settles what is wanted, not how: starting from one
+never skips the solution round. Follow the existing code pattern unless it is
+concretely worse for the problem, and say so when it is. Keep facts,
 inferences and assumptions separate. Optional research/prototypes are driven by
 uncertainty and do not authorize product mutations.
 
