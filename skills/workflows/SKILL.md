@@ -1,6 +1,6 @@
 ---
 name: workflows
-description: Starts a single planning and delivery session for whatever the user asks, from discovery through approved vertical GitHub issues and bounded implementation, right-sized to the request. Offers phone monitoring first. RoadS observations are an optional input when configured.
+description: Starts a single planning and delivery session for whatever the user asks, from discovery through approved vertical GitHub issues and bounded implementation, right-sized to the request. First tells the user to keep `claude rc` running in a PowerShell window when no Remote Control host is detected, without asking. RoadS observations are an optional input when configured.
 disable-model-invocation: true
 ---
 
@@ -30,7 +30,8 @@ in English. If you notice you drifted, say so once and switch back.
 free-text choice by itself. Never end a turn with an open question in prose.
 Whenever you tell the user to do something outside this conversation (open a
 terminal, run a command, look at the phone), give the exact copy-paste commands
-in their own code blocks and then ask, with options, what happened. If
+in their own code blocks and then ask, with options, what happened (except the
+stage 0 `claude rc` guidance, which is never followed by a question). If
 `AskUserQuestion` is unavailable, record the pending question and stop that
 decision-dependent work.
 
@@ -42,68 +43,43 @@ fits, in the `preview` of the approve option. A summary or a file path alone is
 not showing it. If none of these is possible, record the approval as pending
 and stop.
 
-## 0. Phone first
+## 0. Remote Control host (no questions)
 
-Before inspecting the project or discussing the request, run the read-only
-preflight `python "${CLAUDE_PLUGIN_ROOT}/scripts/workflow.py" monitoring --root
-<project>` and report it in one line. Absence of a candidate host is a safe
-conclusion that none is running; a candidate proves a process, never a phone.
+Before inspecting the project, run the read-only preflight `python
+"${CLAUDE_PLUGIN_ROOT}/scripts/workflow.py" monitoring --root <project>`. Ask
+nothing about the phone, monitoring mode, fixed machines or opening the session
+in the CLI: this stage never calls `AskUserQuestion`.
 
-When `host.known` is present, the user already confirmed this very host process
-on the phone in `/workflows:total-remote-control`, and it has been running ever
-since. Ask nothing about the phone: say in one line that the fixed machine
-`<host_name>` (pid `<pid>`, confirmed at `<confirmed_at>`) is still running, that
-you continue in phone mode, and that saying "fico no teclado" switches to local
-mode. Record mode `phone` with `phone_connected: true` and `confirmed_by`
-"persistent host <pid> confirmed on the phone at <confirmed_at>, still running",
-skip `Abrir no CLI`, and go to stage 1. Any other result, including a candidate
-without `known`, takes the question below.
+- **Known host** (`host.known` present, the host the user confirmed on the phone
+  in `/workflows:total-remote-control` and still running): say in one line that
+  the fixed machine `<host_name>` (pid `<pid>`) is still running and go on.
+- **Other host detected:** say so in one line (with the process id) and go on.
+- **No host (or the listing failed):** show this guidance once, in Portuguese,
+  with the command in its own code block, and go straight on to stage 1 without
+  waiting:
 
-Otherwise ask one `AskUserQuestion`, header `Celular`, "Quer acompanhar e responder
-esta sessão pelo celular?":
+  > Para o PC ficar online no app Claude do celular, abra um PowerShell (fora
+  > deste app), rode o comando abaixo e deixe essa janela aberta. Se fechar a
+  > janela, o dispositivo sai do ar.
 
-- `Máquina fixa no app` — this PC becomes a machine the Claude mobile app keeps
-  listing, where the user can open new sessions at any time.
-- `Já acompanho pelo app` — the phone already follows this very session (for
-  example the desktop app's own remote access). That is not a fixed machine.
-- `Não, fico no teclado` — local mode.
+  ```powershell
+  claude rc
+  ```
 
-For `Máquina fixa no app`, the configuration runs in its own command. Show these
-steps, each command in its own code block with the real project path:
+A candidate proves a process, never a connected phone. Record in the handoff and
+in the authorization's `monitoring` block, when one exists, with the session
+identity and the time:
 
-1. Abra o PowerShell (fora deste app) — ele vai ficar aberto.
-2. `cd "<pasta do projeto>"`
-3. `claude` — aceite a confiança da pasta, se perguntado.
-4. `/workflows:total-remote-control` — a configuração guiada começa ali.
+- `host.known`: mode `phone`, `phone_connected: true`, `confirmed_by`
+  "persistent host <pid> confirmed on the phone at <confirmed_at>, still running".
+- other host: mode `alternative`, `confirmed_by: "preflight"`, details
+  `"Remote Control host detected; phone not confirmed"`.
+- no host: mode `local`, `confirmed_by: "preflight"`.
 
-Then ask, header `Configuração`: `Concluí e o celular respondeu`, `Deu erro`,
-`Deixar para depois`. On the first, rerun the preflight: only a detected host
-together with that answer, given in this session, records mode `phone` with
-`phone_connected: true`. Without a host, say so plainly and offer the steps
-again or local mode. `Deu erro` asks for the message through the free-text
-choice; `Deixar para depois` records local mode and moves on.
-
-For `Já acompanho pelo app`, ask the user to answer a test question from the
-phone and record mode `alternative` with details "phone follows this session;
-no persistent host". It never counts as a fixed machine.
-
-After a fixed machine is confirmed, and only when this session runs in the
-desktop app, ask header `Abrir no CLI`, "Quer abrir esta mesma sessão também no
-CLI?", options `Mostrar comando` and `Não`. The command resumes this same
-conversation from the same directory: `cd "<pasta desta sessão>"` then
-`claude --resume <id-desta-sessão>`, or `claude --resume` and pick the session
-by its title when the id is unknown. Take the id and the desktop context only
-from what the host states about this session (its environment notes, or the
-transcript file named after the id under `~/.claude/projects/<pasta>/`); never
-guess an id. Advise closing the session in the desktop
-app before continuing in the CLI, so that two clients do not write the same
-conversation. Never run it yourself.
-
-Record mode, `confirmed_by`, session identity and time in the authorization's
-`monitoring` block when one exists, and in the handoff. Repeat detection after
-every restart, new session or reported disconnection; an earlier confirmation
-survives them only as `host.known`, that is, while the same confirmed host
-process keeps running.
+Never record `phone_connected: true` otherwise, unless the user states,
+unprompted in this session, that the phone received and answered. After a
+restart, new session or reported disconnection, rerun the preflight and repeat
+the guidance if the host is gone; still ask nothing.
 
 ## 1. Take the request and right-size the path
 
@@ -199,12 +175,11 @@ configured board.
 
 ## 6. Bounded development
 
-Read `../to-development/SKILL.md`. If the user intends to be away, first confirm
-in its own `AskUserQuestion` that the stage 0 arrangement still holds (rerun the
-preflight), never in the same batch as the authorization. Inventory hooks,
+Read `../to-development/SKILL.md`. If the user intends to be away, rerun the
+stage 0 preflight and report it in one line; if the host is gone, repeat the
+`claude rc` guidance. Do not turn this into a question. Inventory hooks,
 permission settings, confirmation requirements and integration access without
-exposing secrets. Do not disable hooks or request bypass mode. An AFK phase that
-depends on reaching the user waits for a confirmed arrangement. Then recommend the
+exposing secrets. Do not disable hooks or request bypass mode. Then recommend the
 highest safe parallelism and ask the concurrency question and one bounded
 implementation authorization, batched when practical. Identify exact issue IDs,
 repository, worktree base and branch prefix, verification argv, draft PR

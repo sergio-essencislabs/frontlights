@@ -54,26 +54,18 @@ configuração ou rotina automática de interceptação (hook) é instalada.
 
 ## Acompanhar pelo celular (máquina fixa no app)
 
-A primeira pergunta de todo `/workflows:workflows` é se você quer acompanhar a
-sessão pelo celular. Para que este PC apareça sempre no app Claude do celular,
-como uma máquina onde você abre sessões novas:
+O `/workflows:workflows` começa verificando, só por leitura, se há um host do
+Remote Control rodando. Não faz pergunta sobre celular. Sem host, ele apenas
+orienta: abra um PowerShell, fora do app desktop, rode o comando abaixo e deixe
+a janela aberta para o dispositivo ficar online no app Claude do celular.
 
-1. Abra o PowerShell, fora do app desktop. Essa janela vai ficar aberta.
-2. Vá para a pasta do projeto: `cd "C:\caminho\do\projeto"`
-3. Rode `claude` e aceite a confiança da pasta, se for perguntado.
-4. Rode `/workflows:total-remote-control`.
+```powershell
+claude rc
+```
 
-A configuração segue por perguntas com opções. Numa **segunda** janela do
-PowerShell, você roda `claude remote-control --name <nome>`, com espaço e sem
-traço antes de `remote`. Com um traço só (`claude -remote-control`), o comando
-abre a lista de sessões antigas. Depois você confirma no celular que a máquina
-aparece e responde. A janela do host precisa ficar aberta, e a tampa do notebook
-também, até existir um teste com a tampa fechada. O PC pode ficar bloqueado.
-
-Acompanhar **uma** sessão do desktop pelo celular é outra coisa: não cria uma
-máquina fixa. No app desktop, o `/workflows` também pode mostrar o comando para
-abrir a mesma sessão no CLI (`claude --resume <id>`). Ele nunca roda esse comando
-por conta própria.
+Fechar a janela tira o dispositivo do ar. Para uma configuração guiada, com
+ajuste de energia e teste no celular, existe o comando opcional
+`/workflows:total-remote-control`.
 
 ## Configurar um projeto
 
@@ -136,7 +128,7 @@ uma rota JSON de observações. Integrações ausentes são informadas explicita
 
 ## Fluxo de trabalho e utilitários
 
-Pergunta do celular (com a verificação de energia e de host do Remote Control) →
+Verificação do host do Remote Control (sem pergunta; orienta `claude rc` quando falta) →
 pedido e dimensionamento → inspeção → entrevista de decisões → PRD mostrado na
 íntegra e aprovado →
 plano de issues verticais aprovado e publicado → autorização delimitada de

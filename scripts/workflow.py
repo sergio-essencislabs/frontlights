@@ -476,7 +476,9 @@ def host_candidates(rows, since=None):
     for row in rows or []:
         command = row.get('CommandLine') or row.get('command') or ''
         tokens = [token.strip('"\'') for token in command.split()]
-        if 'remote-control' not in tokens:
+        # `claude rc` is the short alias of `claude remote-control`.
+        if 'remote-control' not in tokens and not (
+                'rc' in tokens and any('claude' in token.lower() for token in tokens)):
             continue
         if any(token.lower() in HELP_TOKENS for token in tokens):
             continue

@@ -1,6 +1,6 @@
 {
   "name": "workflows",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "author": {"name": "Workflows contributors"},
   "description": "Guided discovery, approved PRDs, vertical GitHub issues and bounded delivery, right-sized to the request. RoadS is an optional input."
 }
