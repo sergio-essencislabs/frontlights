@@ -139,6 +139,39 @@ a partir de outro plugin. A consulta ao quadro e ao planejamento de entregas exi
 ferramentas configuradas separadamente; o utilitário consulta issues do GitHub e
 uma rota JSON de observações. Integrações ausentes são informadas explicitamente.
 
+### Sincronizar sprint e roadmap com o RoadS
+
+Toda sessão `/frontlights` começa perguntando se a sprint e o roadmap devem ser atualizados
+de acordo com o RoadS. Com a resposta "sim", o Frontlights:
+
+1. busca as mudanças que um Scrum Master fez no Roadmap do RoadS;
+2. escreve a prosa em cópias temporárias do `ROADMAP.md` do ano e do `SPRINT_*.md` da semana;
+3. mostra o diff para aprovação;
+4. grava, com backup ao lado de cada arquivo;
+5. confere as marcas ocultas de cada mudança;
+6. só então confirma ao RoadS.
+
+Quem escreve os arquivos é sempre esta máquina: o RoadS não alcança a pasta onde eles ficam.
+
+Configure o bloco `roadmapSync` no `.frontlights/config.json` do projeto (veja
+`examples/config.json`):
+
+- `endpoint` é a base `/api/frontlights` do RoadS, que responde `GET pending-changes` e
+  `POST ack`;
+- `secretEnvVar` nomeia a variável do segredo, que precisa começar por `FRONTLIGHTS_`. Defina o
+  valor no seu próprio terminal, com
+  `setx FRONTLIGHTS_API_SECRET "<valor emitido pelo RoadS>"`, e reinicie o Claude;
+- `scrumRoot` é a pasta onde ficam os arquivos, e aceita `%USERPROFILE%`;
+- `roadmapFile`, `weekFolderPattern` e `sprintFilePattern` montam os caminhos. `{yyyy}` vem da
+  segunda-feira da sprint. Em cada padrão, o primeiro `{dd_MM}` é a segunda e o seguinte, a sexta;
+- `maxSprintItems` limita a sprint a 4 itens;
+- `issueTargets` diz, para cada produto do RoadS, o repositório e o quadro onde a issue nasce.
+  Produto sem destino não gera issue.
+
+Na primeira vez, o envio do segredo para aquele endereço precisa da sua aprovação. O estado da
+sincronização (aprovação, marca, plano e cópias temporárias) fica em `.frontlights/roadmap-sync/`,
+fora do Git. O utilitário é `python scripts/roadmap_sync.py status|approve|fetch|apply|ack|rotate-markers --root <projeto>`.
+
 ## Fluxo de trabalho e utilitários
 
 Verificação do host do Remote Control (sem pergunta; orienta `claude rc` quando falta)

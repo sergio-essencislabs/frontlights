@@ -1,5 +1,18 @@
 {
   "repository": "OWNER/REPOSITORY",
   "project": null,
-  "roads": null
+  "roads": null,
+  "roadmapSync": {
+    "enabled": false,
+    "endpoint": "https://roads.example.com/api/frontlights",
+    "secretEnvVar": "FRONTLIGHTS_API_SECRET",
+    "scrumRoot": "%USERPROFILE%\\PASTA\\SCRUM",
+    "roadmapFile": "{yyyy}/ROADMAP.md",
+    "weekFolderPattern": "{yyyy}/{dd_MM}",
+    "sprintFilePattern": "SPRINT_{dd_MM}_a_{dd_MM}.md",
+    "maxSprintItems": 4,
+    "issueTargets": {
+      "PRODUTO": {"repository": "OWNER/REPOSITORY", "project": {"owner": "OWNER", "number": 1}}
+    }
+  }
 }

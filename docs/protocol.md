@@ -71,6 +71,12 @@ do plugin enquanto ele executa trabalho no projeto consumidor. Estrutura recomen
     handoff.md
     checkpoint.json
     evidence/<data-hora>.txt
+  roadmap-sync/
+    approval.json    par (endereço, variável) aprovado pelo usuário
+    marker.json      segredo local das marcas; nunca sai da máquina
+    plan.json        mudanças buscadas no RoadS, marcas e destinos
+    state.json       último asOf confirmado
+    staging/         cópias temporárias do ROADMAP e do SPRINT
 ```
 
 A unidade de trabalho é a issue do GitHub, identificada pelo número, para que o

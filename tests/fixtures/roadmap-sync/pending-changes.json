@@ -1,0 +1,65 @@
+{
+  "asOf": "2026-09-28T12:00:00.000Z",
+  "changes": [
+    {
+      "id": "7f1c2d3e-0000-4000-8000-000000000001",
+      "itemId": "5a5a5a5a-0000-4000-8000-00000000000a",
+      "action": "add",
+      "payload": null,
+      "createdAt": "2026-09-28T10:05:00.123Z",
+      "unknownField": "tolerated",
+      "item": {
+        "title": "Exportar o relatório de amostras em CSV",
+        "description": "Usuários baixam o relatório de amostras em CSV.",
+        "produto": "Example Product",
+        "prioridade": "Alta",
+        "effort": "medium",
+        "githubIssueUrl": null,
+        "lane": "Próxima sprint",
+        "laneId": "lane-next"
+      }
+    },
+    {
+      "id": "7f1c2d3e-0000-4000-8000-000000000002",
+      "itemId": "5a5a5a5a-0000-4000-8000-00000000000b",
+      "action": "modify",
+      "payload": {"github_issue_url": "https://github.com/OWNER/REPOSITORY/issues/12"},
+      "createdAt": "2026-09-28T10:30:00Z",
+      "item": {
+        "title": "Proteger a página de login",
+        "description": "Limitar tentativas que falham.",
+        "produto": "Example Product",
+        "prioridade": "Média",
+        "effort": "Very High",
+        "githubIssueUrl": null,
+        "lane": "Agora",
+        "laneId": "lane-now"
+      }
+    },
+    {
+      "id": "7f1c2d3e-0000-4000-8000-000000000003",
+      "itemId": null,
+      "action": "remove",
+      "payload": {"item_id": "5a5a5a5a-0000-4000-8000-00000000000c", "lane_id": "lane-later", "title": "Relatório antigo em PDF"},
+      "createdAt": "2026-09-28T11:00:00Z",
+      "item": null
+    },
+    {
+      "id": "7f1c2d3e-0000-4000-8000-000000000004",
+      "itemId": "5a5a5a5a-0000-4000-8000-00000000000d",
+      "action": "move_lane",
+      "payload": {"from": "lane-later", "to": "lane-now"},
+      "createdAt": "2026-09-28T11:30:00Z",
+      "item": {
+        "title": "Tela de lotes de amostras",
+        "description": "Listar os lotes de amostras por conta.",
+        "produto": "Other Product",
+        "prioridade": "Baixa",
+        "effort": null,
+        "githubIssueUrl": "https://github.com/OWNER/OTHER/issues/3",
+        "lane": "Agora",
+        "laneId": "lane-now"
+      }
+    }
+  ]
+}

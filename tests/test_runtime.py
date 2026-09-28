@@ -27,9 +27,24 @@ class ReleaseManifestTests(unittest.TestCase):
         self.assertEqual(skills, ['frontlights'])
         text = (ROOT / 'skills' / 'frontlights' / 'SKILL.md').read_text(encoding='utf-8')
         self.assertIn('user-invocable: false', text.split('---')[1])
-        for name in ('grilling', 'prd', 'issues', 'development', 'remote-control'):
+        for name in ('grilling', 'prd', 'issues', 'development', 'remote-control', 'roadmap-sync'):
             self.assertIn(f'references/{name}.md', text)
             self.assertTrue((ROOT / 'skills' / 'frontlights' / 'references' / f'{name}.md').is_file())
+
+    def test_every_session_asks_about_the_roadmap_before_the_request(self):
+        text = (ROOT / 'skills' / 'frontlights' / 'SKILL.md').read_text(encoding='utf-8')
+        stage1 = text.split('## 1.')[1].split('## 2.')[0]
+        self.assertIn('every session', stage1)
+        self.assertIn('Atualizar a sprint e o roadmap de acordo com o RoadS?', stage1)
+        self.assertLess(stage1.index('roadmap_sync.py'), stage1.index('Then choose the lightest path'))
+
+    def test_example_config_carries_only_generic_placeholders(self):
+        example = json.loads((ROOT / 'examples' / 'config.json').read_text(encoding='utf-8'))
+        sync = example['roadmapSync']
+        self.assertRegex(sync['secretEnvVar'], r'^FRONTLIGHTS_[A-Z0-9_]+$')
+        self.assertIn('example', sync['endpoint'])
+        self.assertTrue(all(t['repository'] == 'OWNER/REPOSITORY' for t in sync['issueTargets'].values()))
+        self.assertNotIn('guardian', json.dumps(example).lower())
 
     def test_work_is_named_by_issue_never_by_retired_gt_ids(self):
         skill = ROOT / 'skills' / 'frontlights'
