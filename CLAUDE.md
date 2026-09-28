@@ -20,6 +20,8 @@ organização, produto, cliente ou pessoa, caminho local de máquina, nem saída
 capturada de sessão real. Exemplos, modelos, testes e documentação usam apenas
 marcadores genéricos (`OWNER/REPOSITORY`, `roads: null`). Configuração real vive
 fora deste repositório, no `.frontlights/config.json` do projeto de destino.
+Exceção: `author.name` em `.claude-plugin/plugin.json` é "Sergio Mendes", por
+decisão do mantenedor.
 
 Suba a versão em `.claude-plugin/plugin.json` **e** na entrada do plugin em
 `.claude-plugin/marketplace.json` em toda alteração que precise chegar a quem já
