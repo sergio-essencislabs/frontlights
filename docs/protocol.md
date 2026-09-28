@@ -4,7 +4,7 @@
 
 | Etapa | Permitido antes da próxima aprovação | Evidência exigida |
 | --- | --- | --- |
-| Celular (primeira pergunta) | Detectar o estado da máquina e perguntar ao usuário | Host detectado e confirmação pelo celular nesta sessão, ou alternativa explícita |
+| Host do Remote Control (sem pergunta) | Detectar o host e, sem host, orientar `claude rc` num PowerShell que fica aberto | Resultado da verificação prévia |
 | Inspeção | Ler o projeto atual e as fontes configuradas | Fontes, horários e limitações |
 | Descoberta | Entrevistar, ler código e registrar decisões | Resultado, limites e escolhas aprovados |
 | PRD | Redigir e revisar uma versão local | Texto integral mostrado e aprovação humana da versão exata |
@@ -22,12 +22,14 @@ relatada. Uma confirmação anterior só sobrevive como `host.known`: o
 `.workflows/monitoring.json` registrado por `/workflows:total-remote-control`
 aponta o mesmo pid de um host ainda em execução, iniciado antes da confirmação.
 
-A pergunta do celular vem antes de qualquer outra, exceto com `host.known`, quando
-a sessão informa em uma linha que segue em modo `phone` e não pergunta nada.
-Fora desse caso, `phone` com `phone_connected: true` exige as duas coisas na
-sessão atual: processo do host detectado e confirmação do usuário. Acompanhar uma sessão já aberta pelo celular é modo `alternative`, não
-uma máquina fixa. Na etapa 6, a confirmação de que o arranjo continua valendo é
-uma pergunta separada da autorização, nunca no mesmo lote.
+A verificação do host vem antes de tudo e não faz pergunta nenhuma. Sem host, o
+usuário recebe uma única orientação: rodar `claude rc` num PowerShell e deixar a
+janela aberta para o dispositivo ficar online. Com `host.known`, o registro é
+`phone` com `phone_connected: true`; com outro host, `alternative` com
+`confirmed_by: "preflight"`; sem host, `local`. Fora de `host.known`, `phone` com
+`phone_connected: true` só vale se o usuário afirmar, por conta própria na sessão
+atual, que o celular recebeu e respondeu. Na etapa 6, a verificação é refeita e
+relatada em uma linha, sem pergunta.
 
 Nenhuma aprovação vale sem que o usuário tenha visto o conteúdo completo na sessão.
 Antes da pergunta, o texto integral vai para a conversa, o arquivo é enviado pela

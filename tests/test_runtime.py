@@ -573,8 +573,12 @@ class MonitoringTests(unittest.TestCase):
                 {'ProcessId': 3, 'CommandLine': 'node C:\\x\\cli.js remote-control --name A'},
                 {'ProcessId': 4, 'CommandLine': 'code C:\\src\\remote-control\\readme.md'},
                 {'ProcessId': 5, 'CommandLine': 'claude remote-control --version'},
-                {'ProcessId': 6, 'CommandLine': None}]
-        self.assertEqual([c['pid'] for c in workflow.host_candidates(rows)], [1, 3])
+                {'ProcessId': 6, 'CommandLine': None},
+                {'ProcessId': 9, 'CommandLine': 'claude rc'},
+                {'ProcessId': 10, 'CommandLine': 'node C:\\x\\claude\\cli.js rc --name B'},
+                {'ProcessId': 11, 'CommandLine': 'claude rc --help'},
+                {'ProcessId': 12, 'CommandLine': 'notepad rc'}]
+        self.assertEqual([c['pid'] for c in workflow.host_candidates(rows)], [1, 3, 9, 10])
 
     def test_since_marks_hosts_older_than_the_session(self):
         rows = [{'ProcessId': 7, 'CommandLine': 'claude remote-control', 'CreationDate': '2026-09-25T08:00:00'},
