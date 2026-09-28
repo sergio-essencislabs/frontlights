@@ -1,9 +1,3 @@
----
-name: to-development
-description: Supports workflows with authorized TDD delivery, isolated worktrees, dependency-aware concurrency and evidence-based handoff.
-user-invocable: false
----
-
 # Bounded implementation
 
 Read the recorded authorization, current GitHub issues and `docs/security.md`.
@@ -28,7 +22,7 @@ the authorization question itself instead of discovering a
 `'$GIT_DIR' too big` failure afterwards. Any other change of base after
 approval goes back to the user through `AskUserQuestion`.
 
-Refresh the plan from GitHub and run `workflow.py schedule --plan <file> --limit
+Refresh the plan from GitHub and run `frontlights.py schedule --plan <file> --limit
 <approved-limit>`. The result is a recommendation, not proof of authority. Start
 all eligible non-conflicting issues up to the ceiling with supported generic
 subagents or separate supported sessions. Give each a bounded outcome, owned
@@ -60,7 +54,7 @@ Tests verify behavior through public interfaces, not implementation details. Cod
 can change entirely; tests shouldn't. A good test reads like a specification:
 "user can checkout with valid cart" tells you exactly what capability exists, and
 it survives refactors because it doesn't care about internal structure. See
-[tests.md](tests.md) for examples and [mocking.md](mocking.md) for mocking
+[tdd-tests.md](tdd-tests.md) for examples and [tdd-mocking.md](tdd-mocking.md) for mocking
 guidelines.
 
 ### Seams: where tests go
@@ -124,7 +118,7 @@ sandbox controls still apply. Unexpected effects stop the affected issue.
 ## Review, checkpoints and renewal
 
 Require an independent reviewer to inspect the current diff and test evidence.
-They must not author the changes under review. Bind review to `workflow.py
+They must not author the changes under review. Bind review to `frontlights.py
 evidence --root <worktree>` hashes/HEAD; any change invalidates review. If no
 independent reviewer is available, report "implemented, awaiting independent
 review", not completed. Do not manufacture reviewer identities or approvals.
@@ -138,8 +132,8 @@ again before the issue can be reported as reviewed.
 Save compact `templates/handoff.md` and a machine-readable checkpoint before each
 session renewal. Include the issue URL and acceptance snapshot, repository map,
 decisions, changed files, commands/results, review evidence, blockers and next
-concrete step. `workflow.py checkpoint` records the issue snapshot, handoff and
-current Git evidence; `workflow.py resume` detects drift without overwriting it.
+concrete step. `frontlights.py checkpoint` records the issue snapshot, handoff and
+current Git evidence; `frontlights.py resume` detects drift without overwriting it.
 Read both the human handoff and current issue/diff in the fresh session.
 
 Check context using measured accumulated session usage plus a conservative next

@@ -1,9 +1,3 @@
----
-name: to-issues
-description: Supports workflows by decomposing an approved PRD into vertical GitHub issues with explicit dependencies and approval before publication.
-user-invocable: false
----
-
 # Vertical issue planning
 
 Read the approved PRD revision and current GitHub issues/board. Reuse an existing
@@ -27,7 +21,7 @@ action), never internals. Favor critical paths and complex logic over every edge
 case. `to-development` writes tests only at these seams, so approving the issue
 approves them; name them in the approval table too.
 
-Run `workflow.py validate-plan --plan <plan.json> --config <.workflows/config.json>`;
+Run `frontlights.py validate-plan --plan <plan.json> --config <.frontlights/config.json>`;
 this checks structure, DAG and board fields, not semantic verticality. Review every vertical demonstration manually. Check
 missing cross-layer tests, hidden sequencing, generated/shared files, migrations,
 ports, shared services, dependency cycles and context size. Add dependencies or
@@ -40,7 +34,7 @@ issue, in the conversation, as a file sent with the host's file-sending tool
 when one exists, and in the `preview` of the approve option (as much as fits).
 Then ask approval through `AskUserQuestion`, with options, for the exact issue
 creation/update scope before any write. A local project without a remote writes
-the approved bodies under `.workflows/issues/<n>/` with `source: "local"`
+the approved bodies under `.frontlights/issues/<n>/` with `source: "local"`
 snapshots; the same approval rule applies. Use installed GitHub
 tools or `gh issue create/edit --repo <approved-repo> --body-file <file>` with
 literal UTF-8 bodies, not interpolated shell strings. Keep native permissions.
@@ -49,8 +43,8 @@ duplicates. Record partial publication and resume remaining writes idempotently.
 
 ## Project board
 
-When `.workflows/config.json` has `project` (reported by `inspect` as
-`sources.project`), every issue this skill creates or adopts belongs on that board;
+When `.frontlights/config.json` has `project` (reported by `inspect` as
+`sources.project`), every issue this stage creates or adopts belongs on that board;
 never publish one outside it. Plan it with the issue:
 
 - For each issue, record `issue_type` (or rely on `project.issue_type`) and
@@ -76,7 +70,7 @@ never publish one outside it. Plan it with the issue:
 Without `project` configured: for a repository owned by an organization, ask
 through `AskUserQuestion` whether its issues live on a board (options: a board
 you found with `gh project list --owner <owner>`, "no board", free text). Record
-the answer in `.workflows/config.json` as `project` (or `"project": null`) before
+the answer in `.frontlights/config.json` as `project` (or `"project": null`) before
 publishing, so later sessions do not ask again. A local project has no board.
 
 Put `Depends on: #N, #M` in each canonical issue body (or `none`); verify dependency

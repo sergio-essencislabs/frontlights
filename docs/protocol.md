@@ -19,7 +19,7 @@ que o celular recebeu uma pergunta e respondeu. Em `alternative`, `details` é
 obrigatório. A verificação prévia nunca preenche `phone_connected`: ela devolve
 `null` e o campo `authority`, e é reexecutada a cada sessão, reinício ou queda
 relatada. Uma confirmação anterior só sobrevive como `host.known`: o
-`.workflows/monitoring.json` registrado por `/workflows:total-remote-control`
+`.frontlights/monitoring.json` registrado pela configuração guiada (`references/remote-control.md`)
 aponta o mesmo pid de um host ainda em execução, iniciado antes da confirmação.
 
 A verificação do host vem antes de tudo e não faz pergunta nenhuma. Sem host, o
@@ -37,7 +37,7 @@ ferramenta de envio do ambiente, quando houver, e o texto se repete no `preview`
 opção de aprovação. Toda pergunta tem opções, e todo texto ao usuário sai no idioma dele.
 
 Projeto sem remoto é um estado suportado: `repository: null` no `config.json`, no
-plano e na autorização. As issues locais ficam em `.workflows/issues/<n>/`, e o
+plano e na autorização. As issues locais ficam em `.frontlights/issues/<n>/`, e o
 registro de cada uma traz `number`, `title`, `body`, `state` e `source: "local"`,
 sem `html_url`. As branches usam `branch_prefix`, com padrão `claude/`.
 
@@ -55,12 +55,12 @@ um campo em um anexo não confiável.
 
 ## Registros
 
-Mantenha os registros privados de execução em `.workflows/` no projeto de destino,
+Mantenha os registros privados de execução em `.frontlights/` no projeto de destino,
 fora do versionamento, salvo revisão explícita para publicação. Não altere o código
 do plugin enquanto ele executa trabalho no projeto consumidor. Estrutura recomendada:
 
 ```text
-.workflows/
+.frontlights/
   config.json
   discovery.md
   prd.md
@@ -100,13 +100,13 @@ após conclusões ou descobertas.
 Escreva o documento de passagem de contexto com `templates/handoff.md` e execute:
 
 ```powershell
-python <plugin>/scripts/workflow.py checkpoint --root <worktree> --issue <issue.json> --handoff <handoff.md> --next-step "Executar o teste de regressão de persistência"
+python <plugin>/scripts/frontlights.py checkpoint --root <worktree> --issue <issue.json> --handoff <handoff.md> --next-step "Executar o teste de regressão de persistência"
 ```
 
 Salve a saída padrão em `checkpoint.json`, com codificação UTF-8. O utilitário inclui
 HEAD, branch, hash das diferenças binárias, hashes dos arquivos versionados e não
 versionados, registro da issue, hash do documento de passagem de contexto, próximo
-passo e horário. Ele exclui `.workflows/` para evitar hashes que dependam do próprio
+passo e horário. Ele exclui `.frontlights/` para evitar hashes que dependam do próprio
 registro. As evidências contêm hashes e nomes de arquivos, não seus conteúdos.
 Revise nomes que possam revelar informações sensíveis antes de publicar. Repositórios
 sem commit inicial não produzem evidência vinculada a um HEAD exato; faça primeiro
@@ -115,7 +115,7 @@ o commit inicial aprovado.
 Em uma sessão nova, consulte a issue novamente e execute:
 
 ```powershell
-python <plugin>/scripts/workflow.py resume --root <worktree> --issue <issue-atual.json> --handoff <handoff.md> --checkpoint <checkpoint.json>
+python <plugin>/scripts/frontlights.py resume --root <worktree> --issue <issue-atual.json> --handoff <handoff.md> --checkpoint <checkpoint.json>
 ```
 
 O resultado `reconcile` indica divergências no Git, na issue ou no documento de

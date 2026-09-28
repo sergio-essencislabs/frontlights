@@ -1,15 +1,15 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
-  "name": "workflows",
+  "name": "frontlights",
   "owner": {
     "name": "Essencis Labs"
   },
-  "description": "Marketplace do plugin Workflows: descoberta guiada, PRDs aprovados, issues verticais no GitHub e entrega delimitada, dimensionadas ao pedido.",
+  "description": "Marketplace do plugin Frontlights: descoberta guiada, PRDs aprovados, issues verticais no GitHub e entrega delimitada, dimensionadas ao pedido.",
   "plugins": [
     {
-      "name": "workflows",
+      "name": "frontlights",
       "source": "./",
-      "version": "0.6.1",
+      "version": "0.7.0",
       "description": "Conduz qualquer pedido — funcionalidade, bug, refatoração, pesquisa ou documento — por descoberta, PRD aprovado, issues verticais e implementação com testes e autorização delimitada. RoadS é uma entrada opcional."
     }
   ]

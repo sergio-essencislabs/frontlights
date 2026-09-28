@@ -1,7 +1,9 @@
-# Piloto Workflows
+# Piloto Frontlights
 
-Plugin independente para Claude Code. Entrada: `/workflows:workflows`, a forma com
-prefixo do plugin para o `/workflows` descrito nos requisitos. Leia `skills/workflows/SKILL.md`.
+Plugin independente para Claude Code, antes chamado Workflows. Entrada:
+`/frontlights`. O plugin tem uma única skill, `skills/frontlights/SKILL.md`, que
+define a ordem das etapas; as instruções detalhadas de cada etapa ficam em
+`skills/frontlights/references/`. Leia a skill antes de alterar o fluxo.
 
 Idioma: mantenha README, documentação, modelos, exemplos e textos apresentados ao
 usuário em português. Somente as skills são redigidas em inglês; elas devem orientar
@@ -17,7 +19,7 @@ Este repositório é público. Nunca versione endpoint real, segredo, token, nom
 organização, produto, cliente ou pessoa, caminho local de máquina, nem saída
 capturada de sessão real. Exemplos, modelos, testes e documentação usam apenas
 marcadores genéricos (`OWNER/REPOSITORY`, `roads: null`). Configuração real vive
-fora deste repositório, no `.workflows/config.json` do projeto de destino.
+fora deste repositório, no `.frontlights/config.json` do projeto de destino.
 
 Suba a versão em `.claude-plugin/plugin.json` **e** na entrada do plugin em
 `.claude-plugin/marketplace.json` em toda alteração que precise chegar a quem já

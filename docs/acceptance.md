@@ -1,5 +1,9 @@
 # Evidências do piloto — 24/09/2026
 
+> O plugin se chamava **Workflows** até a versão 0.6.1 e passou a se chamar
+> **Frontlights** na 0.7.0. Os registros abaixo anteriores a essa versão citam os
+> nomes da época (`workflows@inline`, `/workflows:total-remote-control`).
+
 Branch de implementação: `codex/workflows-pilot`, no clone de desenvolvimento.
 Ambiente: Windows, Python 3.14.6 e Claude Code 2.1.278. Não houve publicação remota,
 instalação, alteração do GuardianS, merge ou implantação.
@@ -12,8 +16,8 @@ instalação, alteração do GuardianS, merge ou implantação.
   de autorização.
 - `python -m compileall -q scripts tests`: passou. Não há verificador de tipos externo
   configurado; esse resultado verifica compilação sintática, não análise estática de tipos.
-- `python scripts/workflow.py validate-plan --plan examples/plan.json`: passou.
-- `python scripts/workflow.py schedule --plan examples/plan.json --limit 2`:
+- `python scripts/frontlights.py validate-plan --plan examples/plan.json`: passou.
+- `python scripts/frontlights.py schedule --plan examples/plan.json --limit 2`:
   retornou `[1, 2]`; a issue dependente 3 não foi selecionada.
 - `claude plugin validate . --json`: **sucesso**, sem erros ou avisos no manifesto,
   com um aviso de conteúdo: o CLAUDE.md da raiz não é carregado nos projetos consumidores.
@@ -39,7 +43,7 @@ validação do formato da resposta e das dependências de tarefas em execução.
 
 | Verificação dos requisitos | Evidência e situação |
 | --- | --- |
-| 1. Carregamento e descoberta, com entrada pública única | Carregamento nativo identifica seis skills; uma delas tem entrada pública. Verificação interativa do menu pendente. Comando: `/workflows:workflows`. |
+| 1. Carregamento e descoberta, com entrada pública única | Carregamento nativo identifica seis skills; uma delas tem entrada pública. Verificação interativa do menu pendente. Comando: `/frontlights`. |
 | 2. Planejamento com RoadS e GitHub reais | Utilitário de consulta e testes de fontes indisponíveis implementados. Projeto e RoadS reais configurados não foram fornecidos; teste real pendente. |
 | 3. Descoberta, PRD e aprovações | Skills e modelos persistentes implementados. Entrevista real e teste de bloqueio de gravações pendentes. |
 | 4. Decomposição vertical | Validador estrutural e avaliação de conversão de tickets por camada em entregas verticais fornecidos. Avaliação real do modelo pendente. |

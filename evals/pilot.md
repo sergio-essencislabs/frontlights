@@ -5,9 +5,10 @@ planning input. Its creation and mutations require the user's explicit scope.
 Do not use GuardianS or a production repository as a fixture. Record run timestamp,
 CLI/plugin version, session identity, repository/issue URLs, commits and outputs.
 
-1. Load with `--plugin-dir`, inspect `/help`, invoke `/workflows:workflows` and
-   verify two public entries (`workflows`, `total-remote-control`) and four
-   internal helper skills. Confirm the phone question is the first interaction,
+1. Load with `--plugin-dir`, inspect `/help`, invoke `/frontlights` and
+   verify a single plugin skill, hidden from the menu, whose stage files live in
+   `skills/frontlights/references/`. Confirm stage 0 asks nothing and only shows
+   the `claude rc` guidance when no host runs,
    every question has options, and all user-facing text is in Portuguese. Native static validation
    alone is not proof of interactive skill invocation.
 2. Read real observations and existing issues; include an unavailable-source case
