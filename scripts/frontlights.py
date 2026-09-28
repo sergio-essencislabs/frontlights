@@ -1,4 +1,4 @@
-"""Workflows pilot: deterministic planning/evidence helpers, never a shell agent.
+"""Frontlights pilot: deterministic planning/evidence helpers, never a shell agent.
 
 Only inspect performs network reads. No command here publishes issues, executes
 tests, grants Claude permissions, or changes a product repository.
@@ -246,7 +246,7 @@ def authorize(charter, operation):
         require(target.is_relative_to(worktree), 'path escapes worktree')
         rel = target.relative_to(worktree).as_posix()
         parts = {p.casefold() for p in target.relative_to(worktree).parts}
-        forbidden = {'.git', '.claude', '.codex', '.agents', '.workflows', 'claude.md', 'agents.md'}
+        forbidden = {'.git', '.claude', '.codex', '.agents', '.frontlights', '.workflows', 'claude.md', 'agents.md'}
         require(not (parts & forbidden), 'policy and control files require human review')
         require(any(relative(p) != '*' and
                     (relative(rel) == relative(p) or relative(rel).startswith(relative(p) + '/'))
@@ -267,14 +267,14 @@ def git_evidence(root):
         return run(['git', '-C', str(root), *args])
     head = git('rev-parse', 'HEAD').decode().strip()
     branch = git('branch', '--show-current').decode().strip()
-    diff = git('diff', '--binary', '--no-ext-diff', '--no-textconv', 'HEAD', '--', '.', ':!.workflows')
+    diff = git('diff', '--binary', '--no-ext-diff', '--no-textconv', 'HEAD', '--', '.', ':!.frontlights')
     names = git('ls-files', '-z', '--cached', '--others', '--exclude-standard').split(b'\0')
     files = {}
     for raw in sorted(set(names)):
         if not raw:
             continue
         name = os.fsdecode(raw)
-        if name.replace('\\', '/').startswith('.workflows/'):
+        if name.replace('\\', '/').startswith('.frontlights/'):
             continue
         path = root / name
         require(path.resolve().is_relative_to(root), 'tracked/untracked path escapes repository')
@@ -505,7 +505,7 @@ def moment(value):
 
 
 def monitoring_record(root):
-    """Read `.workflows/monitoring.json` here or, from a linked worktree, in the main one."""
+    """Read `.frontlights/monitoring.json` here or, from a linked worktree, in the main one."""
     places = [Path(root)]
     try:
         common = run(['git', 'rev-parse', '--path-format=absolute', '--git-common-dir'], cwd=root)
@@ -514,7 +514,7 @@ def monitoring_record(root):
         pass
     for place in places:
         try:
-            record = load(place / '.workflows' / 'monitoring.json')
+            record = load(place / '.frontlights' / 'monitoring.json')
         except (OSError, ValueError):
             continue
         if isinstance(record, dict):
@@ -538,7 +538,7 @@ def known_host(record, candidates):
         if candidate.get('pid') == record.get('host_process_id') and started and started <= confirmed:
             return {'pid': candidate['pid'], 'host_name': record.get('host_name'),
                     'confirmed_at': record['observed_phone_confirmation']['at'],
-                    'source': '.workflows/monitoring.json'}
+                    'source': '.frontlights/monitoring.json'}
     return None
 
 
@@ -593,7 +593,7 @@ def main():
         if name == 'schedule':
             p.add_argument('--limit', type=int, required=True)
         else:
-            p.add_argument('--config', help='.workflows/config.json; enforces its project board fields')
+            p.add_argument('--config', help='.frontlights/config.json; enforces its project board fields')
     p = sub.add_parser('authorize')
     p.add_argument('--charter', required=True)
     p.add_argument('--operation', required=True)

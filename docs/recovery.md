@@ -3,7 +3,7 @@
 1. Pare de distribuir novas tarefas; permita que operações seguras em andamento
    salvem seus pontos de retomada. Não encerre processos alheios nem remova a
    worktree de outra sessão.
-2. Preserve alterações não salvas em commits, evidências, branches e `.workflows/`.
+2. Preserve alterações não salvas em commits, evidências, branches e `.frontlights/`.
    Confira o estado real do Git e a responsabilidade pela worktree antes de retomar.
    Não execute limpeza ou restauração automática.
 3. Inicie uma nova sessão do Claude com o mesmo projeto e plugin. Leia a issue,

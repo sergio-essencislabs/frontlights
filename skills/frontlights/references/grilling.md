@@ -1,9 +1,3 @@
----
-name: grilling
-description: Supports the workflows coordinator with focused product discovery, decision interviews and explicit assumptions.
-user-invocable: false
----
-
 # Discovery interview
 
 Relentlessly stress-tests plans and designs through systematic questioning.
@@ -12,7 +6,7 @@ Conducts deep-dive questioning across all aspects of a plan, walking through dec
 Automatically explores the codebase to answer questions where code context is available, reducing redundant back-and-forth
 Designed for design reviews, architecture validation, and pre-implementation planning where thorough vetting prevents downstream issues
 
-Use only within the coordinating workflows session. Read approved decisions and
+Use only within the coordinating `/frontlights` session. Read approved decisions and
 current planning input before asking anything. Use `AskUserQuestion` for every
 question, in the user's language, each with two to four concrete options and
 the recommended one first; never ask an open question in prose. Workers without
@@ -31,5 +25,5 @@ the tool return questions to the coordinator.
    research/prototype step is needed, bound it and obtain permission for any
    changes beyond existing authority. Do not start product implementation here.
 
-Return approved decisions and unresolved items to `/workflows:workflows` for PRD
-drafting. A decision log is planning evidence, never an issue status database.
+Carry approved decisions and unresolved items into stage 4 (PRD)
+as the input. A decision log is planning evidence, never an issue status database.

@@ -8,7 +8,7 @@ from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
-import workflow
+import frontlights
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -21,6 +21,15 @@ class ReleaseManifestTests(unittest.TestCase):
         market = json.loads((ROOT / '.claude-plugin' / 'marketplace.json').read_text(encoding='utf-8'))
         entry = next(p for p in market['plugins'] if p['name'] == plugin['name'])
         self.assertEqual(entry.get('version'), plugin['version'])
+
+    def test_single_hidden_skill_whose_stage_references_exist(self):
+        skills = sorted(p.name for p in (ROOT / 'skills').iterdir() if p.is_dir())
+        self.assertEqual(skills, ['frontlights'])
+        text = (ROOT / 'skills' / 'frontlights' / 'SKILL.md').read_text(encoding='utf-8')
+        self.assertIn('user-invocable: false', text.split('---')[1])
+        for name in ('grilling', 'prd', 'issues', 'development', 'remote-control'):
+            self.assertIn(f'references/{name}.md', text)
+            self.assertTrue((ROOT / 'skills' / 'frontlights' / 'references' / f'{name}.md').is_file())
 
 
 def issue(number, paths, dependencies=()):
@@ -56,7 +65,7 @@ def charter(root):
 
 class PlanningTests(unittest.TestCase):
     def test_valid_vertical_plan(self):
-        workflow.validate_plan(plan())
+        frontlights.validate_plan(plan())
 
     def test_reject_cycle_missing_dependency_duplicate(self):
         for mutation in ('cycle', 'missing', 'duplicate'):
@@ -68,7 +77,7 @@ class PlanningTests(unittest.TestCase):
             else:
                 p['issues'].append(p['issues'][0])
             with self.subTest(mutation=mutation), self.assertRaises(ValueError):
-                workflow.validate_plan(p)
+                frontlights.validate_plan(p)
 
     def test_horizontal_and_oversized_rejected(self):
         for field, value in [('vertical_check', ''), ('session_sized', False),
@@ -76,28 +85,28 @@ class PlanningTests(unittest.TestCase):
             p = plan()
             p['issues'][0][field] = value
             with self.subTest(field=field), self.assertRaises(ValueError):
-                workflow.validate_plan(p)
+                frontlights.validate_plan(p)
 
     def test_refill_respects_dependencies_and_overlap(self):
         p = plan()
-        self.assertEqual(workflow.schedule(p, 2), [1, 2])
+        self.assertEqual(frontlights.schedule(p, 2), [1, 2])
         p['issues'][0]['status'] = 'running'
-        self.assertEqual(workflow.schedule(p, 2), [2])
+        self.assertEqual(frontlights.schedule(p, 2), [2])
         p['issues'][0]['status'] = 'verified'
-        self.assertEqual(workflow.schedule(p, 2), [2, 3])
+        self.assertEqual(frontlights.schedule(p, 2), [2, 3])
         p['issues'][1]['status'] = 'blocked'
-        self.assertEqual(workflow.schedule(p, 2), [3])
+        self.assertEqual(frontlights.schedule(p, 2), [3])
 
     def test_parent_case_and_unknown_ownership_conflict(self):
         for paths in (['SRC'], ['src/save'], ['*']):
             p = plan()
             p['issues'][1]['ownership'] = paths
-            self.assertEqual(workflow.schedule(p, 2), [1])
+            self.assertEqual(frontlights.schedule(p, 2), [1])
 
     def test_selects_maximum_safe_ready_set(self):
         p = plan()
         p['issues'] = [issue(1, ['src']), issue(2, ['src/a']), issue(3, ['src/b'])]
-        self.assertEqual(workflow.schedule(p, 2), [2, 3])
+        self.assertEqual(frontlights.schedule(p, 2), [2, 3])
 
     def test_running_conflict_is_error(self):
         p = plan()
@@ -105,13 +114,13 @@ class PlanningTests(unittest.TestCase):
         for i in p['issues'][:2]:
             i['status'] = 'running'
         with self.assertRaises(ValueError):
-            workflow.schedule(p, 2)
+            frontlights.schedule(p, 2)
 
     def test_running_dependency_violation_is_error(self):
         p = plan()
         p['issues'][2]['status'] = 'running'
         with self.assertRaisesRegex(ValueError, 'dependency'):
-            workflow.schedule(p, 2)
+            frontlights.schedule(p, 2)
 
 
 class AuthorizationTests(unittest.TestCase):
@@ -126,7 +135,7 @@ class AuthorizationTests(unittest.TestCase):
                        path=str(self.root / 'src' / 'app.py'))
 
     def test_positive_local_edit(self):
-        workflow.authorize(self.c, self.op)
+        frontlights.authorize(self.c, self.op)
 
     def test_forbidden_operations_repositories_issues_branches(self):
         changes = [('kind', x) for x in ['merge', 'deploy', 'release', 'delete',
@@ -137,14 +146,14 @@ class AuthorizationTests(unittest.TestCase):
         for key, value in changes:
             op = dict(self.op, **{key: value})
             with self.subTest(key=key, value=value), self.assertRaises(ValueError):
-                workflow.authorize(self.c, op)
+                frontlights.authorize(self.c, op)
 
     def test_escape_and_policy_files_denied(self):
         for path in ['../escape', 'src/../../escape', '.git/config',
-                     '.workflows/authorization.json', 'CLAUDE.md', 'other/file']:
+                     '.frontlights/authorization.json', 'CLAUDE.md', 'other/file']:
             op = dict(self.op, path=str(self.root / path))
             with self.subTest(path=path), self.assertRaises(ValueError):
-                workflow.authorize(self.c, op)
+                frontlights.authorize(self.c, op)
 
     def test_expired_unapproved_or_unmonitored_denied(self):
         for field, value in [('expires_at', '2020-01-01T00:00:00+00:00'),
@@ -152,20 +161,20 @@ class AuthorizationTests(unittest.TestCase):
                              ('concurrency', 0), ('approved_by', '')]:
             c = dict(self.c, **{field: value})
             with self.subTest(field=field), self.assertRaises(ValueError):
-                workflow.authorize(c, self.op)
+                frontlights.authorize(c, self.op)
 
     def test_exact_argv_no_shell_syntax(self):
         op = dict(self.op, kind='test', argv=['python', '-m', 'unittest'])
-        workflow.authorize(self.c, op)
+        frontlights.authorize(self.c, op)
         for argv in [['python', '-c', 'print(1)'], ['python -m unittest; git push'],
                      ['python', '-m', 'unittest', ';', 'gh', 'pr', 'merge']]:
             with self.assertRaises(ValueError):
-                workflow.authorize(self.c, dict(op, argv=argv))
+                frontlights.authorize(self.c, dict(op, argv=argv))
 
     def test_external_writes_always_need_native_permission(self):
         for kind in ['draft_pr', 'issue_update']:
             with self.assertRaisesRegex(ValueError, 'external'):
-                workflow.authorize(self.c, dict(self.op, kind=kind))
+                frontlights.authorize(self.c, dict(self.op, kind=kind))
 
 
 class EvidenceTests(unittest.TestCase):
@@ -177,29 +186,29 @@ class EvidenceTests(unittest.TestCase):
                         'html_url': 'https://github.com/example/pilot/issues/1'}
             evidence = {'head': 'a' * 40, 'branch': 'codex/issue-1',
                         'diff_sha256': 'a', 'files_sha256': 'b', 'files': {}}
-            with patch.object(workflow, 'git_evidence', return_value=evidence):
+            with patch.object(frontlights, 'git_evidence', return_value=evidence):
                 with self.assertRaises(ValueError):
-                    workflow.checkpoint(root, snapshot, handoff, 'Run focused tests')
+                    frontlights.checkpoint(root, snapshot, handoff, 'Run focused tests')
                 handoff.write_text('Acceptance: save persists. Next: run focused tests.')
-                checkpoint = workflow.checkpoint(root, snapshot, handoff, 'Run focused tests')
-                self.assertEqual(workflow.resume(root, checkpoint, snapshot, handoff)['state'], 'unchanged')
+                checkpoint = frontlights.checkpoint(root, snapshot, handoff, 'Run focused tests')
+                self.assertEqual(frontlights.resume(root, checkpoint, snapshot, handoff)['state'], 'unchanged')
                 changed = dict(snapshot, body='Accept B')
-                self.assertEqual(workflow.resume(root, checkpoint, changed, handoff)['state'], 'reconcile')
+                self.assertEqual(frontlights.resume(root, checkpoint, changed, handoff)['state'], 'reconcile')
                 handoff.write_text('Changed next action')
-                self.assertEqual(workflow.resume(root, checkpoint, snapshot, handoff)['state'], 'reconcile')
+                self.assertEqual(frontlights.resume(root, checkpoint, snapshot, handoff)['state'], 'reconcile')
 
     def test_context_budget_fail_closed_and_reserves(self):
-        self.assertEqual(workflow.context_action(80000, 10000), 'continue')
-        self.assertEqual(workflow.context_action(99000, 1000), 'handoff')
-        self.assertEqual(workflow.context_action(140000, 10000), 'stop')
-        self.assertEqual(workflow.context_action(None, 1000), 'stop')
+        self.assertEqual(frontlights.context_action(80000, 10000), 'continue')
+        self.assertEqual(frontlights.context_action(99000, 1000), 'handoff')
+        self.assertEqual(frontlights.context_action(140000, 10000), 'stop')
+        self.assertEqual(frontlights.context_action(None, 1000), 'stop')
         with self.assertRaises(ValueError):
-            workflow.context_action(-1, 100)
+            frontlights.context_action(-1, 100)
 
     def test_snapshot_drift_includes_acceptance_body_and_status(self):
         a = {'number': 1, 'title': 'Save', 'body': 'Accept A', 'state': 'OPEN'}
-        self.assertEqual(workflow.drift(a, dict(a)), [])
-        self.assertEqual(workflow.drift(a, dict(a, body='Accept B')), ['body'])
+        self.assertEqual(frontlights.drift(a, dict(a)), [])
+        self.assertEqual(frontlights.drift(a, dict(a, body='Accept B')), ['body'])
 
     def test_checkpoint_binds_git_head_and_dirty_content(self):
         with tempfile.TemporaryDirectory() as d:
@@ -213,17 +222,17 @@ class EvidenceTests(unittest.TestCase):
             (root / 'app.txt').write_text('one')
             git('add', '.')
             git('commit', '-m', 'fixture')
-            a = workflow.git_evidence(root)
+            a = frontlights.git_evidence(root)
             (root / 'app.txt').write_text('two')
-            b = workflow.git_evidence(root)
+            b = frontlights.git_evidence(root)
             self.assertEqual(a['head'], b['head'])
             self.assertNotEqual(a['diff_sha256'], b['diff_sha256'])
             (root / 'new.txt').write_text('untracked')
-            c = workflow.git_evidence(root)
+            c = frontlights.git_evidence(root)
             self.assertNotEqual(b['files_sha256'], c['files_sha256'])
 
     def test_cli_invalid_json_exits_nonzero_without_traceback(self):
-        result = subprocess.run([sys.executable, str(Path(workflow.__file__)),
+        result = subprocess.run([sys.executable, str(Path(frontlights.__file__)),
                                  'schedule', '--plan', 'missing.json', '--limit', '2'],
                                 capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
@@ -232,22 +241,22 @@ class EvidenceTests(unittest.TestCase):
 
 class IntegrationReadTests(unittest.TestCase):
     def test_malformed_github_payload_is_unavailable(self):
-        with tempfile.TemporaryDirectory() as root, patch.object(workflow, 'run', return_value=b'{"message":"error"}'):
-            result = workflow.inspect({'repository': 'example/pilot'}, root)
+        with tempfile.TemporaryDirectory() as root, patch.object(frontlights, 'run', return_value=b'{"message":"error"}'):
+            result = frontlights.inspect({'repository': 'example/pilot'}, root)
         self.assertEqual(result['sources']['github']['status'], 'unavailable')
 
     def test_github_pagination_filters_prs_roads_unconfigured(self):
         raw = json.dumps([[{'number': 1}], [{'number': 2, 'pull_request': {}}],
                           [{'number': 3}]]).encode()
-        with tempfile.TemporaryDirectory() as root, patch.object(workflow, 'run', return_value=raw) as run:
-            result = workflow.inspect({'repository': 'example/pilot'}, root)
+        with tempfile.TemporaryDirectory() as root, patch.object(frontlights, 'run', return_value=raw) as run:
+            result = frontlights.inspect({'repository': 'example/pilot'}, root)
         self.assertEqual([i['number'] for i in result['sources']['github']['issues']], [1, 3])
         self.assertIn('--paginate', run.call_args.args[0])
         self.assertEqual(result['sources']['roads']['status'], 'unconfigured')
 
     def test_unavailable_integrations_do_not_invent_data_or_echo_tokens(self):
-        with tempfile.TemporaryDirectory() as root, patch.object(workflow, 'run', side_effect=ValueError('private-secret')):
-            result = workflow.inspect({'repository': 'example/pilot', 'roads': {
+        with tempfile.TemporaryDirectory() as root, patch.object(frontlights, 'run', side_effect=ValueError('private-secret')):
+            result = frontlights.inspect({'repository': 'example/pilot', 'roads': {
                 'observations_url': 'http://unsafe.example', 'token_env': 'MISSING_TOKEN'}}, root)
         self.assertEqual(result['sources']['github']['status'], 'unavailable')
         self.assertEqual(result['sources']['roads']['status'], 'unavailable')
@@ -267,8 +276,8 @@ class ProjectBoardTests(unittest.TestCase):
     def test_inspect_reports_board_unconfigured_when_absent_or_null(self):
         for config in ({'repository': 'example/pilot'}, {'repository': 'example/pilot', 'project': None}):
             with self.subTest(config=config), tempfile.TemporaryDirectory() as root, \
-                    patch.object(workflow, 'run', return_value=b'[]'):
-                result = workflow.inspect(config, root)
+                    patch.object(frontlights, 'run', return_value=b'[]'):
+                result = frontlights.inspect(config, root)
             self.assertEqual(result['sources']['project']['status'], 'unconfigured')
 
     def test_inspect_reads_the_configured_board(self):
@@ -276,8 +285,8 @@ class ProjectBoardTests(unittest.TestCase):
             if argv[:3] == ['gh', 'project', 'view']:
                 return json.dumps({'title': 'Board', 'url': 'https://github.com/orgs/example-org/projects/3'}).encode()
             return b'[]'
-        with tempfile.TemporaryDirectory() as root, patch.object(workflow, 'run', side_effect=fake) as run:
-            result = workflow.inspect({'repository': 'example/pilot', 'project': board()}, root)
+        with tempfile.TemporaryDirectory() as root, patch.object(frontlights, 'run', side_effect=fake) as run:
+            result = frontlights.inspect({'repository': 'example/pilot', 'project': board()}, root)
         project = result['sources']['project']
         self.assertEqual(project['status'], 'available')
         self.assertEqual((project['owner'], project['number']), ('example-org', 3))
@@ -291,8 +300,8 @@ class ProjectBoardTests(unittest.TestCase):
             if argv[:3] == ['gh', 'project', 'view']:
                 raise ValueError('missing project scope private-token')
             return b'[]'
-        with tempfile.TemporaryDirectory() as root, patch.object(workflow, 'run', side_effect=fake):
-            result = workflow.inspect({'repository': 'example/pilot', 'project': board()}, root)
+        with tempfile.TemporaryDirectory() as root, patch.object(frontlights, 'run', side_effect=fake):
+            result = frontlights.inspect({'repository': 'example/pilot', 'project': board()}, root)
         self.assertEqual(result['sources']['project']['status'], 'unavailable')
         self.assertNotIn('private-token', json.dumps(result))
 
@@ -300,32 +309,32 @@ class ProjectBoardTests(unittest.TestCase):
         for bad in (board(owner='bad owner'), board(number=0), board(number=True), board(number='3'),
                     board(fields={'Status': 7}), board(fields=[]), board(assignee=''), 'example-org/3'):
             with self.subTest(bad=bad), tempfile.TemporaryDirectory() as root, \
-                    patch.object(workflow, 'run', return_value=b'[]'), self.assertRaisesRegex(ValueError, 'project'):
-                workflow.inspect({'repository': 'example/pilot', 'project': bad}, root)
+                    patch.object(frontlights, 'run', return_value=b'[]'), self.assertRaisesRegex(ValueError, 'project'):
+                frontlights.inspect({'repository': 'example/pilot', 'project': bad}, root)
 
     def test_a_local_project_cannot_have_a_board(self):
         with tempfile.TemporaryDirectory() as root, self.assertRaisesRegex(ValueError, 'project'):
-            workflow.inspect({'repository': None, 'project': board()}, root)
+            frontlights.inspect({'repository': None, 'project': board()}, root)
 
     def test_plan_must_choose_every_open_board_field_per_issue(self):
         p = plan()
         with self.assertRaisesRegex(ValueError, 'Area'):
-            workflow.validate_plan(p, board())
+            frontlights.validate_plan(p, board())
         for i in p['issues']:
             i['project_fields'] = {'Area': 'Backend'}
-        checked = workflow.validate_plan(p, board())
+        checked = frontlights.validate_plan(p, board())
         self.assertEqual(checked['issues'][0]['project_fields'], {'Area': 'Backend'})
 
     def test_plan_issue_type_comes_from_issue_or_board_default(self):
         p = plan()
         for i in p['issues']:
             i['project_fields'] = {'Area': 'Backend'}
-        workflow.validate_plan(p, board())
+        frontlights.validate_plan(p, board())
         with self.assertRaisesRegex(ValueError, 'issue_type'):
-            workflow.validate_plan(p, board(issue_type=None))
+            frontlights.validate_plan(p, board(issue_type=None))
         for i in p['issues']:
             i['issue_type'] = 'Bug'
-        workflow.validate_plan(p, board(issue_type=None))
+        frontlights.validate_plan(p, board(issue_type=None))
 
     def test_plan_rejects_malformed_or_unknown_board_fields(self):
         for bad in ({'Area': ''}, {'Area': 3}, {'Area': 'Backend', 'Typo': 'x'}, ['Area']):
@@ -333,17 +342,17 @@ class ProjectBoardTests(unittest.TestCase):
             for i in p['issues']:
                 i['project_fields'] = bad
             with self.subTest(bad=bad), self.assertRaises(ValueError):
-                workflow.validate_plan(p, board())
+                frontlights.validate_plan(p, board())
 
     def test_plan_without_board_ignores_nothing_and_still_validates(self):
-        workflow.validate_plan(plan())
+        frontlights.validate_plan(plan())
 
     def test_cli_validate_plan_applies_the_board_from_config(self):
         with tempfile.TemporaryDirectory() as d:
             plan_path, config_path = Path(d) / 'plan.json', Path(d) / 'config.json'
             plan_path.write_text(json.dumps(plan()), encoding='utf-8')
             config_path.write_text(json.dumps({'repository': 'example/pilot', 'project': board()}), encoding='utf-8')
-            result = subprocess.run([sys.executable, str(Path(workflow.__file__)), 'validate-plan',
+            result = subprocess.run([sys.executable, str(Path(frontlights.__file__)), 'validate-plan',
                                      '--plan', str(plan_path), '--config', str(config_path)],
                                     capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
@@ -355,8 +364,8 @@ class LocalModeTests(unittest.TestCase):
     """A project without a remote is a supported state, not a missing prerequisite."""
 
     def test_inspect_without_repository_reports_github_unconfigured(self):
-        with tempfile.TemporaryDirectory() as root, patch.object(workflow, 'run') as run:
-            result = workflow.inspect({'repository': None, 'roads': None}, root)
+        with tempfile.TemporaryDirectory() as root, patch.object(frontlights, 'run') as run:
+            result = frontlights.inspect({'repository': None, 'roads': None}, root)
         run.assert_not_called()
         self.assertIsNone(result['repository'])
         self.assertEqual(result['sources']['github']['status'], 'unconfigured')
@@ -366,7 +375,7 @@ class LocalModeTests(unittest.TestCase):
         for config in ({'repository': 'not a repository'}, {'roads': None}, {'repsitory': None}):
             with self.subTest(config=config), tempfile.TemporaryDirectory() as root, \
                     self.assertRaisesRegex(ValueError, 'repository'):
-                workflow.inspect(config, root)
+                frontlights.inspect(config, root)
 
     def test_resume_rejects_a_source_change_alone(self):
         with tempfile.TemporaryDirectory() as d:
@@ -375,20 +384,20 @@ class LocalModeTests(unittest.TestCase):
             handoff.write_text('Next.')
             local = {'number': 1, 'body': 'Accept A', 'source': 'local'}
             evidence = {'head': 'a', 'branch': 'claude/i', 'diff_sha256': 'a', 'files_sha256': 'b', 'files': {}}
-            with patch.object(workflow, 'git_evidence', return_value=evidence):
-                saved = workflow.checkpoint(root, local, handoff, 'Next')
+            with patch.object(frontlights, 'git_evidence', return_value=evidence):
+                saved = frontlights.checkpoint(root, local, handoff, 'Next')
                 with self.assertRaisesRegex(ValueError, 'different issue'):
-                    workflow.resume(root, saved, dict(local, source=None), handoff)
+                    frontlights.resume(root, saved, dict(local, source=None), handoff)
 
     def test_local_plan_validates_without_urls(self):
         p = plan()
         p['repository'] = None
         for i in p['issues']:
             i['url'] = None
-        workflow.validate_plan(p)
+        frontlights.validate_plan(p)
         p['issues'][0]['url'] = 'https://github.com/example/pilot/issues/1'
         with self.assertRaisesRegex(ValueError, 'local plan'):
-            workflow.validate_plan(p)
+            frontlights.validate_plan(p)
 
     def test_local_issue_snapshot_checkpoints_and_resumes(self):
         with tempfile.TemporaryDirectory() as d:
@@ -398,14 +407,14 @@ class LocalModeTests(unittest.TestCase):
             local = {'number': 1, 'title': 'Save', 'body': 'Accept A', 'state': 'open', 'source': 'local'}
             evidence = {'head': 'a' * 40, 'branch': 'claude/issue-1',
                         'diff_sha256': 'a', 'files_sha256': 'b', 'files': {}}
-            with patch.object(workflow, 'git_evidence', return_value=evidence):
-                saved = workflow.checkpoint(root, local, handoff, 'Run focused tests')
-                self.assertEqual(workflow.resume(root, saved, local, handoff)['state'], 'unchanged')
+            with patch.object(frontlights, 'git_evidence', return_value=evidence):
+                saved = frontlights.checkpoint(root, local, handoff, 'Run focused tests')
+                self.assertEqual(frontlights.resume(root, saved, local, handoff)['state'], 'unchanged')
                 with self.assertRaises(ValueError):
-                    workflow.checkpoint(root, dict(local, source='guess'), handoff, 'Run focused tests')
+                    frontlights.checkpoint(root, dict(local, source='guess'), handoff, 'Run focused tests')
                 remote = dict(local, source=None, html_url='https://github.com/example/pilot/issues/1')
                 with self.assertRaisesRegex(ValueError, 'different issue'):
-                    workflow.resume(root, saved, remote, handoff)
+                    frontlights.resume(root, saved, remote, handoff)
 
 
 class LocalAuthorizationTests(unittest.TestCase):
@@ -415,11 +424,11 @@ class LocalAuthorizationTests(unittest.TestCase):
             c = dict(charter(root), repository=None)
             op = dict(repository=None, issue=1, kind='edit', branch='claude/issue-1',
                       worktree=root, path=str(Path(root) / 'src' / 'a.py'))
-            workflow.authorize(c, op)
+            frontlights.authorize(c, op)
             missing = {k: v for k, v in op.items() if k != 'repository'}
             for bad in (missing, dict(op, repository='example/pilot')):
                 with self.subTest(op=bad), self.assertRaisesRegex(ValueError, 'repository'):
-                    workflow.authorize(c, bad)
+                    frontlights.authorize(c, bad)
 
 
 class BranchPrefixTests(unittest.TestCase):
@@ -440,9 +449,9 @@ class BranchPrefixTests(unittest.TestCase):
         return c
 
     def test_default_prefix_is_claude(self):
-        workflow.authorize(self.charter_for('claude/issue-1'), self.operation('claude/issue-1'))
+        frontlights.authorize(self.charter_for('claude/issue-1'), self.operation('claude/issue-1'))
         with self.assertRaisesRegex(ValueError, 'branch'):
-            workflow.authorize(self.charter_for('codex/issue-1'), self.operation('codex/issue-1'))
+            frontlights.authorize(self.charter_for('codex/issue-1'), self.operation('codex/issue-1'))
 
     def test_prefix_cannot_open_a_protected_namespace(self):
         for protected, prefix, branch in ((['release/*'], 'release/', 'release/1.0'),
@@ -450,7 +459,7 @@ class BranchPrefixTests(unittest.TestCase):
                                           (['MAIN'], 'main/', 'main/x')):
             c = self.charter_for(branch, branch_prefix=prefix, protected_branches=protected)
             with self.subTest(prefix=prefix), self.assertRaisesRegex(ValueError, 'branch_prefix'):
-                workflow.authorize(c, self.operation(branch))
+                frontlights.authorize(c, self.operation(branch))
 
     def test_mid_pattern_protection_closes_the_prefix_and_bad_entries_fail_cleanly(self):
         for pattern in ('release/*/hotfix', '*/hotfix', 'rel*/hotfix'):
@@ -458,47 +467,47 @@ class BranchPrefixTests(unittest.TestCase):
                                  protected_branches=[pattern])
             with self.subTest(pattern=pattern), \
                     self.assertRaisesRegex(ValueError, 'protected or unapproved branch'):
-                workflow.authorize(c, self.operation('release/a/hotfix/x'))
+                frontlights.authorize(c, self.operation('release/a/hotfix/x'))
         allowed = self.charter_for('release/1.0', branch_prefix='release/',
                                    protected_branches=['release/*/hotfix'])
-        workflow.authorize(allowed, self.operation('release/1.0'))
+        frontlights.authorize(allowed, self.operation('release/1.0'))
         for entries in ([None], [5], 'main'):
             with self.subTest(entries=entries), self.assertRaisesRegex(ValueError, 'protected_branches'):
-                workflow.authorize(self.charter_for('claude/issue-1', protected_branches=entries),
+                frontlights.authorize(self.charter_for('claude/issue-1', protected_branches=entries),
                                    self.operation('claude/issue-1'))
 
     def test_protected_branch_inside_prefix_is_denied_case_insensitively(self):
         c = self.charter_for('claude/x', protected_branches=['Claude/X'])
         with self.assertRaisesRegex(ValueError, 'protected or unapproved branch'):
-            workflow.authorize(c, self.operation('claude/x'))
+            frontlights.authorize(c, self.operation('claude/x'))
 
     def test_one_protected_branch_does_not_block_its_siblings(self):
         c = self.charter_for('claude/issue-2', protected_branches=['claude/issue-1'])
-        workflow.authorize(c, self.operation('claude/issue-2'))
+        frontlights.authorize(c, self.operation('claude/issue-2'))
         for branch in ('claude/issue-1', 'claude/issue-1/sub'):
             trailing = self.charter_for(branch, protected_branches=['claude/issue-1/'])
             with self.subTest(branch=branch), \
                     self.assertRaisesRegex(ValueError, 'protected or unapproved branch'):
-                workflow.authorize(trailing, self.operation(branch))
+                frontlights.authorize(trailing, self.operation(branch))
         below = self.charter_for('claude/issue-1/sub', protected_branches=['claude/issue-1'])
         with self.assertRaisesRegex(ValueError, 'protected or unapproved branch'):
-            workflow.authorize(below, self.operation('claude/issue-1/sub'))
+            frontlights.authorize(below, self.operation('claude/issue-1/sub'))
 
     def test_null_prefix_and_missing_charter_repository_are_denied(self):
         with self.assertRaisesRegex(ValueError, 'branch_prefix'):
-            workflow.authorize(self.charter_for('claude/issue-1', branch_prefix=None),
+            frontlights.authorize(self.charter_for('claude/issue-1', branch_prefix=None),
                                self.operation('claude/issue-1'))
         c = self.charter_for('claude/issue-1')
         del c['repository']
         with self.assertRaisesRegex(ValueError, 'repository'):
-            workflow.authorize(c, self.operation('claude/issue-1'))
+            frontlights.authorize(c, self.operation('claude/issue-1'))
 
     def test_charter_prefix_is_honoured_and_validated(self):
         c = self.charter_for('codex/issue-1', branch_prefix='codex/')
-        workflow.authorize(c, self.operation('codex/issue-1'))
+        frontlights.authorize(c, self.operation('codex/issue-1'))
         for prefix in ('', 'codex', '/', 'main/', 5):
             with self.subTest(prefix=prefix), self.assertRaisesRegex(ValueError, 'branch_prefix'):
-                workflow.authorize(self.charter_for('codex/issue-1', branch_prefix=prefix),
+                frontlights.authorize(self.charter_for('codex/issue-1', branch_prefix=prefix),
                                    self.operation('codex/issue-1'))
 
 
@@ -509,7 +518,7 @@ class VerificationDiscoveryTests(unittest.TestCase):
                 path = Path(d, name)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(text, encoding='utf-8')
-            return workflow.inspect({'repository': None}, d)
+            return frontlights.inspect({'repository': None}, d)
 
     def test_python_unittest_and_pytest_candidates(self):
         self.assertEqual(self.inspect({'tests/test_a.py': ''})['verification_candidates'],
@@ -529,22 +538,22 @@ class VerificationDiscoveryTests(unittest.TestCase):
 
 class PathRiskTests(unittest.TestCase):
     def test_long_or_virtualized_windows_root_is_flagged(self):
-        short = workflow.path_risk('C:/wt/app', 'C:/wt/app', 'win32')
+        short = frontlights.path_risk('C:/wt/app', 'C:/wt/app', 'win32')
         self.assertEqual(short['status'], 'ok')
         deep = 'C:/Users/u/AppData/Roaming/' + 'x' * 170
-        self.assertEqual(workflow.path_risk(deep, deep, 'win32')['status'], 'long_path')
-        virtual = workflow.path_risk('C:/Users/u/AppData/Roaming/App/s',
+        self.assertEqual(frontlights.path_risk(deep, deep, 'win32')['status'], 'long_path')
+        virtual = frontlights.path_risk('C:/Users/u/AppData/Roaming/App/s',
                                      'C:/Users/u/AppData/Local/Packages/App_x/LocalCache/Roaming/App/s', 'win32')
         self.assertEqual(virtual['status'], 'virtualized')
         self.assertIn('worktree', virtual['advice'])
 
     def test_other_platforms_are_not_flagged(self):
         deep = '/home/u/' + 'x' * 300
-        self.assertEqual(workflow.path_risk(deep, deep, 'linux')['status'], 'ok')
+        self.assertEqual(frontlights.path_risk(deep, deep, 'linux')['status'], 'ok')
 
     def test_inspect_reports_path_risk(self):
         with tempfile.TemporaryDirectory() as root:
-            self.assertIn(workflow.inspect({'repository': None}, root)['path_risk']['status'],
+            self.assertIn(frontlights.inspect({'repository': None}, root)['path_risk']['status'],
                           {'ok', 'long_path', 'virtualized'})
 
 
@@ -558,14 +567,14 @@ Q_WITHOUT_VALUE = ('GUID do Esquema de Energia: 381b4222 (Equilibrado)\n'
 
 class MonitoringTests(unittest.TestCase):
     def test_power_value_parses_english_and_localized_output(self):
-        self.assertEqual(workflow.power_value(QH_ENGLISH), {'ac': 0, 'dc': 30})
+        self.assertEqual(frontlights.power_value(QH_ENGLISH), {'ac': 0, 'dc': 30})
         # The console codepage mangles the accented word; the ASCII stem must still match.
-        self.assertEqual(workflow.power_value(QH_LOCALIZED), {'ac': 0, 'dc': 0})
+        self.assertEqual(frontlights.power_value(QH_LOCALIZED), {'ac': 0, 'dc': 0})
 
     def test_absent_power_index_is_unknown_not_zero(self):
         for text in (Q_WITHOUT_VALUE, '', None, 'garbage without any index'):
             with self.subTest(text=text):
-                self.assertEqual(workflow.power_value(text), {'ac': None, 'dc': None})
+                self.assertEqual(frontlights.power_value(text), {'ac': None, 'dc': None})
 
     def test_host_candidates_match_tokens_not_image_name(self):
         rows = [{'ProcessId': 1, 'CommandLine': 'claude remote-control --name Vision'},
@@ -578,25 +587,25 @@ class MonitoringTests(unittest.TestCase):
                 {'ProcessId': 10, 'CommandLine': 'node C:\\x\\claude\\cli.js rc --name B'},
                 {'ProcessId': 11, 'CommandLine': 'claude rc --help'},
                 {'ProcessId': 12, 'CommandLine': 'notepad rc'}]
-        self.assertEqual([c['pid'] for c in workflow.host_candidates(rows)], [1, 3, 9, 10])
+        self.assertEqual([c['pid'] for c in frontlights.host_candidates(rows)], [1, 3, 9, 10])
 
     def test_since_marks_hosts_older_than_the_session(self):
         rows = [{'ProcessId': 7, 'CommandLine': 'claude remote-control', 'CreationDate': '2026-09-25T08:00:00'},
                 {'ProcessId': 8, 'CommandLine': 'claude remote-control', 'CreationDate': '2026-09-25T12:00:00'}]
-        found = workflow.host_candidates(rows, since='2026-09-25T10:00:00')
+        found = frontlights.host_candidates(rows, since='2026-09-25T10:00:00')
         self.assertEqual([(c['pid'], c['predates_session']) for c in found], [(7, True), (8, False)])
 
     def test_since_compares_powershell_dates_as_times(self):
         rows = [{'ProcessId': 9, 'CommandLine': 'claude remote-control',
                  'CreationDate': '/Date(1790360617247)/'}]  # 2026-09-25T18:23:37Z
-        self.assertTrue(workflow.host_candidates(rows, since='2026-09-25T19:00:00Z')[0]['predates_session'])
-        self.assertFalse(workflow.host_candidates(rows, since='2026-09-25T18:00:00Z')[0]['predates_session'])
+        self.assertTrue(frontlights.host_candidates(rows, since='2026-09-25T19:00:00Z')[0]['predates_session'])
+        self.assertFalse(frontlights.host_candidates(rows, since='2026-09-25T18:00:00Z')[0]['predates_session'])
 
     def test_known_host_needs_the_same_process_started_before_confirmation(self):
         record = {'mode': 'phone', 'host_name': 'pc', 'host_process_id': 42,
                   'observed_phone_confirmation': {'at': '2026-09-25T18:25:43Z'}}
         before = {'pid': 42, 'created': '/Date(1790360617247)/'}
-        known = workflow.known_host(record, [before])
+        known = frontlights.known_host(record, [before])
         self.assertEqual((known['pid'], known['host_name'], known['confirmed_at']),
                          (42, 'pc', '2026-09-25T18:25:43Z'))
         restarted = {'pid': 42, 'created': '2026-09-26T09:00:00Z'}
@@ -605,17 +614,17 @@ class MonitoringTests(unittest.TestCase):
                                 ({**record, 'mode': 'local'}, [before]),
                                 ({**record, 'observed_phone_confirmation': {}}, [before]), (None, [before])):
             with self.subTest(record=rec, candidates=candidates):
-                self.assertIsNone(workflow.known_host(rec, candidates))
+                self.assertIsNone(frontlights.known_host(rec, candidates))
 
     def test_monitoring_record_is_found_from_a_linked_worktree(self):
         with tempfile.TemporaryDirectory() as main, tempfile.TemporaryDirectory() as linked:
-            Path(main, '.workflows').mkdir()
-            Path(main, '.workflows', 'monitoring.json').write_text('{"mode": "phone"}', encoding='utf-8')
+            Path(main, '.frontlights').mkdir()
+            Path(main, '.frontlights', 'monitoring.json').write_text('{"mode": "phone"}', encoding='utf-8')
             common = (str(Path(main, '.git')) + '\n').encode()
-            with patch.object(workflow, 'run', return_value=common):
-                self.assertEqual(workflow.monitoring_record(linked), {'mode': 'phone'})
-            with patch.object(workflow, 'run', side_effect=ValueError('not a repository')):
-                self.assertIsNone(workflow.monitoring_record(linked))
+            with patch.object(frontlights, 'run', return_value=common):
+                self.assertEqual(frontlights.monitoring_record(linked), {'mode': 'phone'})
+            with patch.object(frontlights, 'run', side_effect=ValueError('not a repository')):
+                self.assertIsNone(frontlights.monitoring_record(linked))
 
     def test_monitoring_reports_a_known_host_without_claiming_a_phone(self):
         listing = json.dumps([{'ProcessId': 42, 'CommandLine': 'claude remote-control --name pc',
@@ -627,18 +636,18 @@ class MonitoringTests(unittest.TestCase):
             if argv[0] == 'powershell':
                 return listing
             raise ValueError('not needed')
-        with patch.object(workflow.sys, 'platform', 'win32'), \
-             patch.object(workflow, 'run', side_effect=fake), \
-             patch.object(workflow, 'monitoring_record', return_value=record):
-            result = workflow.monitoring('.')
+        with patch.object(frontlights.sys, 'platform', 'win32'), \
+             patch.object(frontlights, 'run', side_effect=fake), \
+             patch.object(frontlights, 'monitoring_record', return_value=record):
+            result = frontlights.monitoring('.')
         self.assertEqual(result['host']['known']['pid'], 42)
         self.assertEqual(result['host']['conclusion'], 'confirmed host still running')
         self.assertIsNone(result['phone_connected'])
 
     def test_monitoring_never_claims_a_phone_and_degrades_per_source(self):
-        with patch.object(workflow.sys, 'platform', 'win32'), \
-             patch.object(workflow, 'run', side_effect=ValueError('powercfg exploded')):
-            result = workflow.monitoring('.')
+        with patch.object(frontlights.sys, 'platform', 'win32'), \
+             patch.object(frontlights, 'run', side_effect=ValueError('powercfg exploded')):
+            result = frontlights.monitoring('.')
         self.assertIsNone(result['phone_connected'])
         self.assertEqual(result['authority'], 'user confirmation in this session')
         for name in ('lock_display_timeout', 'lid_close_action'):
@@ -648,8 +657,8 @@ class MonitoringTests(unittest.TestCase):
         self.assertNotIn('powercfg exploded', json.dumps(result))
 
     def test_monitoring_is_unsupported_off_windows_without_raising(self):
-        with patch.object(workflow.sys, 'platform', 'linux'):
-            result = workflow.monitoring('.')
+        with patch.object(frontlights.sys, 'platform', 'linux'):
+            result = frontlights.monitoring('.')
         self.assertEqual(result['power']['status'], 'unsupported')
         self.assertEqual(result['host']['status'], 'unsupported')
         self.assertIsNone(result['phone_connected'])
@@ -662,14 +671,14 @@ class MonitoringTests(unittest.TestCase):
                              path=str(Path(root) / 'src' / 'a.py'))
             good = charter(root)
             good['monitoring'] = {'mode': 'phone', 'confirmed_by': 'human', 'phone_connected': True}
-            self.assertEqual(workflow.authorize(good, operation)['scope_check'], 'pass')
+            self.assertEqual(frontlights.authorize(good, operation)['scope_check'], 'pass')
             for value in ({}, {'phone_connected': False}, {'phone_connected': 'true'},
                           {'phone_connected': 1}):
                 with self.subTest(value=value):
                     bad = charter(root)
                     bad['monitoring'] = {'mode': 'phone', 'confirmed_by': 'human', **value}
                     with self.assertRaisesRegex(ValueError, 'physical phone not confirmed'):
-                        workflow.authorize(bad, operation)
+                        frontlights.authorize(bad, operation)
 
 
 if __name__ == '__main__':

@@ -1,9 +1,3 @@
----
-name: to-prd
-description: Supports workflows by drafting a proportionate PRD from approved decisions and current repository evidence.
-user-invocable: false
----
-
 # Proportionate PRD
 
 Read the discovery log, repository instructions and relevant implementation.

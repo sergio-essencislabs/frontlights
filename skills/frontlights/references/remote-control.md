@@ -1,14 +1,8 @@
----
-name: total-remote-control
-description: Guides the user, step by step and with option-based questions, to make this PC a fixed machine in the Claude mobile app by starting a persistent Remote Control host and confirming the phone reaches it. Run it from an interactive claude session opened in the project folder.
-disable-model-invocation: true
----
-
 # Fixed machine in the Claude mobile app
 
-The user runs this as `/workflows:total-remote-control` inside an interactive
-`claude` session opened from PowerShell in the project folder. `/workflows` sends
-them here; they may also run it directly. The goal is one thing only: this PC
+The `/frontlights` session reads this reference only when the user asks for a
+guided Remote Control setup (power settings, the phone test). Stage 0 never
+sends the user here on its own: it only shows the `claude rc` guidance. The goal is one thing only: this PC
 appears in the Claude mobile app as a machine where the user can open sessions,
 and the user has proven it by opening one from the phone.
 
@@ -26,7 +20,7 @@ machine appear for new sessions.
 
 ## 1. Read the machine
 
-Run `python "${CLAUDE_PLUGIN_ROOT}/scripts/workflow.py" monitoring --root .` and
+Run `python "${CLAUDE_PLUGIN_ROOT}/scripts/frontlights.py" monitoring --root .` and
 tell the user, in one short paragraph, the two power values and whether a host
 process exists. A missing power value reads as unknown, never as zero. No
 candidate process is a safe conclusion that no host runs here. A candidate is a
@@ -48,8 +42,8 @@ State them as requirements, in plain words, then ask two questions together:
 
 Header `Condições`: `Concordo`, `Não posso`. Header `Energia`, "A máquina fica na
 tomada enquanto você estiver fora?": `Na tomada`, `Na bateria`, `Não sei`.
-`Não posso` ends the skill: tell the user the phone can still follow a single
-session, and that `/workflows` will run in local mode. Battery or unknown power
+`Não posso` ends this setup: tell the user the phone can still follow a single
+session, and that `/frontlights` will run in local mode. Battery or unknown power
 continues with the caveat that only about ninety seconds of locked survival were
 ever measured, on battery; promise nothing beyond that.
 
@@ -120,20 +114,20 @@ on screen is never that evidence.
 
 ## 7. Record and hand back
 
-Write `.workflows/monitoring.json` in the project as a historical record: mode
+Write `.frontlights/monitoring.json` in the project as a historical record: mode
 `phone`, `confirmed_by`, `observed_phone_confirmation` with its time, host name,
 detected process id, measured power values, caveats and
 `"valid_while_process_runs": true`. Never write `phone_connected` there; the
 preflight of later sessions reads this record and reports `host.known` only while
-the same process, started before the confirmation, is still running. Write nothing else, and nothing outside `.workflows/`: no
+the same process, started before the confirmation, is still running. Write nothing else, and nothing outside `.frontlights/`: no
 scheduled task, startup shortcut, service or background logon host (hosts
 started that way died about twenty seconds after the phone connected).
 
-Close with the reminders — host window open, lid open, PC may lock — and tell
-the user to answer `Concluí e o celular respondeu` back in the `/workflows`
-session, which redetects the host itself. From then on, new `/workflows`
-sessions skip the phone question while this host window stays open; closing it
-or restarting the host brings the question back.
+Close with the reminders — host window open, lid open, PC may lock — rerun the
+preflight, record the stage 0 `monitoring` block from it, and go back to where
+the `/frontlights` session was. From then on, new `/frontlights` sessions report
+`host.known` in one line while this host window stays open; closing it or
+restarting the host brings back the `claude rc` guidance.
 
 ## After a restart or disconnection
 
