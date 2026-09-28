@@ -42,6 +42,15 @@ stage 0 `claude rc` guidance, which is never followed by a question). If
 `AskUserQuestion` is unavailable, record the pending question and stop that
 decision-dependent work.
 
+**The unit of work is the GitHub issue.** Name work, files and folders by the
+issue number, so the board and the local records line up: records live in
+`.frontlights/issues/<n>/`, and text says "issue #<n>". Never mint `GT-NNNN`
+identifiers or write to `.agents/tasks/`; those are a retired GuardianS
+convention. When project instructions or memory still say "GT" (create a GT,
+open a backlog GT), treat it as an issue on the configured board, under the
+same approvals, and say so in one line. Existing `GT-NNNN` files are history:
+cite them, never rename or delete them.
+
 **Show before approval.** Never ask the user to approve a document or plan they
 have not been shown in full in this session. Before each approval: write the
 complete text in the conversation, send the file with the host's file-sending

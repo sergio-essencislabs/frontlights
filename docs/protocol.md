@@ -73,6 +73,13 @@ do plugin enquanto ele executa trabalho no projeto consumidor. Estrutura recomen
     evidence/<data-hora>.txt
 ```
 
+A unidade de trabalho é a issue do GitHub, identificada pelo número, para que o
+quadro e os registros locais coincidam. O plugin não cria identificadores
+`GT-NNNN` nem escreve em `.agents/tasks/`, convenção aposentada do GuardianS.
+Instruções de projeto que ainda peçam uma GT são tratadas como pedido de issue no
+quadro, com as mesmas aprovações. Arquivos `GT-NNNN` existentes ficam como
+histórico.
+
 Esses arquivos não determinam de forma independente a situação das issues. Use uma
 resposta JSON recente de `gh api repos/PROPRIETARIO/REPOSITORIO/issues/NUMERO` para
 registrar o estado da issue. Não copie tokens, credenciais ou dados privados alheios

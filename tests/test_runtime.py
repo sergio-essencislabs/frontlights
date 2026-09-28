@@ -31,6 +31,15 @@ class ReleaseManifestTests(unittest.TestCase):
             self.assertIn(f'references/{name}.md', text)
             self.assertTrue((ROOT / 'skills' / 'frontlights' / 'references' / f'{name}.md').is_file())
 
+    def test_work_is_named_by_issue_never_by_retired_gt_ids(self):
+        skill = ROOT / 'skills' / 'frontlights'
+        text = (skill / 'SKILL.md').read_text(encoding='utf-8')
+        self.assertIn('.frontlights/issues/<n>/', text)
+        self.assertIn('Never mint `GT-NNNN`', text)
+        for path in (skill / 'references').glob('*.md'):
+            with self.subTest(path=path.name):
+                self.assertNotRegex(path.read_text(encoding='utf-8'), r'\bGTs?\b')
+
 
 def issue(number, paths, dependencies=()):
     return dict(id=number, title=f'Deliver outcome {number}',

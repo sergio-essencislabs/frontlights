@@ -1,7 +1,7 @@
 # Vertical issue planning
 
 Read the approved PRD revision and current GitHub issues/board. Reuse an existing
-matching issue when its acceptance scope fits; never create duplicate local GTs.
+matching issue when its acceptance scope fits; never create a duplicate local task.
 Use `templates/issue.md` and `examples/plan.json`. Before publication, temporary
 integer IDs are proposal IDs only; remap every dependency to real GitHub numbers
 after creation and verify links. Local status is always a timestamped snapshot.

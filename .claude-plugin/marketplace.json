@@ -9,7 +9,7 @@
     {
       "name": "frontlights",
       "source": "./",
-      "version": "0.8.1",
+      "version": "0.8.2",
       "description": "Conduz qualquer pedido — funcionalidade, bug, refatoração, pesquisa ou documento — por descoberta, PRD aprovado, issues verticais e implementação com testes e autorização delimitada. RoadS é uma entrada opcional."
     }
   ]
