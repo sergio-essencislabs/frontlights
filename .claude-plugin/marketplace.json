@@ -2,14 +2,14 @@
   "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
   "name": "frontlights",
   "owner": {
-    "name": "Essencis Labs"
+    "name": "SworkS"
   },
   "description": "Marketplace do plugin Frontlights: descoberta guiada, PRDs aprovados, issues verticais no GitHub e entrega delimitada, dimensionadas ao pedido.",
   "plugins": [
     {
       "name": "frontlights",
       "source": "./",
-      "version": "0.7.1",
+      "version": "0.7.2",
       "description": "Conduz qualquer pedido — funcionalidade, bug, refatoração, pesquisa ou documento — por descoberta, PRD aprovado, issues verticais e implementação com testes e autorização delimitada. RoadS é uma entrada opcional."
     }
   ]
