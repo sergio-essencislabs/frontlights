@@ -713,8 +713,8 @@ class UpdateCheckTests(unittest.TestCase):
         self.assertEqual(result['status'], 'update_available')
         self.assertEqual(result['commands'], ['claude plugin marketplace update market',
                                               'claude plugin update pilot@market'])
-        self.assertEqual(fetch.call_args[0][0], 'https://raw.githubusercontent.com/OWNER/REPOSITORY'
-                                                '/HEAD/.claude-plugin/marketplace.json')
+        self.assertEqual(fetch.call_args[0][0], 'https://api.github.com/repos/OWNER/REPOSITORY'
+                                                '/contents/.claude-plugin/marketplace.json')
 
     def test_same_or_older_published_version_is_current(self):
         for published in ('0.7.2', '0.7.1'):
@@ -727,7 +727,7 @@ class UpdateCheckTests(unittest.TestCase):
         self.known({'source': 'git', 'url': 'https://github.com/OWNER/REPOSITORY.git'})
         result, fetch = self.check('0.8.0')
         self.assertEqual(result['status'], 'update_available')
-        self.assertIn('/OWNER/REPOSITORY/', fetch.call_args[0][0])
+        self.assertIn('/repos/OWNER/REPOSITORY/', fetch.call_args[0][0])
 
     def test_network_failure_or_unknown_source_is_unavailable_not_current(self):
         result, _ = self.check(error=OSError('offline'))

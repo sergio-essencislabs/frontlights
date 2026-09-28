@@ -602,7 +602,9 @@ def marketplace_repo(source):
 
 
 def fetch_text(url):
-    with urllib.request.urlopen(urllib.request.Request(url), timeout=10) as response:
+    request = urllib.request.Request(url, headers={'Accept': 'application/vnd.github.raw+json',
+                                                   'User-Agent': 'frontlights-update-check'})
+    with urllib.request.urlopen(request, timeout=10) as response:
         raw = response.read(1_000_001)
     require(len(raw) <= 1_000_000, 'published manifest exceeds limit')
     return raw.decode('utf-8-sig')
@@ -625,7 +627,9 @@ def update_check(plugin_root=PLUGIN_ROOT, config_dir=None):
         known = load(config_dir / 'plugins' / 'known_marketplaces.json')
         repo = marketplace_repo((known.get(market_name) or {}).get('source'))
         require(repo, 'marketplace is not hosted on GitHub')
-        url = f'https://raw.githubusercontent.com/{repo}/HEAD/.claude-plugin/marketplace.json'
+        # The contents API, not raw.githubusercontent.com: raw caches for minutes
+        # and would hide a version pushed just before the session.
+        url = f'https://api.github.com/repos/{repo}/contents/.claude-plugin/marketplace.json'
         result['source'] = url
         entry = next(p for p in json.loads(fetch_text(url))['plugins'] if p.get('name') == plugin['name'])
         result['published'] = entry.get('version')
