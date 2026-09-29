@@ -32,7 +32,7 @@ Git e, para consultar o GitHub, GitHub CLI autenticado. Não exige pacotes Pytho
 Instale pelo marketplace deste repositório:
 
 ```powershell
-claude plugin marketplace add sergio-essencislabs/frontlights
+claude plugin marketplace add smendesj/frontlights
 claude plugin install frontlights@frontlights
 ```
 
