@@ -42,11 +42,11 @@ CLI/plugin version, session identity, repository/issue URLs, commits and outputs
     changes. Confirm one "Ficou claro?" shares the call with at most three
     decisions, and that no call ever holds more than four questions. Answer
     "Entendi" once and confirm the decisions stand. Pick "Explicar de outro
-    jeito" twice: the decisions in that call are asked again, and "Seguir com a
-    recomendação e marcar a revisar" appears only after the second
-    re-explanation and records the decision as "tomada pela recomendação, a
-    revisar" under Decisions and Open decisions, and as the first branch offered
-    at the closing. Repeat with "Desligado": the solution round shows exactly
+    jeito" twice: the decisions in that call are asked again, and "Seguir a
+    recomendação" (its description says the decision is marked "a revisar")
+    appears only after the second re-explanation and records the decision as
+    "tomada pela recomendação, a revisar" under Decisions and Open decisions,
+    and as the first branch offered at the closing. Repeat with "Desligado": the solution round shows exactly
     three approaches plus "Explicar antes de decidir". Pick that option on one
     of several questions in a call: the explanation comes, the same question
     returns without the option together with the check, and the other answers

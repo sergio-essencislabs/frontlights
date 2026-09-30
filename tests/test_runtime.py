@@ -1,5 +1,6 @@
 import copy
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -74,6 +75,8 @@ class ReleaseManifestTests(unittest.TestCase):
                           'The other answers given in that call stand',
                           'never holds more than four questions',
                           'when the call carries the check and four decisions are pending',
+                          'that next call carries a check only if an explanation was written '
+                          'since the last check',
                           'is never permission to decide for them'),
             headings[2]: ('one "Ficou claro?" covering every concept explained in the round',
                           'up to three decisions', '"Entendi"', '"Explicar de outro jeito"',
@@ -81,15 +84,36 @@ class ReleaseManifestTests(unittest.TestCase):
                           'This is the learning-mode exception to not re-asking settled decisions',
                           'After two re-explanations of the same round have been given',
                           'to every later check of that round',
-                          'Seguir com a recomendação e marcar a revisar',
+                          '"Seguir a recomendação"',
+                          'its description says the decision is marked "a revisar"',
                           'tell the user which option was taken for each decision',
                           'tomada pela recomendação, a revisar'),
-            headings[3]: ('Concepts explained', 'Never record secrets'),
+            headings[3]: ('Concepts explained', 'each change of it', 'Never record secrets'),
         }
         for heading, phrases in expected.items():
             for phrase in phrases:
                 with self.subTest(section=heading, phrase=phrase):
                     self.assertIn(phrase, bodies[heading])
+
+    def test_follow_recommendation_label_fits_the_five_word_limit_everywhere(self):
+        old = 'Seguir com a recomendação e marcar a revisar'
+        learning = (ROOT / 'skills' / 'frontlights' / 'references' / 'learning.md').read_text(encoding='utf-8')
+        pilot = (ROOT / 'evals' / 'pilot.md').read_text(encoding='utf-8')
+        for name, text in (('learning.md', learning), ('pilot.md', pilot)):
+            flat = ' '.join(text.split())
+            with self.subTest(file=name):
+                self.assertNotIn(old, flat)
+                self.assertIn('"Seguir a recomendação"', flat)
+        label = re.search(r'add "([^"]+)" to every later check', ' '.join(learning.split())).group(1)
+        self.assertLessEqual(len(label.split()), 5)
+
+    def test_readme_describes_learning_mode(self):
+        flat = ' '.join((ROOT / 'README.md').read_text(encoding='utf-8').split())
+        for phrase in ('modo aprendizado', 'desligado por padrão', '"Explicar antes de decidir"',
+                       '"Ficou claro?"', '"Seguir a recomendação"', '"a revisar"',
+                       'suposição, não como decisão aprovada'):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, flat)
 
     def test_grilling_offers_learning_mode_with_depth_and_keeps_three_approaches(self):
         skill = ROOT / 'skills' / 'frontlights'
@@ -101,6 +125,8 @@ class ReleaseManifestTests(unittest.TestCase):
                        'or the conversation has been compacted',
                        'read the mode back from the discovery log',
                        "update the log's learning-mode line whenever the mode changes",
+                       "add the change, with the question where it happened, to the log's "
+                       'learning-mode changes line',
                        'turn the mode on or off at any time', 'Record both choices.'):
             with self.subTest(section='depth', phrase=phrase):
                 self.assertIn(phrase, depth)
@@ -136,6 +162,9 @@ class ReleaseManifestTests(unittest.TestCase):
         text = (ROOT / 'templates' / 'discovery.md').read_text(encoding='utf-8')
         self.assertIn('- Learning mode (ligado / desligado):', text)
         self.assertLess(text.index('- Grilling depth'), text.index('- Learning mode'))
+        self.assertIn('- Learning mode changes (nenhuma, ou cada troca e a pergunta em que ocorreu):', text)
+        self.assertLess(text.index('- Learning mode ('), text.index('- Learning mode changes'))
+        self.assertLess(text.index('- Learning mode changes'), text.index('## Project conventions'))
         self.assertIn('## Concepts explained', text)
         self.assertIn('| Concept | Summary | Where it came up |', text)
         self.assertLess(text.index('## Decisions'), text.index('## Concepts explained'))
