@@ -39,10 +39,12 @@ for one in free text.
   "Explicar antes de decidir". It takes one slot, so the question then has at
   most three real options, and the solution round has exactly three approaches.
   When the user picks it, or asks in free text, explain and then ask the same
-  question again, without the explain option, together with the understanding
-  check below. The other answers given in that call stand.
-- A call never holds more than four questions, the check included: when four
-  decisions are pending, ask three with the check and the rest in the next call.
+  question again together with the understanding check below; a question asked
+  again never carries the explain option. The other answers given in that call
+  stand.
+- A call never holds more than four questions, the check included: when the call
+  carries the check and four decisions are pending, ask three with the check and
+  the rest in the next call.
 - Never treat an explanation as a decision. The user still chooses, and "Entendi"
   is never permission to decide for them.
 
@@ -60,13 +62,14 @@ four questions. Its options:
 - "Explicar de outro jeito": re-explain from a different angle (an analogy, a
   smaller step, another excerpt), then ask again. There is no limit on
   re-explanations. The decisions answered in the same call are not final: ask
-  them again after the new explanation. This is the one exception to not
-  re-asking settled decisions.
-- After two re-explanations have been given, add "Seguir com a recomendação e
-  marcar a revisar" to every later check: take the recommended option for each
-  decision asked in that call, replacing any provisional answer. Give each one
-  the status "tomada pela recomendação, a revisar" in the Decisions table and
-  list it under "Open decisions", so the user can come back to it.
+  them again after the new explanation. This is the learning-mode exception to
+  not re-asking settled decisions.
+- After two re-explanations of the same round have been given, add "Seguir com a
+  recomendação e marcar a revisar" to every later check of that round: take the
+  recommended option for each decision asked in that call, replacing any
+  provisional answer, and tell the user which option was taken for each decision.
+  Give each one the status "tomada pela recomendação, a revisar" in the Decisions
+  table and list it under "Open decisions", so the user can come back to it.
 
 ## Record
 

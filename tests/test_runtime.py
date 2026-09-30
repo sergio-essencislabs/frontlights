@@ -70,13 +70,19 @@ class ReleaseManifestTests(unittest.TestCase):
             headings[0]: ('mark the comments as yours', "never inside an option's `preview`",
                           'Never include secrets', 'short enough to read on a phone'),
             headings[1]: ('"Explicar antes de decidir"', 'at most three real options',
-                          'without the explain option', 'The other answers given in that call stand',
-                          'never holds more than four questions', 'is never permission to decide for them'),
+                          'a question asked again never carries the explain option',
+                          'The other answers given in that call stand',
+                          'never holds more than four questions',
+                          'when the call carries the check and four decisions are pending',
+                          'is never permission to decide for them'),
             headings[2]: ('one "Ficou claro?" covering every concept explained in the round',
                           'up to three decisions', '"Entendi"', '"Explicar de outro jeito"',
                           'no limit on re-explanations', 'are not final',
-                          'After two re-explanations have been given',
+                          'This is the learning-mode exception to not re-asking settled decisions',
+                          'After two re-explanations of the same round have been given',
+                          'to every later check of that round',
                           'Seguir com a recomendação e marcar a revisar',
+                          'tell the user which option was taken for each decision',
                           'tomada pela recomendação, a revisar'),
             headings[3]: ('Concepts explained', 'Never record secrets'),
         }
@@ -93,6 +99,7 @@ class ReleaseManifestTests(unittest.TestCase):
                        'in the same `AskUserQuestion` call', '"Desligado"',
                        'Read `references/learning.md` before writing the first explanation',
                        'or the conversation has been compacted',
+                       'read the mode back from the discovery log',
                        'turn the mode on or off at any time', 'Record both choices.'):
             with self.subTest(section='depth', phrase=phrase):
                 self.assertIn(phrase, depth)
@@ -115,7 +122,9 @@ class ReleaseManifestTests(unittest.TestCase):
         for phrase in ('asked for another explanation in the same call', 'marked "a revisar"'):
             with self.subTest(section='closing', phrase=phrase):
                 self.assertIn(phrase, closing)
-        self.assertIn('concepts explained', flat.split('## Recording')[1])
+        recording = flat.split('## Recording')[1]
+        self.assertIn('concepts explained', recording)
+        self.assertIn('as assumptions to be shown, never as approved decisions', recording)
         skill_text = (skill / 'SKILL.md').read_text(encoding='utf-8')
         self.assertIn('`references/learning.md` is read only when the user turns learning mode on '
                       'in the grilling or asks for an explanation there.', ' '.join(skill_text.split()))
