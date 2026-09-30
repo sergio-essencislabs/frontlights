@@ -9,6 +9,7 @@
 - Assumptions requiring verification:
 
 - Grilling depth (rápida / padrão / exaustiva):
+- Learning mode (ligado / desligado):
 
 ## Project conventions
 
@@ -31,6 +32,12 @@
 | Implementation approach | | | unresolved |
 
 Every decision-tree branch ends answered or marked "não se aplica, porque…".
+
+## Concepts explained
+
+| Concept | Summary | Where it came up |
+| --- | --- | --- |
+| | | |
 
 ## Pre-mortem
 

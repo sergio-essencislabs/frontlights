@@ -17,15 +17,26 @@ an issue shortens the problem round; it never removes the solution round.
 
 ## 0. Depth
 
-Open the interview with one question: "Qual profundidade de grilling?" Options,
-recommended first according to the size and risk of the work:
+Open the interview with the depth question: "Qual profundidade de grilling?"
+Options, recommended first according to the size and risk of the work:
 
 - **Padrão:** problem round, solution round and decision tree (default).
 - **Rápida:** confirm the problem in one question, then the solution round only.
 - **Exaustiva:** everything, plus the pre-mortem and a critique of the issue.
 
 The depth changes how many branches are explored, never the minimum of three
-approaches in the solution round. Record the choice.
+approaches in the solution round.
+
+Ask the learning-mode question in the same `AskUserQuestion` call as the depth:
+"Ativar o modo aprendizado?", with "Desligado" first and recommended (the default)
+and "Ligado". It helps a user who is still learning to understand the technical
+decisions while making them. Read `references/learning.md` before writing the
+first explanation: right away when the mode is on, otherwise the first time the
+user picks "Explicar antes de decidir" or asks for an explanation, and again
+whenever the user turns the mode on later or the conversation has been compacted,
+in which case read the mode back from the discovery log. The user can turn the
+mode on or off at any time; apply it from the next question and update the log's
+learning-mode line whenever the mode changes. Record both choices.
 
 ## 1. Problem round
 
@@ -68,6 +79,11 @@ configuration instead of code. When the problem truly admits fewer than three
 sensible approaches, say why in the question text and offer the real ones plus
 "Investigar mais antes de decidir".
 
+With learning mode off, the fourth option is "Explicar antes de decidir", so the
+round has exactly three approaches; it takes a slot and never replaces an
+approach below the minimum of three. With learning mode on, explain first (see
+`references/learning.md`) and the round may carry four approaches.
+
 For every approach, the option `preview` shows:
 
 - files and modules touched, with a short sketch (signature, pseudo-diff or flow);
@@ -84,7 +100,8 @@ approaches with the reason.
 
 After the approach is chosen, walk its branches in order. Each relevant branch
 is one question with at least three concrete options when three sensible ones
-exist, batched at most four per round. Pick the branches by kind of work:
+exist, batched at most four per call (the learning-mode check counts as one).
+Pick the branches by kind of work:
 
 | Kind | Branches |
 | --- | --- |
@@ -93,6 +110,12 @@ exist, batched at most four per round. Pick the branches by kind of work:
 | Refactor | target boundary, migration order, behavior preservation evidence, pattern it converges to, rollback |
 | Integration | contract and versioning, authentication (never secrets in the repository), failure and retry, test doubles vs. live verification, rate and cost |
 | Document | audience, structure, sources of truth, maintenance owner |
+
+Technical branches (every branch except scope, priority and other product
+questions) follow the slot rule of `references/learning.md`. With learning mode
+off, the last option is "Explicar antes de decidir" (at most three real
+options); its `preview` only lists what will be explained. With it on, explain
+first and put one "Ficou claro?" check in the same call as up to three decisions.
 
 Every branch ends answered or marked "não se aplica, porque…" in the discovery
 log. At Rápida depth, ask only the branches that change the implementation and
@@ -109,18 +132,22 @@ change the approach.
 Never decide alone that the interview is over. End with one question whose
 options are "Seguir para o plano/PRD", "Aprofundar <the most uncertain open
 branch>" and "Aprofundar <the next one>". Keep going while the user chooses to
-deepen, and do not re-ask settled decisions unless new evidence invalidates them;
-explain such changes.
+deepen, and do not re-ask settled decisions unless new evidence invalidates them
+or the user asked for another explanation in the same call (see
+`references/learning.md`); explain such changes. Decisions marked "a revisar"
+(taken by recommendation in learning mode) come first among the branches offered
+for deepening.
 
 ## Recording
 
-Record everything in `templates/discovery.md`: depth, conventions with example
-paths, approaches considered (chosen and rejected, with reasons and pattern fit),
-branch decisions, pre-mortem, unresolved questions, approval references and
-evidence. If a small research/prototype step is needed, bound it and obtain
-permission for any changes beyond existing authority. Do not start product
-implementation here.
+Record everything in `templates/discovery.md`: depth, learning mode, conventions
+with example paths, approaches considered (chosen and rejected, with reasons and
+pattern fit), branch decisions, concepts explained, pre-mortem, unresolved
+questions, approval references and evidence. If a small research/prototype step
+is needed, bound it and obtain permission for any changes beyond existing
+authority. Do not start product implementation here.
 
 Carry approved decisions, the chosen approach, the recorded conventions and
-unresolved items into stage 4 (PRD) as the input. A decision log is planning
-evidence, never an issue status database.
+unresolved items into stage 4 (PRD) as the input. Decisions marked "a revisar"
+go in as assumptions to be shown, never as approved decisions. A decision log is
+planning evidence, never an issue status database.
