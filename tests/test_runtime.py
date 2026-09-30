@@ -61,12 +61,29 @@ class ReleaseManifestTests(unittest.TestCase):
         positions = [text.index(heading) for heading in headings]
         self.assertEqual(positions, sorted(positions))
         flat = ' '.join(text.split())
-        for phrase in ('Explicar antes de decidir', 'at most three real options',
-                       'one "Ficou claro?" covering every concept explained in the round',
-                       'up to three decisions', 'Entendi', 'Explicar de outro jeito',
-                       'Seguir com a recomendação e marcar a revisar', 'Concepts explained'):
-            with self.subTest(phrase=phrase):
-                self.assertIn(phrase, flat)
+        self.assertIn('Read this file before writing the first explanation', flat.split(headings[0])[0])
+        bodies = {}
+        for heading, following in zip(headings, headings[1:] + (None,)):
+            body = flat.split(heading)[1]
+            bodies[heading] = body.split(following)[0] if following else body
+        expected = {
+            headings[0]: ('mark the comments as yours', "never inside an option's `preview`",
+                          'Never include secrets', 'short enough to read on a phone'),
+            headings[1]: ('"Explicar antes de decidir"', 'at most three real options',
+                          'without the explain option', 'The other answers given in that call stand',
+                          'never holds more than four questions', 'is never permission to decide for them'),
+            headings[2]: ('one "Ficou claro?" covering every concept explained in the round',
+                          'up to three decisions', '"Entendi"', '"Explicar de outro jeito"',
+                          'no limit on re-explanations', 'are not final',
+                          'After two re-explanations have been given',
+                          'Seguir com a recomendação e marcar a revisar',
+                          'tomada pela recomendação, a revisar'),
+            headings[3]: ('Concepts explained', 'Never record secrets'),
+        }
+        for heading, phrases in expected.items():
+            for phrase in phrases:
+                with self.subTest(section=heading, phrase=phrase):
+                    self.assertIn(phrase, bodies[heading])
 
     def test_grilling_offers_learning_mode_with_depth_and_keeps_three_approaches(self):
         skill = ROOT / 'skills' / 'frontlights'
@@ -74,21 +91,36 @@ class ReleaseManifestTests(unittest.TestCase):
         depth = flat.split('## 0. Depth')[1].split('## 1. Problem round')[0]
         for phrase in ('"Qual profundidade de grilling?"', '"Ativar o modo aprendizado?"',
                        'in the same `AskUserQuestion` call', '"Desligado"',
-                       '`references/learning.md`', 'Record both choices.'):
+                       'Read `references/learning.md` before writing the first explanation',
+                       'or the conversation has been compacted',
+                       'turn the mode on or off at any time', 'Record both choices.'):
             with self.subTest(section='depth', phrase=phrase):
                 self.assertIn(phrase, depth)
-        self.assertLess(depth.index('"Ativar o modo aprendizado?"'), depth.index('`references/learning.md`'))
+        self.assertLess(depth.index('"Ativar o modo aprendizado?"'), depth.index('Read `references/learning.md`'))
         solution = flat.split('## 3. Solution round')[1].split('## 4. Decision tree')[0]
-        for phrase in ('exactly three approaches', '"Explicar antes de decidir"', 'at least three genuinely different approaches'):
+        for phrase in ('at least three genuinely different approaches',
+                       'With learning mode off, the fourth option is "Explicar antes de decidir", '
+                       'so the round has exactly three approaches'):
             with self.subTest(section='solution', phrase=phrase):
                 self.assertIn(phrase, solution)
         tree = flat.split('## 4. Decision tree')[1].split('## 5. Pre-mortem')[0]
-        for phrase in ('"Explicar antes de decidir"', '"Ficou claro?"', 'up to three decisions'):
+        for phrase in ('batched at most four per call', 'the learning-mode check counts as one',
+                       'every branch except scope, priority and other product questions',
+                       'the last option is "Explicar antes de decidir" (at most three real options)',
+                       'its `preview` only lists what will be explained',
+                       'one "Ficou claro?" check in the same call as up to three decisions'):
             with self.subTest(section='tree', phrase=phrase):
                 self.assertIn(phrase, tree)
+        closing = flat.split('## 6. Closing')[1].split('## Recording')[0]
+        for phrase in ('asked for another explanation in the same call', 'marked "a revisar"'):
+            with self.subTest(section='closing', phrase=phrase):
+                self.assertIn(phrase, closing)
         self.assertIn('concepts explained', flat.split('## Recording')[1])
-        stage3 = (skill / 'SKILL.md').read_text(encoding='utf-8').split('## 3.')[1].split('## 4.')[0]
-        self.assertIn('learning mode', ' '.join(stage3.split()))
+        skill_text = (skill / 'SKILL.md').read_text(encoding='utf-8')
+        self.assertIn('`references/learning.md` is read only when the user turns learning mode on '
+                      'in the grilling or asks for an explanation there.', ' '.join(skill_text.split()))
+        stage3 = ' '.join(skill_text.split('## 3.')[1].split('## 4.')[0].split())
+        self.assertIn('together with the learning mode (off by default', stage3)
 
     def test_discovery_template_records_learning_mode_and_concepts_explained(self):
         text = (ROOT / 'templates' / 'discovery.md').read_text(encoding='utf-8')

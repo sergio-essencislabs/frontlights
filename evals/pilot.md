@@ -40,14 +40,20 @@ CLI/plugin version, session identity, repository/issue URLs, commits and outputs
     the concept in plain words, why the project does it that way, a commented
     excerpt with its path (about fifteen lines, no secrets) and what each option
     changes. Confirm one "Ficou claro?" shares the call with at most three
-    decisions. Pick "Explicar de outro jeito" twice: the decisions in that call
-    are asked again, and "Seguir com a recomendação e marcar a revisar" appears
-    only from the second re-explanation on and lands the decision under Open
-    decisions. Repeat with "Desligado": the solution round shows exactly three
-    approaches plus "Explicar antes de decidir". Confirm the discovery log
-    records the mode and one row per concept. Check on the phone that the
-    explanations are readable. The textual tests only prove these rules are
-    written down; this step proves they are followed.
+    decisions, and that no call ever holds more than four questions. Answer
+    "Entendi" once and confirm the decisions stand. Pick "Explicar de outro
+    jeito" twice: the decisions in that call are asked again, and "Seguir com a
+    recomendação e marcar a revisar" appears only after the second
+    re-explanation and records the decision as "tomada pela recomendação, a
+    revisar" under Decisions and Open decisions, and as the first branch offered
+    at the closing. Repeat with "Desligado": the solution round shows exactly
+    three approaches plus "Explicar antes de decidir". Pick that option on one
+    of several questions in a call: the explanation comes, the same question
+    returns without the option together with the check, and the other answers
+    stand. Confirm no explanation or excerpt contains a secret, the discovery
+    log records the mode and one row per concept, and the explanations are
+    readable on the phone. The textual tests only prove these rules are written
+    down; this step proves they are followed.
 
 Only after all required checks pass, present the linked evidence and separately
 ask about default-workflow switching and GuardianS deactivation via AskUserQuestion.

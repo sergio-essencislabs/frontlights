@@ -33,7 +33,9 @@ and "Ligado". It helps a user who is still learning to understand the technical
 decisions while making them. Read `references/learning.md` before writing the
 first explanation: right away when the mode is on, otherwise the first time the
 user picks "Explicar antes de decidir" or asks for an explanation, and again
-whenever the user turns the mode on later. Record both choices.
+whenever the user turns the mode on later or the conversation has been compacted.
+The user can turn the mode on or off at any time; apply it from the next
+question. Record both choices.
 
 ## 1. Problem round
 
@@ -97,7 +99,8 @@ approaches with the reason.
 
 After the approach is chosen, walk its branches in order. Each relevant branch
 is one question with at least three concrete options when three sensible ones
-exist, batched at most four per round. Pick the branches by kind of work:
+exist, batched at most four per call (the learning-mode check counts as one).
+Pick the branches by kind of work:
 
 | Kind | Branches |
 | --- | --- |
@@ -107,10 +110,11 @@ exist, batched at most four per round. Pick the branches by kind of work:
 | Integration | contract and versioning, authentication (never secrets in the repository), failure and retry, test doubles vs. live verification, rate and cost |
 | Document | audience, structure, sources of truth, maintenance owner |
 
-Technical branches follow the slot rule of `references/learning.md`. With
-learning mode off, the last option is "Explicar antes de decidir" (at most three
-real options). With it on, explain first and put one "Ficou claro?" check in the
-same call as up to three decisions.
+Technical branches (every branch except scope, priority and other product
+questions) follow the slot rule of `references/learning.md`. With learning mode
+off, the last option is "Explicar antes de decidir" (at most three real
+options); its `preview` only lists what will be explained. With it on, explain
+first and put one "Ficou claro?" check in the same call as up to three decisions.
 
 Every branch ends answered or marked "não se aplica, porque…" in the discovery
 log. At Rápida depth, ask only the branches that change the implementation and
@@ -127,8 +131,11 @@ change the approach.
 Never decide alone that the interview is over. End with one question whose
 options are "Seguir para o plano/PRD", "Aprofundar <the most uncertain open
 branch>" and "Aprofundar <the next one>". Keep going while the user chooses to
-deepen, and do not re-ask settled decisions unless new evidence invalidates them;
-explain such changes.
+deepen, and do not re-ask settled decisions unless new evidence invalidates them
+or the user asked for another explanation in the same call (see
+`references/learning.md`); explain such changes. Decisions marked "a revisar"
+(taken by recommendation in learning mode) come first among the branches offered
+for deepening.
 
 ## Recording
 
