@@ -23,8 +23,10 @@ relatada. Uma confirmação anterior só sobrevive como `host.known`: o
 aponta o mesmo pid de um host ainda em execução, iniciado antes da confirmação.
 
 A verificação do host vem antes de tudo e não faz pergunta nenhuma. Sem host, o
-usuário recebe uma única orientação: rodar `claude rc` num PowerShell e deixar a
-janela aberta para o dispositivo ficar online. Com `host.known`, o registro é
+usuário recebe uma única orientação curta: abrir um PowerShell na pasta do
+projeto, rodar `claude rc` (confiando na pasta, se pedir), deixar a janela aberta
+e iniciar a sessão pelo dispositivo no celular, além da oferta da configuração
+guiada de energia para tampa fechada ou PC bloqueado. Com `host.known`, o registro é
 `phone` com `phone_connected: true`; com outro host, `alternative` com
 `confirmed_by: "preflight"`; sem host, `local`. Fora de `host.known`, `phone` com
 `phone_connected: true` só vale se o usuário afirmar, por conta própria na sessão

@@ -77,11 +77,26 @@ in the CLI: this stage never calls `AskUserQuestion`.
   with the command in its own code block, and go straight on to stage 1 without
   waiting:
 
-  > Para o PC ficar online no app Claude do celular, abra um PowerShell (fora
-  > deste app), rode o comando abaixo e deixe essa janela aberta. Se fechar a
-  > janela, o dispositivo sai do ar.
+  > Para o PC ficar online no app Claude do celular:
+  >
+  > 1. Abra um PowerShell (fora deste app) e entre na pasta do projeto.
+  > 2. Rode `claude rc` nessa pasta. Se pedir para confiar na pasta, aceite. Se
+  >    não pedir e o comando não iniciar, rode `claude` na pasta para confiar,
+  >    saia com `/exit` e rode `claude rc` de novo.
+  > 3. Deixe essa janela aberta. Se fechar a janela, o dispositivo sai do ar.
+  >    Use uma janela por projeto.
+  > 4. No celular, abra o app Claude, inicie uma sessão pelo dispositivo e
+  >    escolha o repositório. A sessão fica sincronizada entre o celular e o
+  >    desktop.
+  >
+  > Depois de reiniciar o PC ou o Claude, repita os passos 1 e 2 em cada pasta.
+  >
+  > Para continuar pelo celular com a tampa fechada ou o PC bloqueado, peça a
+  > configuração guiada de energia durante o `/frontlights`: eu mostro os
+  > comandos e você os roda.
 
   ```powershell
+  cd "<pasta do projeto>"
   claude rc
   ```
 

@@ -69,16 +69,30 @@ configuração ou rotina automática de interceptação (hook) é instalada.
 
 O `/frontlights` começa verificando, só por leitura, se há um host do
 Remote Control rodando. Não faz pergunta sobre celular. Sem host, ele apenas
-orienta: abra um PowerShell, fora do app desktop, rode o comando abaixo e deixe
-a janela aberta para o dispositivo ficar online no app Claude do celular.
+orienta, em passos curtos:
+
+1. Abra um PowerShell, fora do app desktop, e entre na pasta do projeto.
+2. Rode `claude rc` nessa pasta. Se pedir para confiar na pasta, aceite. Se não
+   pedir e o comando não iniciar, rode `claude` na pasta para confiar, saia com
+   `/exit` e rode `claude rc` de novo.
+3. Deixe a janela aberta, uma por projeto.
+4. No celular, inicie uma sessão pelo dispositivo e escolha o repositório. A
+   sessão fica sincronizada entre o celular e o desktop.
 
 ```powershell
+cd "C:\caminho\do\projeto"
 claude rc
 ```
 
-Fechar a janela tira o dispositivo do ar. Para uma configuração guiada, com
-ajuste de energia e teste no celular, peça isso durante o `/frontlights`; ele
-segue `skills/frontlights/references/remote-control.md`.
+Fechar a janela tira o dispositivo do ar. Depois de reiniciar o PC ou o Claude,
+repita os passos 1 e 2 em cada pasta: as sessões voltam sincronizadas (observado
+em um teste em uma máquina, sem garantia).
+
+Para continuar pelo celular com a tampa fechada ou o PC bloqueado, peça a
+configuração guiada durante o `/frontlights`. Ela lê os ajustes de energia,
+mostra os comandos `powercfg` exatos, com os valores anteriores para desfazer, e
+você os roda: o plugin nunca altera o esquema de energia sozinho. Ela também faz
+o teste no celular e segue `skills/frontlights/references/remote-control.md`.
 
 ## Configurar um projeto
 

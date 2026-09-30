@@ -49,11 +49,16 @@ ever measured, on battery; promise nothing beyond that.
 
 ## 3. Power, only when needed
 
-Only if a measured value is not zero or is unknown: show the current values and
-the exact `powercfg` lines for the active scheme and these two settings only,
-with the previous values so they can be restored. The user runs them; you do
-not change system settings. Ask header `Ajuste de energia`: `Vou rodar os
-comandos`, `Deixar como está`. After `Vou rodar os comandos`, rerun the
+This step is the offer to make the machine safe to work from the phone with the
+lid closed or the PC locked. Always make the offer here, in plain words: with
+the current values, say whether closing the lid or locking would put the
+machine to sleep or turn the session off. If a measured value is not zero or is
+unknown: show the current values and the exact `powercfg` lines for the active
+scheme and these two settings only, with the previous values so they can be
+restored. The user runs them; you do not change system settings. Say that
+locking the PC (`Win+L`) is the safe way to leave it, instead of leaving it
+unlocked. Ask header `Ajuste de energia`: `Vou rodar os comandos`, `Deixar como
+está`. After `Vou rodar os comandos`, rerun the
 preflight and report the new values. A zero lock-display value attempts to stop
 lock from entering standby; it is not a proven fix. Never set sleep to "never",
 never call `SetThreadExecutionState`, never touch another scheme.
@@ -61,7 +66,8 @@ never call `SetThreadExecutionState`, never touch another scheme.
 ## 4. Start the host in a second window
 
 Tell the user to keep this window open and open **another** PowerShell window,
-then paste, with the real folder and a short name derived from it:
+then paste, with the real folder and a short name derived from it. One window
+per project: each project folder needs its own host.
 
 ```powershell
 cd "<pasta do projeto>"
@@ -70,6 +76,11 @@ cd "<pasta do projeto>"
 ```powershell
 claude remote-control --name <nome-curto>
 ```
+
+`claude rc` is the short alias and works the same. If the folder is not trusted
+yet and the quick safety check does not appear by itself, explain that the user
+must run `claude` in that folder to trust it, accept, leave with `/exit`, and run
+the host command again.
 
 Warn in one line: it is `claude remote-control`, with a space and no dash before
 `remote`. `claude -remote-control` is not the host command: the single dash
@@ -98,8 +109,10 @@ the phone without a detected process.
 ## 6. Pin it on the phone
 
 Tell the user: no app Claude do celular, entre na área de código (Code), procure a
-máquina `<nome-curto>` na lista de ambientes ou sessões, abra, envie "teste" e
-espere a resposta. Menu names may vary with the app version; say so rather than
+máquina `<nome-curto>` na lista de ambientes ou sessões, inicie uma sessão pelo
+dispositivo escolhendo o repositório desejado, envie "teste" e espere a resposta.
+Explain that this session stays synchronized between the phone and the desktop
+window as long as the host window stays open. Menu names may vary with the app version; say so rather than
 inventing exact labels. Ask header `Celular`: `A máquina aparece e respondeu`,
 `Não aparece`, `Aparece mas não abre`.
 
@@ -130,6 +143,11 @@ the `/frontlights` session was. From then on, new `/frontlights` sessions report
 restarting the host brings back the `claude rc` guidance.
 
 ## After a restart or disconnection
+
+Tell the user to repeat the host command (`claude rc`) in each project folder, as
+in step 4. One pilot on one machine, after closing Claude and restarting Windows
+for an update, showed all three sessions returning synchronized on phone and
+desktop this way; say it is an observation, not a guarantee.
 
 Detect first. `claude remote-control --help` (CLI 2.1.282) documents that `-c`
 reattaches to the session last recorded for this folder or one of its worktrees
