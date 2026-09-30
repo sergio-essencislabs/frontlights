@@ -190,6 +190,16 @@ quebra o padrão do projeto e o custo disso. Em seguida, a skill percorre os ram
 de decisão da abordagem escolhida, e é o usuário quem decide quando parar. O
 padrão existente é o preferido; ele só é quebrado quando for comprovadamente pior
 para o caso.
+A mesma pergunta que define a profundidade oferece o modo aprendizado, desligado
+por padrão, para quem ainda está aprendendo a programar e quer entender as
+decisões enquanto as toma. Ligado, antes de cada decisão técnica a skill explica
+em texto o conceito em linguagem simples, por que o projeto faz assim, um trecho
+comentado do próprio código e o que cada opção muda, e fecha cada rodada com um
+"Ficou claro?". Desligado, a última opção de cada pergunta técnica é "Explicar
+antes de decidir". Depois de duas reexplicações da mesma rodada, aparece "Seguir
+a recomendação": a decisão fica marcada como "a revisar" e entra no PRD como
+suposição, não como decisão aprovada. O modo pode ser ligado ou desligado a
+qualquer momento, e os conceitos explicados ficam registrados no `discovery.md`.
 Toda pergunta ao usuário usa `AskUserQuestion`, sempre com opções. A conversa
 segue no idioma do usuário. Nada é aprovado sem que o texto completo tenha
 sido mostrado antes. O GitHub é a fonte oficial;

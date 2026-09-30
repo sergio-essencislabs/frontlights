@@ -10,6 +10,7 @@
 
 - Grilling depth (rápida / padrão / exaustiva):
 - Learning mode (ligado / desligado):
+- Learning mode changes (nenhuma, ou cada troca e a pergunta em que ocorreu):
 
 ## Project conventions
 

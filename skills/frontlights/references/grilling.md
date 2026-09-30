@@ -35,8 +35,10 @@ first explanation: right away when the mode is on, otherwise the first time the
 user picks "Explicar antes de decidir" or asks for an explanation, and again
 whenever the user turns the mode on later or the conversation has been compacted,
 in which case read the mode back from the discovery log. The user can turn the
-mode on or off at any time; apply it from the next question and update the log's
-learning-mode line whenever the mode changes. Record both choices.
+mode on or off at any time; apply it from the next question, update the log's
+learning-mode line whenever the mode changes and add the change, with the
+question where it happened, to the log's learning-mode changes line. Record both
+choices.
 
 ## 1. Problem round
 
