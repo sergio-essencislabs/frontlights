@@ -34,6 +34,20 @@ CLI/plugin version, session identity, repository/issue URLs, commits and outputs
    predicates. Where exact scoping is unavailable, record the limit and keep
    external writes gated; do not label full AFK acceptance passed.
 10. Restart without the plugin and verify GuardianS and project data remain intact.
+11. Learning mode. Answer "Ligado" to "Ativar o modo aprendizado?" in the same
+    call as the depth. Confirm `references/learning.md` was read before the first
+    explanation, and that each technical question is preceded by chat text with
+    the concept in plain words, why the project does it that way, a commented
+    excerpt with its path (about fifteen lines, no secrets) and what each option
+    changes. Confirm one "Ficou claro?" shares the call with at most three
+    decisions. Pick "Explicar de outro jeito" twice: the decisions in that call
+    are asked again, and "Seguir com a recomendação e marcar a revisar" appears
+    only from the second re-explanation on and lands the decision under Open
+    decisions. Repeat with "Desligado": the solution round shows exactly three
+    approaches plus "Explicar antes de decidir". Confirm the discovery log
+    records the mode and one row per concept. Check on the phone that the
+    explanations are readable. The textual tests only prove these rules are
+    written down; this step proves they are followed.
 
 Only after all required checks pass, present the linked evidence and separately
 ask about default-workflow switching and GuardianS deactivation via AskUserQuestion.

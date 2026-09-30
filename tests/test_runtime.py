@@ -27,7 +27,7 @@ class ReleaseManifestTests(unittest.TestCase):
         self.assertEqual(skills, ['frontlights'])
         text = (ROOT / 'skills' / 'frontlights' / 'SKILL.md').read_text(encoding='utf-8')
         self.assertIn('user-invocable: false', text.split('---')[1])
-        for name in ('grilling', 'prd', 'issues', 'development', 'remote-control', 'roadmap-sync'):
+        for name in ('grilling', 'prd', 'issues', 'development', 'remote-control', 'roadmap-sync', 'learning'):
             self.assertIn(f'references/{name}.md', text)
             self.assertTrue((ROOT / 'skills' / 'frontlights' / 'references' / f'{name}.md').is_file())
 
@@ -51,6 +51,53 @@ class ReleaseManifestTests(unittest.TestCase):
         for template in ('discovery.md', 'issue.md', 'prd.md'):
             with self.subTest(template=template):
                 self.assertIn('onventions', (ROOT / 'templates' / template).read_text(encoding='utf-8'))
+
+    def test_learning_reference_defines_when_to_explain_how_to_check_and_what_to_record(self):
+        text = (ROOT / 'skills' / 'frontlights' / 'references' / 'learning.md').read_text(encoding='utf-8')
+        headings = ('## What every explanation must have', '## When to explain',
+                    '## Understanding check', '## Record')
+        for heading in headings:
+            self.assertIn(heading, text)
+        positions = [text.index(heading) for heading in headings]
+        self.assertEqual(positions, sorted(positions))
+        flat = ' '.join(text.split())
+        for phrase in ('Explicar antes de decidir', 'at most three real options',
+                       'one "Ficou claro?" covering every concept explained in the round',
+                       'up to three decisions', 'Entendi', 'Explicar de outro jeito',
+                       'Seguir com a recomendação e marcar a revisar', 'Concepts explained'):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, flat)
+
+    def test_grilling_offers_learning_mode_with_depth_and_keeps_three_approaches(self):
+        skill = ROOT / 'skills' / 'frontlights'
+        flat = ' '.join((skill / 'references' / 'grilling.md').read_text(encoding='utf-8').split())
+        depth = flat.split('## 0. Depth')[1].split('## 1. Problem round')[0]
+        for phrase in ('"Qual profundidade de grilling?"', '"Ativar o modo aprendizado?"',
+                       'in the same `AskUserQuestion` call', '"Desligado"',
+                       '`references/learning.md`', 'Record both choices.'):
+            with self.subTest(section='depth', phrase=phrase):
+                self.assertIn(phrase, depth)
+        self.assertLess(depth.index('"Ativar o modo aprendizado?"'), depth.index('`references/learning.md`'))
+        solution = flat.split('## 3. Solution round')[1].split('## 4. Decision tree')[0]
+        for phrase in ('exactly three approaches', '"Explicar antes de decidir"', 'at least three genuinely different approaches'):
+            with self.subTest(section='solution', phrase=phrase):
+                self.assertIn(phrase, solution)
+        tree = flat.split('## 4. Decision tree')[1].split('## 5. Pre-mortem')[0]
+        for phrase in ('"Explicar antes de decidir"', '"Ficou claro?"', 'up to three decisions'):
+            with self.subTest(section='tree', phrase=phrase):
+                self.assertIn(phrase, tree)
+        self.assertIn('concepts explained', flat.split('## Recording')[1])
+        stage3 = (skill / 'SKILL.md').read_text(encoding='utf-8').split('## 3.')[1].split('## 4.')[0]
+        self.assertIn('learning mode', ' '.join(stage3.split()))
+
+    def test_discovery_template_records_learning_mode_and_concepts_explained(self):
+        text = (ROOT / 'templates' / 'discovery.md').read_text(encoding='utf-8')
+        self.assertIn('- Learning mode (ligado / desligado):', text)
+        self.assertLess(text.index('- Grilling depth'), text.index('- Learning mode'))
+        self.assertIn('## Concepts explained', text)
+        self.assertIn('| Concept | Summary | Where it came up |', text)
+        self.assertLess(text.index('## Decisions'), text.index('## Concepts explained'))
+        self.assertLess(text.index('## Concepts explained'), text.index('## Pre-mortem'))
 
     def test_example_config_carries_only_generic_placeholders(self):
         example = json.loads((ROOT / 'examples' / 'config.json').read_text(encoding='utf-8'))
