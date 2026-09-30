@@ -78,14 +78,17 @@ class RoadmapSyncTestCase(unittest.TestCase):
         """What the session does in step 4: append prose and paste each marker from the plan."""
         for name in ('roadmap', 'sprint'):
             staged = Path(plan['targets'][name]['staged'])
-            text = staged.read_text(encoding='utf-8')
+            # Bytes, not text mode: write_text turns a CRLF draft into LF on Linux.
+            text = staged.read_bytes().decode('utf-8')
+            newline = '\r\n' if '\r\n' in text else '\n'
+            added = ''
             for change in plan['changes']:
                 if change['id'] in skip or change['alreadyApplied']:
                     continue
                 if name == 'roadmap' or change['action'] == 'move_lane':
                     marker = change['declinedMarker'] if change['id'] in declined else change['marker']
-                    text += f"\n## {change['item']['title']}\n\nProsa sobre a mudança. {marker}\n"
-            staged.write_text(text, encoding='utf-8')
+                    added += f"\n## {change['item']['title']}\n\nProsa sobre a mudança. {marker}\n"
+            staged.write_bytes((text + added.replace('\n', newline)).encode('utf-8'))
 
 
 class ConfigurationTests(RoadmapSyncTestCase):
