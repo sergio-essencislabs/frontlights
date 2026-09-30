@@ -100,6 +100,7 @@ class ReleaseManifestTests(unittest.TestCase):
                        'Read `references/learning.md` before writing the first explanation',
                        'or the conversation has been compacted',
                        'read the mode back from the discovery log',
+                       "update the log's learning-mode line whenever the mode changes",
                        'turn the mode on or off at any time', 'Record both choices.'):
             with self.subTest(section='depth', phrase=phrase):
                 self.assertIn(phrase, depth)
