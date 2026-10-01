@@ -14,11 +14,18 @@ Subcomandos (cada um imprime um objeto JSON em stdout):
               (sem o campo, o primeiro). A URL é a origem (`esquema://host:porta`) da `health` do
               processo e o host precisa ser 127.0.0.1, localhost ou ::1; outro host é recusado como
               infraestrutura (nunca ambiente real). Registro: .../checks/integration.json.
-  smoke       pede cada caminho de `checks.smoke.paths` (relativo à origem do processo `checks.smoke.target`,
+  smoke       sobe o serve da issue sozinho quando não há registro ou todos os processos morreram (usa o
+              `serve start` com o mesmo --config, --root e --issue), pede cada caminho de `checks.smoke.paths` (relativo à origem do processo `checks.smoke.target`,
               sem o campo o primeiro) e confere o status: `checks.smoke.expectStatus` (inteiro ou lista)
               ou, por padrão, 2xx/3xx; redirecionamentos não são seguidos. Registro: .../checks/smoke.json.
-              Ambos aceitam `--base` (hash do diff contra o merge-base) e marcam `simulacao: false`.
-              `login` e `password` de `browserTest.users` são ocultados de tudo que é impresso ou gravado.
+              Se o smoke subiu o serve, derruba SOMENTE o que subiu (também quando um caminho falha ou o comando
+              é interrompido); processos já vivos, de outra pessoa ou sessão, são usados e nunca derrubados.
+              Falha de subida é infraestrutura (kind `serve_start_failed`, erro do serve mascarado). Saída e
+              registro trazem `serve_iniciado_pelo_smoke` e `serve_encerrado`. A `integration` NÃO sobe nada:
+              exige o `serve start` já feito. Ambos aceitam `--base` (hash do diff contra o merge-base) e marcam `simulacao: false`.
+              `login` e `password` de `browserTest.users` são ocultados (só valores, uma passada, idempotente)
+              de tudo que é impresso ou gravado; valor com menos de 4 caracteres ou com o texto do marcador
+              faz `integration` e `smoke` recusarem o comando (código 2) antes de executar qualquer coisa.
 
 Códigos de saída de `integration` e `smoke`: 0 passou/saudável; 1 falha de produto (argv sai com código
 diferente de zero, caminho com status inesperado ou 5xx); 2 config ou uso recusado; 3 infraestrutura (serve
@@ -75,8 +82,11 @@ SECRET_OPTION = re.compile(r'^--?[\w-]*(?:password|passwd|pwd|token|secret|crede
 CREDENTIAL_OPTION = re.compile(r'^--?(?:u|user|username|login|basic|auth)$', re.I)
 MIN_SECRET_LENGTH = 8
 MIN_USER_SECRET_LENGTH = 4
+MASK = '[oculto]'
 USER_SECRETS = []
 LOCAL_HOSTS = {'127.0.0.1', 'localhost', '::1'}
+# Registro malformado (campo ausente, tipo errado, URL ilegível): infraestrutura, nunca traceback.
+MALFORMED = (KeyError, AttributeError, TypeError, ValueError, UnicodeError, IndexError)
 SMOKE_TIMEOUT = 10
 TARGETS = {'integration': 'backend da branch (local)', 'smoke': 'aplicação da branch (local)'}
 EXIT_CODES = {'passed': 0, 'healthy': 0, 'product_failure': 1, 'infrastructure': 3}
@@ -98,13 +108,29 @@ class Refused(Exception):
 
 
 def redact(text):
-    for name, value in os.environ.items():
-        if len(value) >= MIN_SECRET_LENGTH and SECRET_NAME.search(name):
-            text = text.replace(value, '[oculto]')
-    for value in sorted(USER_SECRETS, key=len, reverse=True):
-        text = text.replace(value, '[oculto]')
-        text = text.replace(json.dumps(value)[1:-1], '[oculto]')
-    return text
+    """Oculta todo segredo conhecido em uma única passada, do mais longo ao mais curto.
+
+    O próprio marcador entra primeiro na expressão e é trocado por ele mesmo: ocultar duas vezes não muda
+    nada, mesmo para um segredo que seja pedaço do marcador (`ocul`).
+    """
+    values = {value for name, value in os.environ.items()
+              if len(value) >= MIN_SECRET_LENGTH and SECRET_NAME.search(name)}
+    values.update(value for value in USER_SECRETS if value)
+    if not values:
+        return text
+    pattern = '|'.join([re.escape(MASK)] + [re.escape(value) for value in sorted(values, key=len, reverse=True)])
+    return re.sub(pattern, lambda found: MASK, text)
+
+
+def scrub(value):
+    """Oculta os VALORES texto de um valor JSON; chaves e estrutura ficam intactas."""
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, list):
+        return [scrub(item) for item in value]
+    if isinstance(value, dict):
+        return {key: scrub(item) for key, item in value.items()}
+    return value
 
 
 def load_user_secrets(config_path):
@@ -119,6 +145,29 @@ def load_user_secrets(config_path):
             value = user.get(key) if isinstance(user, dict) else None
             if isinstance(value, str) and len(value) >= MIN_USER_SECRET_LENGTH:
                 USER_SECRETS.append(value)
+
+
+def require_maskable_user_secrets(config_path):
+    """Recusa (código 2) login ou senha de teste que a máscara não consegue ocultar com segurança.
+
+    Vale para `integration` e `smoke`: valor com menos de 4 caracteres ou que contenha o texto do marcador
+    não pode ser ocultado por inteiro nem sem ambiguidade. A mensagem nunca repete o valor.
+    """
+    users = read_config(config_path).get('browserTest') or {}
+    users = users.get('users') if isinstance(users, dict) else None
+    for user in users if isinstance(users, list) else []:
+        for key in ('login', 'password'):
+            value = user.get(key) if isinstance(user, dict) else None
+            if not isinstance(value, str) or not value:
+                continue
+            if MASK in value:
+                raise Refused(f'O {key} de um usuário em browserTest.users contém o texto {MASK}, que colide com '
+                              'o marcador de máscara e impediria ocultá-lo por inteiro. Use um valor de teste '
+                              'sem esse texto.')
+            if len(value) < MIN_USER_SECRET_LENGTH:
+                raise Refused(f'O {key} de um usuário em browserTest.users tem menos de {MIN_USER_SECRET_LENGTH} '
+                              'caracteres: um segredo curto não pode ser ocultado com segurança na saída e nos '
+                              'registros. Use um valor de teste mais longo.')
 
 
 def redact_argv(argv):
@@ -493,7 +542,7 @@ def run_suite_inner(argv, cwd, timeout, warnings):
         return infrastructure('timeout', f'A suíte passou de {timeout} s e foi interrompida.')
     except OSError:
         return infrastructure('cannot_start', 'A suíte não pôde ser iniciada.')
-    output = redact(raw)
+    output = raw  # o parser lê o texto bruto; a máscara vale só para o que é impresso ou gravado
     parsed = parse_failures(output)
     names = [name for name, _ in parsed]
     tests_run = count_tests(output)
@@ -521,7 +570,10 @@ def execute(label, settings, tree, record_dir, ancestor=None):
     record_dir.mkdir(parents=True, exist_ok=True)
     path = record_dir / f'regression-{label}.json'
     record['record'] = str(path)
-    path.write_text(json.dumps(record, indent=2, ensure_ascii=True), encoding='utf-8')
+    shown = scrub(record)
+    # nomes de falha vêm da saída da suíte e são chaves aqui: única exceção à regra de não mexer em chaves
+    shown['failure_fingerprints'] = {redact(name): prints for name, prints in record['failure_fingerprints'].items()}
+    path.write_text(json.dumps(shown, indent=2, ensure_ascii=True), encoding='utf-8')
     return record
 
 
@@ -616,19 +668,39 @@ def pick_process(processes, name):
 
 
 def local_origin(entry):
-    """`esquema://host[:porta]` do processo; recusa host que não seja a própria máquina."""
-    parts = urllib.parse.urlsplit(entry['url'])
-    host = (parts.hostname or '').lower()
-    if host not in LOCAL_HOSTS:
-        raise Infra('non_local_url', f'O processo {entry.get("name")} do serve declara um host que não é local; '
-                    'a integração e o smoke só falam com o backend da própria branch em 127.0.0.1, localhost '
-                    'ou ::1, nunca com um ambiente real.')
-    shown = f'[{host}]' if ':' in host else host
+    """`esquema://host[:porta]` do processo; só http/https e só a própria máquina.
+
+    `localhost` é entregue como o literal 127.0.0.1, para não depender do resolvedor.
+    """
+    name = entry.get('name')
+    url = entry.get('url')
+    if not isinstance(url, str) or not url:
+        raise Infra('serve_registry_invalid', f'O registro do serve não traz a URL do processo {name}.')
     try:
+        parts = urllib.parse.urlsplit(url)
+        host = (parts.hostname or '').lower()
         port = f':{parts.port}' if parts.port else ''
     except ValueError:
-        raise Infra('non_local_url', f'A URL do processo {entry.get("name")} no registro do serve é inválida.')
+        raise Infra('invalid_url', f'A URL do processo {name} no registro do serve é inválida.') from None
+    if parts.scheme not in ('http', 'https'):
+        raise Infra('invalid_url', f'A URL do processo {name} no registro do serve não usa http nem https.')
+    if host not in LOCAL_HOSTS:
+        raise Infra('non_local_url', f'O processo {name} do serve declara um host que não é local; '
+                    'a integração e o smoke só falam com o backend da própria branch em 127.0.0.1, localhost '
+                    'ou ::1, nunca com um ambiente real.')
+    host = '127.0.0.1' if host == 'localhost' else host
+    shown = f'[{host}]' if ':' in host else host
     return f'{parts.scheme}://{shown}{port}'
+
+
+def read_status(root, issue):
+    """Situação do serve da issue; registro ilegível ou malformado é infraestrutura."""
+    try:
+        return serve.status(root, issue)
+    except serve.Refusal as refusal:
+        raise Infra('serve_registry_invalid', serve.protect(str(refusal))) from None
+    except MALFORMED:
+        raise Infra('serve_registry_invalid', f'O registro do serve da issue {issue} tem campos inesperados.') from None
 
 
 def locate(root, issue, name):
@@ -636,12 +708,14 @@ def locate(root, issue, name):
     if not serve.registry_path(root, issue).is_file():
         raise Infra('serve_registry_missing', f'Não há registro do serve para a issue {issue} nesta worktree: '
                     'rode `serve start` antes (scripts/serve.py start --config ... --root ... --issue ...).')
+    status = read_status(root, issue)
     try:
-        status = serve.status(root, issue)
-    except serve.Refusal as refusal:
-        raise Infra('serve_registry_invalid', str(refusal))
-    origin = local_origin(pick_process(status['processes'], name))
-    dead = [str(entry.get('name')) for entry in status['processes'] if not entry['alive']]
+        if not status['processes']:
+            raise Infra('serve_registry_invalid', f'O registro do serve da issue {issue} não lista processos.')
+        origin = local_origin(pick_process(status['processes'], name))
+        dead = [str(entry.get('name')) for entry in status['processes'] if not entry['alive']]
+    except MALFORMED:
+        raise Infra('serve_registry_invalid', f'O registro do serve da issue {issue} tem campos inesperados.') from None
     if dead:
         raise Infra('serve_down', f'Processo(s) do serve fora do ar: {", ".join(dead)}. Rode `serve start` de novo '
                     '(ou `serve stop` e depois `serve start`) antes da verificação.')
@@ -654,7 +728,7 @@ def optional_name(value, label):
     return value
 
 
-def environment_outcome(args, label, work):
+def environment_outcome(args, label, work, extra=None):
     """Fluxo comum de integração e smoke: evidência, execução, classificação, registro e código de saída.
 
     `work()` devolve o resultado da verificação ou levanta Infra.
@@ -670,6 +744,8 @@ def environment_outcome(args, label, work):
         record.update(work(root))
     except Infra as problem:
         record.update(infrastructure(problem.kind, problem.message))
+    if extra:
+        record.update(extra)
     path = root / '.frontlights' / 'issues' / str(args.issue) / 'checks' / f'{label}.json'
     record['record'] = str(path)
     record['ok'] = record['classification'] in ('passed', 'healthy')
@@ -680,10 +756,11 @@ def environment_outcome(args, label, work):
 
 def write_record(path, record):
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(redact(json.dumps(record, indent=2, ensure_ascii=True)), encoding='utf-8')
+    path.write_text(json.dumps(scrub(record), indent=2, ensure_ascii=True), encoding='utf-8')
 
 
 def run_integration(args):
+    require_maskable_user_secrets(args.config)
     settings = command_settings(args.config, 'integration')
     name = optional_name((read_config(args.config).get('checks') or {}).get('backend'), 'checks.backend')
 
@@ -720,10 +797,11 @@ def smoke_settings(config_path):
     if not isinstance(paths, list) or not paths or not all(isinstance(p, str) for p in paths):
         raise Refused('checks.smoke.paths precisa ser uma lista não vazia de caminhos como "/" ou "/health".')
     for path in paths:
-        if (not path.startswith('/') or path.startswith('//') or any(c in path for c in '\\\0\r\n \t')
-                or '://' in path):
+        if (not path.startswith('/') or path.startswith('//') or '\\' in path or '://' in path
+                or not path.isascii() or any(ord(c) <= 32 or ord(c) == 127 for c in path)):
             raise Refused('checks.smoke.paths só aceita caminhos relativos à URL base, começando com uma barra '
-                          '(por exemplo "/health"), sem espaços, "//" inicial ou URL completa.')
+                          '(por exemplo "/health"), só com caracteres ASCII visíveis, sem espaços, "//" inicial '
+                          'ou URL completa.')
     expected = block.get('expectStatus')
     codes = [expected] if isinstance(expected, int) and not isinstance(expected, bool) else expected
     if codes is not None and (not isinstance(codes, list) or not codes or not all(
@@ -750,6 +828,8 @@ def fetch_status(url, timeout):
     except urllib.error.HTTPError as error:
         error.close()
         return error.code
+    except ValueError:  # inclui UnicodeError: a URL não pôde ser montada
+        raise Infra('invalid_url', f'A URL {url} não pôde ser montada para a requisição.') from None
     except (urllib.error.URLError, OSError, http.client.HTTPException) as error:
         reason = error.reason if isinstance(error, urllib.error.URLError) else error
         if isinstance(reason, TimeoutError):
@@ -758,21 +838,65 @@ def fetch_status(url, timeout):
                     'atendendo (conexão recusada ou interrompida).')
 
 
+def serve_is_up(root, issue):
+    """True se há registro com algum processo vivo (do usuário ou de outra sessão); False se o smoke deve subir."""
+    if not serve.registry_path(root, issue).is_file():
+        return False
+    processes = read_status(root, issue)['processes']
+    return not processes or any(entry['alive'] for entry in processes)
+
+
+def start_serve(config, root, issue, flags):
+    """Sobe o serve da issue; falha de subida é infraestrutura e não deixa processos para trás."""
+    try:
+        serve.start(config, root, issue)
+    except serve.Refusal as refusal:
+        if 'left' in refusal.extra:  # a subida falhou e a limpeza do serve não derrubou tudo: tenta uma vez mais
+            try:
+                serve.stop(root, issue)
+            except (serve.Refusal, OSError, *MALFORMED):
+                pass
+        raise Infra('serve_start_failed', f'O serve não subiu: {serve.protect(str(refusal))}') from None
+    except OSError as error:
+        raise Infra('serve_start_failed', f'O serve não subiu: {serve.protect(str(error))}') from None
+    flags['serve_iniciado_pelo_smoke'] = True
+
+
+def stop_started_serve(root, issue, flags):
+    """Derruba o serve só se o smoke o iniciou; falha ao derrubar vira aviso no resultado."""
+    if not flags['serve_iniciado_pelo_smoke']:
+        return
+    try:
+        serve.stop(root, issue)
+        flags['serve_encerrado'] = True
+    except (serve.Refusal, OSError, *MALFORMED) as error:
+        flags.setdefault('warnings', []).append(
+            f'O smoke iniciou o serve, mas não conseguiu derrubá-lo: {serve.protect(str(error))} '
+            'Rode `serve stop` para encerrar o que sobrou.')
+
+
 def run_smoke(args):
+    require_maskable_user_secrets(args.config)
     settings = smoke_settings(args.config)
+    flags = {'serve_iniciado_pelo_smoke': False, 'serve_encerrado': False}
 
     def work(root):
-        origin = locate(root, args.issue, settings['target'])
-        results = []
-        for path in settings['paths']:
-            status = fetch_status(origin + path, settings['timeout'])
-            ok = status in settings['expect'] if settings['expect'] else 200 <= status < 400
-            results.append({'path': path, 'status': status, 'ok': ok})
-        failed = [r['path'] for r in results if not r['ok']]
-        return {'base_url': origin, 'paths': results, 'failures': failed,
-                'classification': 'product_failure' if failed else 'healthy'}
+        try:
+            if not serve_is_up(root, args.issue):
+                start_serve(args.config, root, args.issue, flags)
+            origin = locate(root, args.issue, settings['target'])
+            results = []
+            for path in settings['paths']:
+                status = fetch_status(origin + path, settings['timeout'])
+                ok = status in settings['expect'] if settings['expect'] else 200 <= status < 400
+                results.append({'path': path, 'status': status, 'ok': ok})
+            failed = [r['path'] for r in results if not r['ok']]
+            return {'base_url': origin, 'paths': results, 'failures': failed,
+                    'classification': 'product_failure' if failed else 'healthy'}
+        finally:
+            stop_started_serve(root, args.issue, flags)
 
-    return environment_outcome(args, 'smoke', work)
+    return environment_outcome(args, 'smoke', work, flags)
 
 
 SUBCOMMANDS = {'regression': (configure_regression, run_regression),
@@ -790,8 +914,8 @@ def main(argv=None):
     try:
         result, code = SUBCOMMANDS[args.command][1](args)
     except (Refused, OSError) as error:
-        result, code = {'ok': False, 'blocking': True, 'error': redact(str(error))}, 2
-    print(redact(json.dumps(result, indent=2, ensure_ascii=True)))
+        result, code = {'ok': False, 'blocking': True, 'error': str(error)}, 2
+    print(json.dumps(scrub(result), indent=2, ensure_ascii=True))  # a única passada de máscara da saída
     return code
 
 
