@@ -58,10 +58,12 @@ Subcomandos (cada um imprime um objeto JSON em stdout):
               e avisa em `warnings` para conferir e rodar `serve stop`.
               A `integration` NÃO sobe nada: exige o `serve start` já feito. Ambos aceitam `--base`
               (hash do diff contra o merge-base) e marcam `simulacao: false`.
-              `login` e `password` de `browserTest.users` são ocultados (valor bruto e as formas
-              codificadas em URL: `quote` e `quote_plus` com e sem `safe`, codificação dupla, hex
-              maiúsculo ou minúsculo; uma passada, idempotente) de tudo que é
-              impresso ou gravado; valor com menos de 4 caracteres ou com o texto do marcador faz
+              `login` e `password` de `browserTest.users` são ocultados de tudo que é impresso ou
+              gravado: o valor bruto e qualquer mistura, caractere a caractere, de literal e codificação
+              percent (`%XX` com hex maiúsculo ou minúsculo, `+` para espaço, até duas camadas), o que cobre
+              `quote`, `quote_plus` e `encodeURIComponent` com qualquer `safe`. O texto literal respeita a
+              caixa; a máscara é uma passada e idempotente; três ou mais camadas não são cobertas. Valor com
+              menos de 4 caracteres ou com o texto do marcador faz
               `integration` e `smoke` recusarem o comando (código 2) antes de executar qualquer coisa.
 
 Códigos de saída de `integration` e `smoke`: 0 passou/saudável; 1 falha de produto (argv sai com
@@ -160,19 +162,25 @@ class Refused(Exception):
     """Configuração ou uso recusado; nada foi executado."""
 
 
-def secret_forms(value):
-    """O valor e as formas codificadas em URL em que ele costuma aparecer em um caminho, uma query ou um argv.
+def secret_pattern(value):
+    """Expressão que casa o valor bruto ou qualquer codificação percent dele, em um único passo.
 
-    `quote` e `quote_plus` (as duas que o `serve` também oculta), com `safe` padrão, `safe=''` e as barras
-    e arrobas preservadas, mais a codificação dupla, cada uma com o hexadecimal em maiúsculas (como o Python
-    escreve) e em minúsculas (`%2b`, como outras bibliotecas escrevem). O valor bruto não ganha variante em
-    minúsculas: só as formas codificadas.
+    Cada caractere aceita a forma literal, `%XX` (hexadecimal em maiúsculas ou minúsculas) e a mesma
+    sequência codificada de novo (`%25XX`, duas camadas); o espaço aceita também `+` (e `%2B`). A mistura vale
+    dentro do mesmo valor, então qualquer `safe` de `quote`/`quote_plus` e o `encodeURIComponent` casam. O
+    texto literal respeita a caixa: o valor bruto não ganha variante em minúsculas.
     """
-    quote, quote_plus = urllib.parse.quote, urllib.parse.quote_plus
-    encoded = {quote(value), quote(value, safe=''), quote(value, safe='/@'), quote_plus(value),
-               quote_plus(value, safe='/'), quote(quote(value, safe=''), safe='')}
-    encoded |= {re.sub(r'%[0-9A-F]{2}', lambda found: found.group().lower(), form) for form in encoded}
-    return {value} | encoded
+    def any_case(text):
+        return ''.join(f'[{c.lower()}{c.upper()}]' if c.isalpha() else c for c in text)
+
+    parts = []
+    for char in value:
+        encoded = ''.join(f'%{byte:02X}' for byte in char.encode())
+        options = [re.escape(char), any_case(encoded), any_case(encoded.replace('%', '%25'))]
+        if char == ' ':
+            options += [r'\+', '%2[Bb]']
+        parts.append('(?:' + '|'.join(options) + ')')
+    return ''.join(parts)
 
 
 def redact(text):
@@ -184,10 +192,11 @@ def redact(text):
     """
     values = {value for name, value in os.environ.items()
               if len(value) >= MIN_SECRET_LENGTH and SECRET_NAME.search(name)}
-    values.update(form for value in USER_SECRETS if value for form in secret_forms(value))
-    if not values:
+    patterns = {re.escape(value): len(value) for value in values}
+    patterns.update({secret_pattern(value): len(value) for value in USER_SECRETS if value})
+    if not patterns:
         return text
-    pattern = '|'.join([re.escape(MASK)] + [re.escape(value) for value in sorted(values, key=len, reverse=True)])
+    pattern = '|'.join([re.escape(MASK)] + sorted(patterns, key=patterns.get, reverse=True))
     return re.sub(pattern, lambda found: MASK, text)
 
 
@@ -964,7 +973,13 @@ def environment_outcome(args, label, work, extra=None, settle=None):
     record['record'] = str(path)
     record['ok'] = record['classification'] in ('passed', 'healthy')
     record['blocking'] = not record['ok']
-    write_record(path, record)
+    try:
+        write_record(path, record)
+    except OSError:
+        record['classification'] = 'infrastructure'
+        record['infrastructure'] = {'kind': 'record_write_failed',
+                                    'message': 'Não foi possível gravar o registro da verificação.'}
+        record['ok'], record['blocking'] = False, True
     return record, EXIT_CODES[record['classification']]
 
 
@@ -1209,16 +1224,20 @@ def stop_started_serve(root, issue, flags, ledger):
 
     Uma recusa por trava ocupada (outro start ou stop da issue em andamento) é repetida com pausa de
     STOP_RETRY_PAUSE até STOP_RETRY_SECONDS no total, e a conferência do registro roda de novo a cada
-    tentativa: se a outra sessão terminou o stop, o registro sumiu e vale o aviso de "outra sessão". Nenhuma
-    outra falha é repetida; esgotado o prazo, a recusa vale como falha ao derrubar.
+    tentativa: se a outra sessão terminou o stop, o registro sumiu e vale o aviso de "outra sessão". O prazo é
+    medido DEPOIS de cada tentativa: uma tentativa longa que o estoura não é repetida, então o total é no máximo
+    o prazo mais uma tentativa. Uma trava que o serve não consegue usar (E/S) tem o mesmo texto da ocupada e só
+    é repetida se a tentativa terminar dentro do prazo; o serve gasta até 20 s por tentativa nesse caso, então
+    ela custa uma tentativa, não duas. Nenhuma outra falha é repetida; esgotado o prazo, a recusa vale como
+    falha ao derrubar.
     """
     deadline = time.monotonic() + STOP_RETRY_SECONDS
-    while stop_attempt(root, issue, flags, ledger, time.monotonic() + STOP_RETRY_PAUSE < deadline):
+    while stop_attempt(root, issue, flags, ledger, deadline):
         time.sleep(STOP_RETRY_PAUSE)
 
 
-def stop_attempt(root, issue, flags, ledger, retry):
-    """Uma tentativa de derrubar o serve do smoke; True só se a trava estava ocupada e `retry` permite repetir."""
+def stop_attempt(root, issue, flags, ledger, deadline):
+    """Uma tentativa de derrubar o serve do smoke; True só se a trava estava ocupada e ainda cabe outra tentativa."""
     if not flags['serve_iniciado_pelo_smoke']:
         return False
     if not serve.registry_path(root, issue).is_file():
@@ -1246,7 +1265,7 @@ def stop_attempt(root, issue, flags, ledger, retry):
             raise RuntimeError('o serve devolveu processos sem encerrar.')
         flags['serve_encerrado'] = True
     except Exception as error:
-        if retry and lock_busy(error):
+        if lock_busy(error) and time.monotonic() + STOP_RETRY_PAUSE < deadline:
             return True
         ledger['orphans'] = True
         warn(flags, f'O smoke iniciou o serve, mas não conseguiu derrubá-lo: {serve.protect(str(error))} '

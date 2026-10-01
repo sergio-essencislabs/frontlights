@@ -5,13 +5,16 @@ import http.server
 import io
 import json
 import os
+import random
 import re
 import socket
+import string
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 import urllib.error
 import urllib.parse
@@ -1027,7 +1030,7 @@ class DirectHealthyTest(IntegrationTestCase):
 
 
 class AutostartHostTest(SmokeHelpers, IntegrationTestCase):
-    """O host de cada health declarado é conferido ANTES de o smoke chamar serve.start."""
+    """O host de cada health declarado é conferido ANTES que o smoke chame serve.start."""
 
     def refused(self, config_processes=None, base_url='http://127.0.0.1:1'):
         self.write_config({'smoke': {'paths': ['/'], 'target': 'api'}}, processes=config_processes,
@@ -1531,7 +1534,8 @@ class UnprovenStartTest(SmokeHelpers, IntegrationTestCase):
                 self.start_serve()
             return 200
 
-        with mock.patch.object(serve, 'start', side_effect=self.odd_start()),                 mock.patch.object(checks, 'fetch_status', side_effect=other_session):
+        with mock.patch.object(serve, 'start', side_effect=self.odd_start()), \
+                mock.patch.object(checks, 'fetch_status', side_effect=other_session):
             code, result = self.run_check('smoke')
         self.assertEqual(code, 0, result)
         self.assertIs(result['serve_encerrado'], False)
@@ -1555,12 +1559,15 @@ class UnprovenStartTest(SmokeHelpers, IntegrationTestCase):
     def test_a_start_with_a_new_return_shape_is_never_stopped_blindly_when_the_registry_existed_before(self):
         self.smoke_config()
         self.stale_registry()
-        with mock.patch.object(serve, 'start', side_effect=self.odd_start()),                 mock.patch.object(serve, 'stop') as stopped:
+        with mock.patch.object(serve, 'start', side_effect=self.odd_start()), \
+                mock.patch.object(serve, 'stop') as stopped:
             code, result = self.run_check('smoke')
         self.assertEqual(code, 0, result)
         stopped.assert_not_called()
         self.assertIs(result['serve_encerrado'], False)
         self.assertTrue(any('Rode `serve stop`' in w and 'não sabe' in w for w in result['warnings']), result)
+        self.assertIs(result['serve_iniciado_pelo_smoke'], True)
+        self.assertIs(self.record('smoke')['serve_iniciado_pelo_smoke'], True)
         self.assertTrue(self.registry_file().is_file())  # o limpador do teste (`serve stop`) o encerra
 
     def test_the_registry_snapshot_is_none_when_it_cannot_be_read(self):
@@ -1851,7 +1858,7 @@ class PartlyDeadRegistryTest(SmokeHelpers, IntegrationTestCase):
 
 
 class PortugueseMessagesTest(IntegrationTestCase):
-    """Mensagens montadas por concatenação não podem sair com `de o`, `de a`, `em o`, `em a`."""
+    """Mensagens montadas por concatenação saem com a contração (do, da, no, na), nunca com artigo solto."""
 
     def messages(self):
         found = []
@@ -1882,6 +1889,12 @@ class PortugueseMessagesTest(IntegrationTestCase):
         source = (SCRIPTS / 'checks.py').read_text(encoding='utf-8')
         self.assertEqual(PORTUGUESE_CONTRACTION.findall(source), [])
         self.assertNotIn("f'A URL de {", source)
+
+    def test_the_portuguese_text_of_the_tests_uses_the_contracted_forms_too(self):
+        for name in ('test_checks_integration.py', 'test_checks.py', 'test_serve.py'):
+            source = (Path(__file__).resolve().parent / name).read_text(encoding='utf-8')
+            for number, line in enumerate(source.splitlines(), 1):
+                self.assertIsNone(PORTUGUESE_CONTRACTION.search(line), (name, number, line.strip()))
 
 
 class DocstringLayoutTest(unittest.TestCase):
@@ -2014,6 +2027,46 @@ class RestoreMaskedByNameTest(SmokeHelpers, IntegrationTestCase):
             with self.subTest(label), self.assertRaises(checks.Infra) as caught:
                 checks.restore_masked(processes, str(self.config), 12)
             self.assertEqual(caught.exception.kind, 'serve_registry_invalid')
+
+    def entry(self, name, url='http://127.0.0.1:1/health'):
+        return {'name': name, 'pid': 1, 'port': 1, 'url': url, 'alive': True}
+
+    def test_extra_registry_entries_never_wrap_around_to_the_first_declared_process(self):
+        self.write_config({}, processes=self.declared('frontend', 'backend'),
+                          users=[{'login': LOGIN, 'password': 'backend'}])
+        entries = [self.entry('frontend', 'http://[redacted]:1/health'), self.entry('backend'),
+                   self.entry('frontend')]
+        with self.assertRaises(checks.Infra) as caught:
+            checks.restore_masked(entries, str(self.config), 12)
+        self.assertEqual(caught.exception.kind, 'serve_registry_invalid')
+
+    def test_a_hidden_piece_of_a_name_is_never_empty(self):
+        self.write_config({}, processes=self.declared('backend', 'frontend'),
+                          users=[{'login': LOGIN, 'password': 'back'}])
+        for name in ('[redacted]backend', 'backend[redacted]', 'back[redacted]end'):
+            with self.subTest(name=name), self.assertRaises(checks.Infra) as caught:
+                checks.restore_masked([self.entry(name)], str(self.config), 12)
+            self.assertEqual(caught.exception.kind, 'serve_registry_invalid')
+
+    def test_a_masked_password_in_the_userinfo_is_not_a_masked_authority(self):
+        url = 'http://usuario:[redacted]@127.0.0.1:1/health'
+        self.assertFalse(checks.masked_authority(url))
+        self.assertTrue(checks.masked_authority('http://usuario:[redacted]@[redacted]:1/health'))
+        self.assertTrue(checks.masked_authority('http://usuario@127.0.0.1:[redacted]/health'))
+        missing = self.tmp / 'sem-config.json'  # nada a refazer: o config nem é lido
+        self.assertEqual(checks.restore_masked([self.entry('api', url)], str(missing), 12), [self.entry('api', url)])
+
+    def test_a_masked_url_without_a_declared_health_cannot_be_rebuilt(self):
+        for health in (None, 5, ['http://127.0.0.1:1/health']):
+            with self.subTest(health=health):
+                declared = {'name': 'api', 'argv': [sys.executable, '-c', 'pass'], 'port': 1}
+                if health is not None:
+                    declared['health'] = health
+                self.write_config({}, processes=[declared], users=[{'login': LOGIN, 'password': '127.0.0.1'}])
+                with self.assertRaises(checks.Infra) as caught:
+                    checks.restore_masked([self.entry('api', 'http://[redacted]:1/health')], str(self.config), 12)
+                self.assertEqual(caught.exception.kind, 'serve_registry_invalid')
+                self.assertIn('config', caught.exception.message)
 
     def test_an_unmasked_registry_is_never_compared_with_the_config(self):
         self.write_config({}, processes=self.declared('frontend', 'backend'),
@@ -2175,45 +2228,227 @@ class StopRetryTest(SmokeHelpers, IntegrationTestCase):
         self.assertTrue(any('outra sessão' in w for w in result['warnings']), result)
         self.assertNotIn('infrastructure', result)
 
+    def fake_time(self, tick=0.01):
+        """Relógio simulado: cada leitura de monotonic avança `tick`; sleep avança o tempo pedido e o registra."""
+        clock, pauses = [0.0], []
+
+        def monotonic():
+            clock[0] += tick
+            return clock[0]
+
+        def sleep(seconds):
+            pauses.append(seconds)
+            clock[0] += seconds
+
+        return types.SimpleNamespace(monotonic=monotonic, sleep=sleep), clock, pauses
+
+    def busy_stop(self, clock, attempt_seconds, message=None):
+        calls = []
+
+        def stop(root, issue):
+            calls.append(1)
+            clock[0] += attempt_seconds
+            raise serve.Refusal(message or self.BUSY, category=serve.USAGE)
+
+        return stop, calls
+
+    def test_an_attempt_that_overruns_the_deadline_is_not_repeated(self):
+        fake, clock, pauses = self.fake_time()
+        stop, calls = self.busy_stop(clock, 20)
+        with mock.patch.object(checks, 'time', fake):
+            code, result = self.smoke_with(stop)
+        self.assertEqual((code, len(calls), pauses), (3, 1, []), result)
+        self.assertEqual(result['infrastructure']['kind'], 'serve_stop_failed')
+
+    def test_the_total_wait_stays_within_the_deadline_plus_one_attempt(self):
+        fake, clock, pauses = self.fake_time()
+        stop, calls = self.busy_stop(clock, 3)
+        with mock.patch.object(checks, 'time', fake):
+            code, result = self.smoke_with(stop)
+        self.assertEqual(code, 3, result)
+        self.assertEqual(len(calls), 4)  # t=3, 6, 9 repetem; a de t=12 estourou o prazo e encerra
+        self.assertLess(clock[0], checks.STOP_RETRY_SECONDS + 3 + 1)
+
+    def test_every_retry_pauses_for_the_configured_time(self):
+        fake, clock, pauses = self.fake_time()
+        stop, calls = self.busy_stop(clock, 0)
+        with mock.patch.object(checks, 'time', fake), mock.patch.object(checks, 'STOP_RETRY_PAUSE', 0.5):
+            code, result = self.smoke_with(stop)
+        self.assertEqual(code, 3, result)
+        self.assertGreater(len(calls), 5)
+        self.assertEqual(pauses, [0.5] * (len(calls) - 1))
+
+    def test_both_busy_lock_messages_of_the_serve_are_retried(self):
+        messages = ('Outro start ou stop da issue 12 está em andamento (pid 4242). Aguarde-o terminar.',
+                    'Não foi possível obter a trava 12.lock em 5 s: outro start ou stop está em andamento.')
+        for message in messages:
+            with self.subTest(message=message[:20]):
+                fake, clock, pauses = self.fake_time()
+                real, calls = serve.stop, []
+
+                def stop(root, issue):
+                    calls.append(1)
+                    if len(calls) <= 2:
+                        raise serve.Refusal(message, category=serve.USAGE)
+                    return real(root, issue)
+
+                with mock.patch.object(checks, 'time', fake):
+                    code, result = self.smoke_with(stop)
+                self.assertEqual((code, len(calls)), (0, 3), result)
+                self.assertIs(result['serve_encerrado'], True)
+
+    @unittest.skipUnless(AUTO_SUPPORTED, 'a trava inutilizável por E/S depende do serve da #11 (texto da recusa)')
+    def test_a_lock_that_cannot_be_used_costs_one_attempt_not_two(self):
+        lock = self.root / '.frontlights' / 'serve' / '12.lock'
+        real, calls = serve.stop, []
+
+        def stop(root, issue):
+            calls.append(1)
+            lock.mkdir(parents=True, exist_ok=True)  # diretório no lugar do arquivo: o serve não consegue usar a trava
+            return real(root, issue)
+
+        begin = time.monotonic()
+        code, result = self.smoke_with(stop)
+        elapsed = time.monotonic() - begin
+        self.assertEqual((code, result['infrastructure']['kind']), (3, 'serve_stop_failed'), result)
+        self.assertTrue(any('Rode `serve stop`' in w for w in result['warnings']), result)
+        self.assertEqual(len(calls), 1)  # a tentativa do serve já passou do prazo de 10 s: não se repete
+        self.assertLess(elapsed, 2 * 20 + 1 - 10)
+        lock.rmdir()
+        self.assertEqual(self.serve('stop').returncode, 0)
+
     def test_the_retry_is_documented(self):
         self.assertIn('trava', checks.__doc__)
         self.assertIn('STOP_RETRY_SECONDS', checks.__doc__)
 
 
+class RecordWriteFailureTest(SmokeHelpers, IntegrationTestCase):
+    """Falha ao gravar o registro é infraestrutura (código 3) e não perde `serve_*`, classificação nem avisos."""
+
+    def block_checks_folder(self):
+        folder = self.root / '.frontlights' / 'issues' / '12' / 'checks'
+        folder.parent.mkdir(parents=True, exist_ok=True)
+        folder.write_text('arquivo no lugar da pasta', encoding='utf-8')
+
+    def test_the_smoke_reports_infrastructure_and_still_stops_what_it_started(self):
+        self.smoke_config()
+        self.block_checks_folder()
+        code, result = self.run_check('smoke')
+        self.assertEqual(code, 3, result)
+        self.assertEqual((result['classification'], result['infrastructure']['kind']),
+                         ('infrastructure', 'record_write_failed'))
+        self.assertEqual((result['ok'], result['blocking']), (False, True))
+        self.assertIs(result['serve_iniciado_pelo_smoke'], True)
+        self.assertIs(result['serve_encerrado'], True)
+        self.assertEqual(result['base_url'], f'http://127.0.0.1:{self.ports["web"]}')
+        self.assertNotIn('warnings', result)
+        self.assertFalse(self.registry_file().exists())
+        self.assert_all_down()
+
+    def test_the_orphan_warning_survives_when_the_stop_also_fails(self):
+        self.smoke_config()
+        self.block_checks_folder()
+        with mock.patch.object(serve, 'stop', side_effect=RuntimeError('falhou')):
+            code, result = self.run_check('smoke')
+        self.assertEqual(code, 3, result)
+        self.assertEqual(result['infrastructure']['kind'], 'record_write_failed')
+        self.assertIs(result['serve_encerrado'], False)
+        self.assertTrue(any('Rode `serve stop`' in w for w in result['warnings']), result)
+
+    def test_the_integration_keeps_its_evidence(self):
+        self.write_config({'integration': {'argv': self.recorder_argv()}})
+        self.start_serve()
+        self.block_checks_folder()
+        code, result = self.run_check('integration')
+        self.assertEqual(code, 3, result)
+        self.assertEqual(result['infrastructure']['kind'], 'record_write_failed')
+        self.assertEqual(result['exit_code'], 0)
+        self.assertEqual(result['backend_url'], f'http://127.0.0.1:{self.ports["api"]}')
+
+
+def lower_percent(text):
+    """Hexadecimal em minúsculas SÓ nas sequências %XX (como `%2f`); o resto do texto fica como está."""
+    return re.sub(r'%[0-9A-Fa-f]{2}', lambda found: found.group().lower(), text)
+
+
+def encode_uri_component(value):
+    """`encodeURIComponent` do JavaScript, escrito à parte: só A-Za-z0-9 e -_.!~*'() ficam; o resto vira %XX."""
+    keep = string.ascii_letters + string.digits + "-_.!~*'()"
+    return ''.join(c if c in keep else ''.join(f'%{byte:02X}' for byte in c.encode()) for c in value)
+
+
+SAFE_SETS = ('', '/', '@', '+', '/@', '/@+', "!*'()~", string.punctuation)
+
+
+def encodings(value):
+    """Formas codificadas de `value`: quote e quote_plus com muitos `safe`, encodeURIComponent, hex em minúsculas
+    (só nas sequências %XX) e duas camadas, nunca derivadas da implementação."""
+    quote, quote_plus = urllib.parse.quote, urllib.parse.quote_plus
+    single = {'encodeURIComponent': encode_uri_component(value)}
+    for safe in SAFE_SETS:
+        single[f'quote safe={safe!r}'] = quote(value, safe=safe)
+        single[f'quote_plus safe={safe!r}'] = quote_plus(value, safe=safe)
+    single.update({f'{name} minúsculo': lower_percent(form) for name, form in single.items()})
+    double = {}
+    for name, form in single.items():
+        for safe in ('', '@'):
+            double[f'{name} dupla safe={safe!r}'] = quote(form, safe=safe)
+            double[f'{name} dupla+ safe={safe!r}'] = quote_plus(form, safe=safe)
+    return {**single, **double}
+
+
 class UrlEncodedSecretFormsTest(IntegrationTestCase):
-    """Todas as codificações plausíveis de um segredo em caminho ou URL saem ocultas, em hex maiúsculo ou minúsculo."""
+    """Toda codificação de um segredo em caminho ou URL sai oculta, sem enumerar as formas na implementação."""
 
-    SECRETS = ('p@ss word/1+x', 'a+b c/d@e', 'x/y/zzzz', 'ação/ü+ é', 'a b&c=d?e#f%g')
-
-    def encodings(self, value):
-        quote, quote_plus = urllib.parse.quote, urllib.parse.quote_plus
-        forms = {'quote': quote(value), "quote(safe='')": quote(value, safe=''), 'quote_plus': quote_plus(value),
-                 "quote_plus(safe='/')": quote_plus(value, safe='/'), "quote(safe='/@')": quote(value, safe='/@'),
-                 'dupla': quote(quote(value, safe=''), safe='')}
-        lowered = {f'{name} minúsculo': re.sub(r'%[0-9A-F]{2}', lambda m: m.group().lower(), form)
-                   for name, form in forms.items()}
-        return {**forms, **lowered}
+    SECRETS = ('p@ss word/1+x', "a!b (c)*d'e~f", 'a+b c/d@e', 'x/y/zzzz', 'ação/ü+ é', 'a b&c=d?e#f%g')
+    REPORTED = ('p%2540ss%2520word%252f1%252bx', 'p@ss%20word%2F1%2Bx', 'p%40ss%20word%2F1+x',
+                "a!b%20(c)*d'e~f")
 
     def test_redact_hides_every_encoding_of_each_secret(self):
         with mock.patch.object(checks, 'USER_SECRETS', list(self.SECRETS)):
             for secret in self.SECRETS:
-                for name, form in self.encodings(secret).items():
+                for name, form in encodings(secret).items():
                     with self.subTest(secret=secret, form=name):
                         self.assertEqual(checks.redact(f'/a?q={form}&b'), '/a?q=[oculto]&b')
 
-    def test_each_form_is_present_in_secret_forms(self):
-        for secret in self.SECRETS:
-            forms = checks.secret_forms(secret)
-            for name in ("quote", "quote(safe='')", 'quote_plus'):
-                with self.subTest(secret=secret, form=name):
-                    self.assertIn(self.encodings(secret)[name], forms)
+    def test_the_forms_found_by_the_fifth_review_are_hidden(self):
+        with mock.patch.object(checks, 'USER_SECRETS', list(self.SECRETS[:2])):
+            for form in self.REPORTED:
+                with self.subTest(form=form):
+                    self.assertEqual(checks.redact(f'/a?q={form}&b'), '/a?q=[oculto]&b')
 
-    def test_a_smoke_path_built_with_quote_never_shows_the_secret_in_a_connection_error(self):
+    def test_random_secrets_in_random_encodings_never_reach_the_output_or_the_record(self):
+        generator = random.Random(12)
+        alphabet = string.ascii_letters + string.digits + string.punctuation.replace('%', '') + '  çãé€'
+        secrets = [''.join(generator.choice(alphabet) for _ in range(generator.randint(4, 12))) for _ in range(40)]
+        with mock.patch.object(checks, 'USER_SECRETS', secrets):
+            for secret in secrets:
+                forms = sorted(encodings(secret).items())
+                for name, form in generator.sample(forms, 8) + [('bruto', secret)]:
+                    text = f'/a?q={form}&b'
+                    with self.subTest(secret=secret, form=name):
+                        shown = checks.redact(text)
+                        self.assertEqual(shown, '/a?q=[oculto]&b')
+                        self.assertEqual(checks.redact(shown), shown)
+                        path = self.tmp / 'registro.json'
+                        checks.write_record(path, {'error': text, 'head': text})
+                        self.assertEqual(json.loads(path.read_text(encoding='utf-8')),
+                                         {'error': shown, 'head': text})
+
+    def test_the_raw_value_has_no_lowercase_variant(self):
+        with mock.patch.object(checks, 'USER_SECRETS', ['Ab/Cd+xyz']):
+            self.assertEqual(checks.redact('Ab%2fCd%2bxyz ab/cd+xyz AB/CD+XYZ ab%2fcd%2bxyz'),
+                             '[oculto] ab/cd+xyz AB/CD+XYZ ab%2fcd%2bxyz')
+
+    def test_a_smoke_path_built_with_any_encoding_never_shows_the_secret_in_a_connection_error(self):
         secret = 'p@ss word/1+x'
         users = [{'login': LOGIN, 'password': secret}]
-        for name in ('quote', "quote(safe='')", 'quote_plus', "quote_plus(safe='/')", 'quote minúsculo'):
-            encoded = self.encodings(secret)[name]
-            with self.subTest(form=name):
+        forms = encodings(secret)
+        names = ("quote safe=''", "quote_plus safe='/'", "quote safe='' minúsculo", "quote safe='@'",
+                 "quote_plus safe='@'", "quote safe='' dupla safe=''", "quote safe='' minúsculo dupla safe=''")
+        chosen = [forms[name] for name in names] + list(self.REPORTED[:3])
+        for encoded in chosen:
+            with self.subTest(form=encoded):
                 self.write_registry(f'http://127.0.0.1:{free_port()}/health')
                 self.write_config({'smoke': {'paths': [f'/{encoded}'], 'target': 'api'}}, users=users)
                 code, result = self.run_check('smoke')
@@ -2221,7 +2456,7 @@ class UrlEncodedSecretFormsTest(IntegrationTestCase):
                 record_text = (self.root / '.frontlights' / 'issues' / '12' / 'checks' / 'smoke.json'
                                ).read_text(encoding='utf-8')
                 for text in (self.last_output, record_text):
-                    for form in self.encodings(secret).values():
+                    for form in forms.values():
                         self.assertNotIn(form, text)
                     self.assertNotIn('ss%20word', text)
                     self.assertNotIn('ss+word', text)
