@@ -7,6 +7,23 @@ Subcomandos (cada um imprime um objeto JSON em stdout):
               nova (só na branch, ou mesmo nome com outra causa em `changed_failures`, ou sem nome;
               bloqueia), falha existente (já na base, não bloqueia) e falha corrigida.
 
+  integration roda o `checks.integration.argv` contra o backend da branch. A URL vem SOMENTE do registro
+              do `serve` da issue (<root>/.frontlights/serve/<n>.json), com todos os processos vivos, e
+              é entregue na variável FRONTLIGHTS_BACKEND_URL e no texto `{backend_url}` de cada elemento
+              do argv. O backend é o processo de `browserTest.processes` com o nome de `checks.backend`
+              (sem o campo, o primeiro). A URL é a origem (`esquema://host:porta`) da `health` do
+              processo e o host precisa ser 127.0.0.1, localhost ou ::1; outro host é recusado como
+              infraestrutura (nunca ambiente real). Registro: .../checks/integration.json.
+  smoke       pede cada caminho de `checks.smoke.paths` (relativo à origem do processo `checks.smoke.target`,
+              sem o campo o primeiro) e confere o status: `checks.smoke.expectStatus` (inteiro ou lista)
+              ou, por padrão, 2xx/3xx; redirecionamentos não são seguidos. Registro: .../checks/smoke.json.
+              Ambos aceitam `--base` (hash do diff contra o merge-base) e marcam `simulacao: false`.
+              `login` e `password` de `browserTest.users` são ocultados de tudo que é impresso ou gravado.
+
+Códigos de saída de `integration` e `smoke`: 0 passou/saudável; 1 falha de produto (argv sai com código
+diferente de zero, caminho com status inesperado ou 5xx); 2 config ou uso recusado; 3 infraestrutura (serve
+sem registro ou com processo morto, host fora do local, conexão recusada, timeout, executável ausente).
+
 Códigos de saída de `regression`: 0 sem falha nova; 1 falha nova; 2 config ou uso recusado, nada
 foi executado; 3 falha de infraestrutura (suíte não inicia, timeout, executável ausente, nenhum
 teste rodou), que nunca conta como "passou" e sempre bloqueia.
@@ -31,6 +48,7 @@ Novos subcomandos entram em SUBCOMMANDS com uma função `configure(parser)` e u
 import argparse
 import datetime as dt
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
@@ -39,6 +57,11 @@ import signal
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+
+import serve
 
 SHELL_PROGRAMS = {'cmd', 'sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'csh', 'tcsh', 'powershell', 'pwsh'}
 # Executam outro comando por conta própria: recusados sempre (`sudo` só quando o próximo é shell).
@@ -51,6 +74,12 @@ SECRET_NAME = re.compile(r'SECRET|TOKEN|PASSWORD|PASSWD|CREDENTIAL|API_?KEY|PRIV
 SECRET_OPTION = re.compile(r'^--?[\w-]*(?:password|passwd|pwd|token|secret|credential|key|auth)[\w-]*$', re.I)
 CREDENTIAL_OPTION = re.compile(r'^--?(?:u|user|username|login|basic|auth)$', re.I)
 MIN_SECRET_LENGTH = 8
+MIN_USER_SECRET_LENGTH = 4
+USER_SECRETS = []
+LOCAL_HOSTS = {'127.0.0.1', 'localhost', '::1'}
+SMOKE_TIMEOUT = 10
+TARGETS = {'integration': 'backend da branch (local)', 'smoke': 'aplicação da branch (local)'}
+EXIT_CODES = {'passed': 0, 'healthy': 0, 'product_failure': 1, 'infrastructure': 3}
 UNITTEST_FAILURE = re.compile(r'^(?:FAIL|ERROR): (.+?)\s*$')
 # O id vai até o separador ` - ` da mensagem ou o fim da linha: ids parametrizados podem ter espaço.
 PYTEST_FAILURE = re.compile(r'^(?:FAILED|ERROR) (\S*(?:::|\.py).*?)(?: - |\s*$)')
@@ -72,7 +101,24 @@ def redact(text):
     for name, value in os.environ.items():
         if len(value) >= MIN_SECRET_LENGTH and SECRET_NAME.search(name):
             text = text.replace(value, '[oculto]')
+    for value in sorted(USER_SECRETS, key=len, reverse=True):
+        text = text.replace(value, '[oculto]')
+        text = text.replace(json.dumps(value)[1:-1], '[oculto]')
     return text
+
+
+def load_user_secrets(config_path):
+    """Login e senha de browserTest.users entram na máscara de tudo que é impresso ou gravado."""
+    USER_SECRETS.clear()
+    try:
+        users = (read_config(config_path).get('browserTest') or {}).get('users') or []
+    except (Refused, AttributeError):
+        return
+    for user in users if isinstance(users, list) else []:
+        for key in ('login', 'password'):
+            value = user.get(key) if isinstance(user, dict) else None
+            if isinstance(value, str) and len(value) >= MIN_USER_SECRET_LENGTH:
+                USER_SECRETS.append(value)
 
 
 def redact_argv(argv):
@@ -148,43 +194,53 @@ def embedded_shell(argv):
     return None
 
 
-def regression_settings(config_path):
+def read_config(config_path):
     try:
-        config = json.loads(Path(config_path).read_text(encoding='utf-8'))
+        config = json.loads(Path(config_path).read_text(encoding='utf-8-sig'))
     except (OSError, ValueError):
         raise Refused('Não foi possível ler o config como JSON.') from None
-    block = (config.get('checks') or {}).get('regression') if isinstance(config, dict) else None
+    return config if isinstance(config, dict) else {}
+
+
+def command_settings(config_path, name):
+    """argv, cwd e timeout do bloco `checks.<name>`; as mesmas recusas valem para regressão e integração."""
+    config = read_config(config_path)
+    block = (config.get('checks') or {}).get(name) if isinstance(config.get('checks') or {}, dict) else None
     if not isinstance(block, dict):
-        raise Refused('O config não declara checks.regression.')
+        raise Refused(f'O config não declara checks.{name}.')
     argv = block.get('argv')
     if not isinstance(argv, list):
-        raise Refused('checks.regression.argv precisa ser uma lista de argumentos, não uma string.')
+        raise Refused(f'checks.{name}.argv precisa ser uma lista de argumentos, não uma string.')
     if not argv or not all(isinstance(a, str) and a for a in argv):
-        raise Refused('checks.regression.argv precisa ter só textos não vazios.')
+        raise Refused(f'checks.{name}.argv precisa ter só textos não vazios.')
     if any('\0' in a for a in argv):
-        raise Refused('checks.regression.argv não aceita byte NUL em nenhum argumento.')
+        raise Refused(f'checks.{name}.argv não aceita byte NUL em nenhum argumento.')
     reason = embedded_shell(argv)
     if reason:
-        raise Refused(f'checks.regression.argv não aceita shell embutido ({reason}; cmd, sh, bash, powershell, '
+        raise Refused(f'checks.{name}.argv não aceita shell embutido ({reason}; cmd, sh, bash, powershell, '
                       '.bat, wrappers, &&, |, ;, redirecionamentos, python -c); declare o executável e '
                       'seus argumentos.')
     timeout = block.get('timeoutSeconds', DEFAULT_TIMEOUT)
     if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
-        raise Refused('checks.regression.timeoutSeconds precisa ser um inteiro positivo.')
+        raise Refused(f'checks.{name}.timeoutSeconds precisa ser um inteiro positivo.')
     cwd = block.get('cwd')
     if cwd is not None and (not isinstance(cwd, str) or not cwd):
-        raise Refused('checks.regression.cwd precisa ser um caminho relativo à worktree.')
+        raise Refused(f'checks.{name}.cwd precisa ser um caminho relativo à worktree.')
     return {'argv': argv, 'cwd': cwd, 'timeout': timeout}
 
 
-def run_directory(tree, cwd):
+def regression_settings(config_path):
+    return command_settings(config_path, 'regression')
+
+
+def run_directory(tree, cwd, name='regression'):
     """Diretório de execução dentro de `tree`; recusa cwd absoluto ou que escape da árvore."""
     tree = Path(tree).resolve(strict=True)
     if cwd is None:
         return tree
     target = (tree / cwd).resolve()
     if Path(cwd).is_absolute() or not target.is_relative_to(tree) or not target.is_dir():
-        raise Refused('checks.regression.cwd precisa ser um diretório existente dentro da worktree.')
+        raise Refused(f'checks.{name}.cwd precisa ser um diretório existente dentro da worktree.')
     return target
 
 
@@ -377,7 +433,7 @@ def kill_tree(process, job=None):
         pass
 
 
-def run_process(argv, cwd, timeout, warnings):
+def run_process(argv, cwd, timeout, warnings, env=None):
     """Roda a suíte em grupo/sessão novos, com a saída em arquivo (um neto vivo não prende a leitura).
 
     Devolve (código de saída, saída). No prazo estourado mata a árvore inteira e levanta TimeoutExpired.
@@ -394,7 +450,7 @@ def run_process(argv, cwd, timeout, warnings):
     try:
         with tempfile.TemporaryFile() as sink:
             process = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=sink,
-                                       stderr=subprocess.STDOUT, **options)
+                                       stderr=subprocess.STDOUT, env=env, **options)
             if job is not None:
                 try:
                     assign_to_job(job, process)
@@ -533,7 +589,195 @@ def run_regression(args):
     return result, 3 if problems else 1 if new else 0
 
 
-SUBCOMMANDS = {'regression': (configure_regression, run_regression)}
+class Infra(Exception):
+    """Falha de infraestrutura prevista (serve fora do ar, URL fora do local, conexão): nunca conta como passou."""
+
+    def __init__(self, kind, message):
+        super().__init__(message)
+        self.kind = kind
+        self.message = message
+
+
+def configure_environment_check(parser):
+    parser.add_argument('--config', required=True, help='.frontlights/config.json com o bloco checks')
+    parser.add_argument('--root', required=True, help='worktree da issue (branch), onde o serve foi iniciado')
+    parser.add_argument('--issue', required=True, type=int)
+    parser.add_argument('--base', help='worktree ou checkout da base, para o hash do diff contra o merge-base')
+
+
+def pick_process(processes, name):
+    """Processo do serve pelo nome; sem nome, o primeiro de browserTest.processes."""
+    if name is None:
+        return processes[0]
+    for entry in processes:
+        if entry.get('name') == name:
+            return entry
+    raise Refused(f'O processo {name} não está em browserTest.processes do serve desta issue.')
+
+
+def local_origin(entry):
+    """`esquema://host[:porta]` do processo; recusa host que não seja a própria máquina."""
+    parts = urllib.parse.urlsplit(entry['url'])
+    host = (parts.hostname or '').lower()
+    if host not in LOCAL_HOSTS:
+        raise Infra('non_local_url', f'O processo {entry.get("name")} do serve declara um host que não é local; '
+                    'a integração e o smoke só falam com o backend da própria branch em 127.0.0.1, localhost '
+                    'ou ::1, nunca com um ambiente real.')
+    shown = f'[{host}]' if ':' in host else host
+    try:
+        port = f':{parts.port}' if parts.port else ''
+    except ValueError:
+        raise Infra('non_local_url', f'A URL do processo {entry.get("name")} no registro do serve é inválida.')
+    return f'{parts.scheme}://{shown}{port}'
+
+
+def locate(root, issue, name):
+    """Origem local do processo `name` do serve da issue, exigindo todos os processos vivos."""
+    if not serve.registry_path(root, issue).is_file():
+        raise Infra('serve_registry_missing', f'Não há registro do serve para a issue {issue} nesta worktree: '
+                    'rode `serve start` antes (scripts/serve.py start --config ... --root ... --issue ...).')
+    try:
+        status = serve.status(root, issue)
+    except serve.Refusal as refusal:
+        raise Infra('serve_registry_invalid', str(refusal))
+    origin = local_origin(pick_process(status['processes'], name))
+    dead = [str(entry.get('name')) for entry in status['processes'] if not entry['alive']]
+    if dead:
+        raise Infra('serve_down', f'Processo(s) do serve fora do ar: {", ".join(dead)}. Rode `serve start` de novo '
+                    '(ou `serve stop` e depois `serve start`) antes da verificação.')
+    return origin
+
+
+def optional_name(value, label):
+    if value is not None and (not isinstance(value, str) or not value):
+        raise Refused(f'{label} precisa ser o nome de um processo de browserTest.processes.')
+    return value
+
+
+def environment_outcome(args, label, work):
+    """Fluxo comum de integração e smoke: evidência, execução, classificação, registro e código de saída.
+
+    `work()` devolve o resultado da verificação ou levanta Infra.
+    """
+    if args.issue <= 0:
+        raise Refused('--issue precisa ser um número positivo.')
+    root = Path(args.root).resolve(strict=True)
+    ancestor = merge_base(root, Path(args.base).resolve(strict=True)) if args.base else None
+    record = {'label': label, 'simulacao': False, 'alvo': TARGETS[label],
+              'timestamp': dt.datetime.now(dt.timezone.utc).isoformat()}
+    record.update(tree_evidence(root, ancestor))
+    try:
+        record.update(work(root))
+    except Infra as problem:
+        record.update(infrastructure(problem.kind, problem.message))
+    path = root / '.frontlights' / 'issues' / str(args.issue) / 'checks' / f'{label}.json'
+    record['record'] = str(path)
+    record['ok'] = record['classification'] in ('passed', 'healthy')
+    record['blocking'] = not record['ok']
+    write_record(path, record)
+    return record, EXIT_CODES[record['classification']]
+
+
+def write_record(path, record):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(redact(json.dumps(record, indent=2, ensure_ascii=True)), encoding='utf-8')
+
+
+def run_integration(args):
+    settings = command_settings(args.config, 'integration')
+    name = optional_name((read_config(args.config).get('checks') or {}).get('backend'), 'checks.backend')
+
+    def work(root):
+        cwd = run_directory(root, settings['cwd'], 'integration')
+        url = locate(root, args.issue, name)
+        argv = [part.replace('{backend_url}', url) for part in settings['argv']]
+        warnings = []
+        outcome = {'argv': redact_argv(settings['argv']), 'backend_url': url}
+        try:
+            code, _ = run_process(argv, cwd, settings['timeout'], warnings,
+                                  dict(os.environ, FRONTLIGHTS_BACKEND_URL=url))
+        except FileNotFoundError:
+            raise Infra('executable_missing', 'Executável da integração não encontrado.')
+        except subprocess.TimeoutExpired:
+            raise Infra('timeout', f'A integração passou de {settings["timeout"]} s e foi interrompida.')
+        except OSError:
+            raise Infra('cannot_start', 'A integração não pôde ser iniciada.')
+        finally:
+            if warnings:
+                outcome['warnings'] = warnings
+        outcome.update({'exit_code': code, 'classification': 'passed' if code == 0 else 'product_failure'})
+        return outcome
+
+    return environment_outcome(args, 'integration', work)
+
+
+def smoke_settings(config_path):
+    config = read_config(config_path)
+    block = (config.get('checks') or {}).get('smoke')
+    if not isinstance(block, dict):
+        raise Refused('O config não declara checks.smoke.')
+    paths = block.get('paths')
+    if not isinstance(paths, list) or not paths or not all(isinstance(p, str) for p in paths):
+        raise Refused('checks.smoke.paths precisa ser uma lista não vazia de caminhos como "/" ou "/health".')
+    for path in paths:
+        if (not path.startswith('/') or path.startswith('//') or any(c in path for c in '\\\0\r\n \t')
+                or '://' in path):
+            raise Refused('checks.smoke.paths só aceita caminhos relativos à URL base, começando com uma barra '
+                          '(por exemplo "/health"), sem espaços, "//" inicial ou URL completa.')
+    expected = block.get('expectStatus')
+    codes = [expected] if isinstance(expected, int) and not isinstance(expected, bool) else expected
+    if codes is not None and (not isinstance(codes, list) or not codes or not all(
+            isinstance(c, int) and not isinstance(c, bool) and 100 <= c <= 599 for c in codes)):
+        raise Refused('checks.smoke.expectStatus precisa ser um status HTTP ou uma lista de status HTTP.')
+    timeout = block.get('timeoutSeconds', SMOKE_TIMEOUT)
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0:
+        raise Refused('checks.smoke.timeoutSeconds precisa ser um inteiro positivo.')
+    return {'paths': paths, 'expect': codes, 'timeout': timeout,
+            'target': optional_name(block.get('target'), 'checks.smoke.target')}
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args, **kwargs):
+        return None
+
+
+def fetch_status(url, timeout):
+    """Status HTTP da resposta (sem seguir redirecionamentos e sem proxy); Infra se não houver resposta."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+    try:
+        with opener.open(url, timeout=timeout) as answer:
+            return answer.status
+    except urllib.error.HTTPError as error:
+        error.close()
+        return error.code
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as error:
+        reason = error.reason if isinstance(error, urllib.error.URLError) else error
+        if isinstance(reason, TimeoutError):
+            raise Infra('timeout', f'Sem resposta em {timeout} s de {url}.')
+        raise Infra('connection_failed', f'Não foi possível conectar a {url}: o processo do serve não está '
+                    'atendendo (conexão recusada ou interrompida).')
+
+
+def run_smoke(args):
+    settings = smoke_settings(args.config)
+
+    def work(root):
+        origin = locate(root, args.issue, settings['target'])
+        results = []
+        for path in settings['paths']:
+            status = fetch_status(origin + path, settings['timeout'])
+            ok = status in settings['expect'] if settings['expect'] else 200 <= status < 400
+            results.append({'path': path, 'status': status, 'ok': ok})
+        failed = [r['path'] for r in results if not r['ok']]
+        return {'base_url': origin, 'paths': results, 'failures': failed,
+                'classification': 'product_failure' if failed else 'healthy'}
+
+    return environment_outcome(args, 'smoke', work)
+
+
+SUBCOMMANDS = {'regression': (configure_regression, run_regression),
+               'integration': (configure_environment_check, run_integration),
+               'smoke': (configure_environment_check, run_smoke)}
 
 
 def main(argv=None):
@@ -542,11 +786,12 @@ def main(argv=None):
     for name, (configure, _) in SUBCOMMANDS.items():
         configure(sub.add_parser(name))
     args = parser.parse_args(argv)
+    load_user_secrets(args.config)
     try:
         result, code = SUBCOMMANDS[args.command][1](args)
     except (Refused, OSError) as error:
         result, code = {'ok': False, 'blocking': True, 'error': redact(str(error))}, 2
-    print(json.dumps(result, indent=2, ensure_ascii=True))
+    print(redact(json.dumps(result, indent=2, ensure_ascii=True)))
     return code
 
 
