@@ -21,7 +21,19 @@ Subcomandos (cada um imprime um objeto JSON em stdout):
               Se o smoke subiu o serve, derruba SOMENTE o que subiu (também quando um caminho falha ou o comando
               é interrompido); processos já vivos, de outra pessoa ou sessão, são usados e nunca derrubados.
               Falha de subida é infraestrutura (kind `serve_start_failed`, erro do serve mascarado). Saída e
-              registro trazem `serve_iniciado_pelo_smoke` e `serve_encerrado`. A `integration` NÃO sobe nada:
+              registro trazem `serve_iniciado_pelo_smoke` e `serve_encerrado` (também quando uma recusa, código 2,
+              acontece depois da subida). Antes de subir, o host de cada `health` e da `baseUrl` de
+              `browserTest` precisa ser local (senão `non_local_url`, sem nenhuma requisição). O health da subida
+              ignora o proxy do ambiente. Antes de derrubar, o smoke confere que o registro ainda traz os mesmos
+              pids e identidades que ele iniciou (outra sessão pode ter feito stop e start: aviso, nada é
+              derrubado). Processo que o smoke subiu e não conseguiu derrubar é órfão: `serve_encerrado` false,
+              `warnings` com "Rode `serve stop`" e, se tudo mais passou, infraestrutura `serve_stop_failed`
+              (código 3); com caminho falho o código segue 1. Registro parcial (processo declarado no config que
+              o `serve start` em andamento ainda não gravou) é `serve_registry_partial`; pid fora de 1..2^31-1,
+              não inteiro ou bool é `serve_registry_invalid`. Limite: um smoke morto à força (kill -9, queda da
+              máquina) não passa pelo `finally` e deixa o serve e o registro no ar; o smoke seguinte os usa como
+              serve "de outra sessão" e avisa em `warnings` para conferir e rodar `serve stop`.
+              A `integration` NÃO sobe nada:
               exige o `serve start` já feito. Ambos aceitam `--base` (hash do diff contra o merge-base) e marcam `simulacao: false`.
               `login` e `password` de `browserTest.users` são ocultados (só valores, uma passada, idempotente)
               de tudo que é impresso ou gravado; valor com menos de 4 caracteres ou com o texto do marcador
@@ -53,6 +65,7 @@ Novos subcomandos entram em SUBCOMMANDS com uma função `configure(parser)` e u
 """
 
 import argparse
+import contextlib
 import datetime as dt
 import hashlib
 import http.client
@@ -85,11 +98,13 @@ MIN_USER_SECRET_LENGTH = 4
 MASK = '[oculto]'
 USER_SECRETS = []
 LOCAL_HOSTS = {'127.0.0.1', 'localhost', '::1'}
-# Registro malformado (campo ausente, tipo errado, URL ilegível): infraestrutura, nunca traceback.
-MALFORMED = (KeyError, AttributeError, TypeError, ValueError, UnicodeError, IndexError)
+# Campos de evidência técnica que a máscara nunca altera (como REGISTRY_EXACT no serve): só texto livre é ocultado.
+EVIDENCE_EXACT = ('head', 'diff_sha256', 'diff_sha256_vs_base', 'files_sha256', 'timestamp', 'pid', 'port',
+                  'classification', 'kind', 'backend_url', 'base_url')
+MAX_PID = 2 ** 31 - 1
 SMOKE_TIMEOUT = 10
 TARGETS = {'integration': 'backend da branch (local)', 'smoke': 'aplicação da branch (local)'}
-EXIT_CODES = {'passed': 0, 'healthy': 0, 'product_failure': 1, 'infrastructure': 3}
+EXIT_CODES = {'passed': 0, 'healthy': 0, 'product_failure': 1, 'refused': 2, 'infrastructure': 3}
 UNITTEST_FAILURE = re.compile(r'^(?:FAIL|ERROR): (.+?)\s*$')
 # O id vai até o separador ` - ` da mensagem ou o fim da linha: ids parametrizados podem ter espaço.
 PYTEST_FAILURE = re.compile(r'^(?:FAILED|ERROR) (\S*(?:::|\.py).*?)(?: - |\s*$)')
@@ -122,14 +137,18 @@ def redact(text):
     return re.sub(pattern, lambda found: MASK, text)
 
 
-def scrub(value):
-    """Oculta os VALORES texto de um valor JSON; chaves e estrutura ficam intactas."""
+def scrub(value, skip=EVIDENCE_EXACT):
+    """Oculta os VALORES texto de um valor JSON; chaves e estrutura ficam intactas.
+
+    `skip` lista as chaves de evidência (head, hashes, horário, porta, classificação, URLs de origem local)
+    cujo valor fica exato: uma senha de teste como `2026` não pode corromper o horário nem o hash do diff.
+    """
     if isinstance(value, str):
         return redact(value)
     if isinstance(value, list):
-        return [scrub(item) for item in value]
+        return [scrub(item, skip) for item in value]
     if isinstance(value, dict):
-        return {key: scrub(item) for key, item in value.items()}
+        return {key: item if key in skip else scrub(item, skip) for key, item in value.items()}
     return value
 
 
@@ -667,12 +686,14 @@ def pick_process(processes, name):
     raise Refused(f'O processo {name} não está em browserTest.processes do serve desta issue.')
 
 
-def local_origin(entry):
+def local_origin(entry, label=None):
     """`esquema://host[:porta]` do processo; só http/https e só a própria máquina.
 
-    `localhost` é entregue como o literal 127.0.0.1, para não depender do resolvedor.
+    `localhost` é entregue como o literal 127.0.0.1, para não depender do resolvedor. `label` descreve a
+    origem da URL nas mensagens (por padrão, o processo do registro do serve).
     """
     name = entry.get('name')
+    label = label or f'o processo {name} do serve'
     url = entry.get('url')
     if not isinstance(url, str) or not url:
         raise Infra('serve_registry_invalid', f'O registro do serve não traz a URL do processo {name}.')
@@ -681,11 +702,11 @@ def local_origin(entry):
         host = (parts.hostname or '').lower()
         port = f':{parts.port}' if parts.port else ''
     except ValueError:
-        raise Infra('invalid_url', f'A URL do processo {name} no registro do serve é inválida.') from None
+        raise Infra('invalid_url', f'A URL de {label} é inválida.') from None
     if parts.scheme not in ('http', 'https'):
-        raise Infra('invalid_url', f'A URL do processo {name} no registro do serve não usa http nem https.')
+        raise Infra('invalid_url', f'A URL de {label} não usa http nem https.')
     if host not in LOCAL_HOSTS:
-        raise Infra('non_local_url', f'O processo {name} do serve declara um host que não é local; '
+        raise Infra('non_local_url', f'{label[0].upper() + label[1:]} declara um host que não é local; '
                     'a integração e o smoke só falam com o backend da própria branch em 127.0.0.1, localhost '
                     'ou ::1, nunca com um ambiente real.')
     host = '127.0.0.1' if host == 'localhost' else host
@@ -693,29 +714,74 @@ def local_origin(entry):
     return f'{parts.scheme}://{shown}{port}'
 
 
+def valid_pid(pid):
+    """Pid de registro utilizável: inteiro (não bool) entre 1 e MAX_PID; o resto nem chega ao sistema."""
+    return isinstance(pid, int) and not isinstance(pid, bool) and 0 < pid <= MAX_PID
+
+
 def read_status(root, issue):
-    """Situação do serve da issue; registro ilegível ou malformado é infraestrutura."""
+    """Situação do serve da issue; registro ilegível, malformado ou com pid fora da faixa é infraestrutura.
+
+    Os pids são conferidos ANTES de `serve.status`: um pid enorme ou negativo chegaria ao sistema operacional
+    truncado (podendo apontar para outro processo) ou estouraria em ctypes. Qualquer exceção do serve ou da
+    leitura vira `serve_registry_invalid`, nunca traceback.
+    """
     try:
+        for entry in serve.read_registry(root, issue)['processes']:
+            if not valid_pid(entry['pid']):
+                raise Infra('serve_registry_invalid', f'O registro do serve da issue {issue} traz um pid inválido '
+                            f'(esperado um inteiro entre 1 e {MAX_PID}).')
         return serve.status(root, issue)
+    except Infra:
+        raise
     except serve.Refusal as refusal:
         raise Infra('serve_registry_invalid', serve.protect(str(refusal))) from None
-    except MALFORMED:
+    except Exception:
         raise Infra('serve_registry_invalid', f'O registro do serve da issue {issue} tem campos inesperados.') from None
 
 
-def locate(root, issue, name):
-    """Origem local do processo `name` do serve da issue, exigindo todos os processos vivos."""
+def read_processes(root, issue):
+    """Processos do registro (cada um com `alive`), já conferidos; forma inesperada é infraestrutura."""
+    status = read_status(root, issue)
+    try:
+        processes = status['processes']
+        if not processes:
+            raise Infra('serve_registry_invalid', f'O registro do serve da issue {issue} não lista processos.')
+        for entry in processes:
+            entry.get('name'), entry['alive']
+    except Infra:
+        raise
+    except Exception:
+        raise Infra('serve_registry_invalid', f'O registro do serve da issue {issue} tem campos inesperados.') from None
+    return processes
+
+
+def declared_names(config_path):
+    """Nomes de browserTest.processes no config; lista vazia se o bloco não puder ser lido."""
+    try:
+        processes = (read_config(config_path).get('browserTest') or {}).get('processes')
+    except (Refused, AttributeError):
+        return []
+    return [item.get('name') for item in processes if isinstance(item, dict)] if isinstance(processes, list) else []
+
+
+def locate(root, issue, name, config_path):
+    """Origem local do processo `name` do serve da issue, exigindo todos os processos vivos.
+
+    Um nome que o config declara mas o registro ainda não traz é um `serve start` em andamento
+    (`serve_registry_partial`), não erro de configuração.
+    """
     if not serve.registry_path(root, issue).is_file():
         raise Infra('serve_registry_missing', f'Não há registro do serve para a issue {issue} nesta worktree: '
                     'rode `serve start` antes (scripts/serve.py start --config ... --root ... --issue ...).')
-    status = read_status(root, issue)
-    try:
-        if not status['processes']:
-            raise Infra('serve_registry_invalid', f'O registro do serve da issue {issue} não lista processos.')
-        origin = local_origin(pick_process(status['processes'], name))
-        dead = [str(entry.get('name')) for entry in status['processes'] if not entry['alive']]
-    except MALFORMED:
-        raise Infra('serve_registry_invalid', f'O registro do serve da issue {issue} tem campos inesperados.') from None
+    processes = read_processes(root, issue)
+    if name is not None and name not in [entry.get('name') for entry in processes] \
+            and name in declared_names(config_path):
+        raise Infra('serve_registry_partial', f'O registro do serve da issue {issue} ainda não traz o processo '
+                    f'{name}: há um `serve start` em andamento (ou ele foi interrompido). Espere terminar e rode '
+                    'de novo; se nenhum start estiver rodando, rode `serve stop` e `serve start`.')
+    origin = local_origin(pick_process(processes, name))
+    dead = [str(entry.get('name')) for entry in processes if not entry['alive']]
     if dead:
         raise Infra('serve_down', f'Processo(s) do serve fora do ar: {", ".join(dead)}. Rode `serve start` de novo '
                     '(ou `serve stop` e depois `serve start`) antes da verificação.')
@@ -728,10 +794,13 @@ def optional_name(value, label):
     return value
 
 
-def environment_outcome(args, label, work, extra=None):
+def environment_outcome(args, label, work, extra=None, settle=None):
     """Fluxo comum de integração e smoke: evidência, execução, classificação, registro e código de saída.
 
-    `work()` devolve o resultado da verificação ou levanta Infra.
+    `work()` devolve o resultado da verificação ou levanta Infra. `extra` (preenchido durante o trabalho)
+    entra no resultado; se `extra` indica que o smoke subiu o serve, uma recusa (Refused) depois da subida
+    também é gravada, com as chaves `serve_*` e os avisos, e sai com o código 2. `settle(record)` ajusta a
+    classificação com o que só se sabe depois do encerramento.
     """
     if args.issue <= 0:
         raise Refused('--issue precisa ser um número positivo.')
@@ -744,8 +813,14 @@ def environment_outcome(args, label, work, extra=None):
         record.update(work(root))
     except Infra as problem:
         record.update(infrastructure(problem.kind, problem.message))
+    except Refused as refusal:
+        if not (extra and extra.get('serve_iniciado_pelo_smoke')):
+            raise
+        record.update({'classification': 'refused', 'error': str(refusal)})
     if extra:
         record.update(extra)
+    if settle:
+        settle(record)
     path = root / '.frontlights' / 'issues' / str(args.issue) / 'checks' / f'{label}.json'
     record['record'] = str(path)
     record['ok'] = record['classification'] in ('passed', 'healthy')
@@ -766,7 +841,7 @@ def run_integration(args):
 
     def work(root):
         cwd = run_directory(root, settings['cwd'], 'integration')
-        url = locate(root, args.issue, name)
+        url = locate(root, args.issue, name, args.config)
         argv = [part.replace('{backend_url}', url) for part in settings['argv']]
         warnings = []
         outcome = {'argv': redact_argv(settings['argv']), 'backend_url': url}
@@ -842,49 +917,168 @@ def serve_is_up(root, issue):
     """True se há registro com algum processo vivo (do usuário ou de outra sessão); False se o smoke deve subir."""
     if not serve.registry_path(root, issue).is_file():
         return False
-    processes = read_status(root, issue)['processes']
-    return not processes or any(entry['alive'] for entry in processes)
+    return any(entry['alive'] for entry in read_processes(root, issue))
 
 
-def start_serve(config, root, issue, flags):
-    """Sobe o serve da issue; falha de subida é infraestrutura e não deixa processos para trás."""
+def require_local_declarations(config_path):
+    """Recusa (non_local_url) health ou baseUrl declarados fora da própria máquina, ANTES de subir qualquer coisa.
+
+    O `serve start` faz GET no `health` de cada processo; um host não local receberia requisições do smoke.
+    Config sem `browserTest` legível não é assunto daqui: quem reclama é o próprio `serve start`.
+    """
     try:
-        serve.start(config, root, issue)
+        block = read_config(config_path).get('browserTest')
+    except Refused:
+        return
+    if not isinstance(block, dict):
+        return
+    processes = block.get('processes')
+    for item in processes if isinstance(processes, list) else []:
+        if isinstance(item, dict) and isinstance(item.get('health'), str):
+            local_origin({'name': item.get('name'), 'url': item['health']},
+                         f'o health do processo {item.get("name")} em browserTest.processes')
+    if isinstance(block.get('baseUrl'), str) and block['baseUrl']:
+        local_origin({'name': 'baseUrl', 'url': block['baseUrl']}, 'a baseUrl de browserTest')
+
+
+def direct_healthy(url):
+    """Mesma regra do `serve.healthy` (2xx/3xx, sem seguir redirecionamento), mas sem proxy do ambiente."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
+    try:
+        with opener.open(url, timeout=2) as answer:
+            return 200 <= answer.status < 400
+    except urllib.error.HTTPError as error:
+        error.close()
+        return 300 <= error.code < 400
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
+        return False
+
+
+@contextlib.contextmanager
+def direct_health():
+    """O health do autostart não passa por proxy do ambiente (o `serve.healthy` usa o proxy do processo).
+
+    Troca `serve.healthy` só durante a chamada ao serve (e restaura depois), sem mexer em serve.py e sem
+    alterar o ambiente herdado pelos processos que o serve inicia.
+    """
+    original = serve.healthy
+    serve.healthy = direct_healthy
+    try:
+        yield
+    finally:
+        serve.healthy = original
+
+
+def warn(flags, text):
+    warnings = flags.setdefault('warnings', [])
+    if text not in warnings:
+        warnings.append(text)
+
+
+def stop_succeeded(result):
+    """O retorno de `serve.stop` só vale como sucesso com ok verdadeiro e nenhum processo em `left`."""
+    return isinstance(result, dict) and result.get('ok') is True and not result.get('left')
+
+
+def started_pids(started):
+    """(pid, identidade) de cada processo que o `serve.start` devolveu; None se a forma não for a esperada."""
+    try:
+        return {(entry['pid'], entry['identity']) for entry in started['processes']}
+    except Exception:
+        return None
+
+
+def start_serve(config, root, issue, flags, ledger):
+    """Sobe o serve da issue; falha de subida é infraestrutura e não deixa processos para trás.
+
+    A intenção (`serve_iniciado_pelo_smoke`) é registrada ANTES de chamar o serve: uma interrupção em qualquer
+    ponto, inclusive logo depois do retorno, cai no `finally` do smoke, que derruba o que subiu.
+    """
+    flags['serve_iniciado_pelo_smoke'] = True
+    try:
+        with direct_health():
+            started = serve.start(config, root, issue)
     except serve.Refusal as refusal:
+        flags['serve_iniciado_pelo_smoke'] = False
         if 'left' in refusal.extra:  # a subida falhou e a limpeza do serve não derrubou tudo: tenta uma vez mais
             try:
-                serve.stop(root, issue)
-            except (serve.Refusal, OSError, *MALFORMED):
-                pass
+                if not stop_succeeded(serve.stop(root, issue)):
+                    raise RuntimeError('o serve devolveu processos sem encerrar')
+            except Exception as error:
+                warn(flags, f'O serve não subiu e a limpeza dos processos parciais falhou: '
+                     f'{serve.protect(str(error))} Rode `serve stop` para encerrar o que sobrou.')
         raise Infra('serve_start_failed', f'O serve não subiu: {serve.protect(str(refusal))}') from None
-    except OSError as error:
+    except Exception as error:
+        flags['serve_iniciado_pelo_smoke'] = False
         raise Infra('serve_start_failed', f'O serve não subiu: {serve.protect(str(error))}') from None
-    flags['serve_iniciado_pelo_smoke'] = True
+    ledger['started'] = started_pids(started)
 
 
-def stop_started_serve(root, issue, flags):
-    """Derruba o serve só se o smoke o iniciou; falha ao derrubar vira aviso no resultado."""
+def stop_started_serve(root, issue, flags, ledger):
+    """Derruba o serve só se o smoke o iniciou e o registro ainda é o dele; falha vira aviso e bloqueio.
+
+    O `serve.stop` é por issue, não por pid: antes de parar, confere que o registro atual traz os mesmos
+    pids e identidades que o smoke iniciou. Se outra sessão fez stop e start no meio, não derruba nada e
+    avisa. Falha ao derrubar (processos órfãos do próprio smoke) marca `ledger['orphans']`.
+    """
     if not flags['serve_iniciado_pelo_smoke']:
         return
+    if not serve.registry_path(root, issue).is_file():
+        if ledger['started'] is None:  # interrompido durante a subida: o próprio serve já limpou tudo
+            flags['serve_iniciado_pelo_smoke'] = False
+        else:
+            warn(flags, 'O registro do serve desapareceu antes do encerramento (outra sessão fez `serve stop`?): '
+                 'o smoke não derrubou nada.')
+        return
     try:
-        serve.stop(root, issue)
+        if ledger['started'] is not None:
+            current = {(entry['pid'], entry.get('identity'))
+                       for entry in serve.read_registry(root, issue)['processes']}
+            if current != ledger['started']:
+                warn(flags, 'O registro do serve da issue mudou depois da subida (outra sessão fez stop e start): '
+                     'o smoke NÃO derrubou o serve atual, que não é o que ele iniciou.')
+                return
+        if not stop_succeeded(serve.stop(root, issue)):
+            raise RuntimeError('o serve devolveu processos sem encerrar.')
         flags['serve_encerrado'] = True
-    except (serve.Refusal, OSError, *MALFORMED) as error:
-        flags.setdefault('warnings', []).append(
-            f'O smoke iniciou o serve, mas não conseguiu derrubá-lo: {serve.protect(str(error))} '
-            'Rode `serve stop` para encerrar o que sobrou.')
+    except Exception as error:
+        ledger['orphans'] = True
+        warn(flags, f'O smoke iniciou o serve, mas não conseguiu derrubá-lo: {serve.protect(str(error))} '
+             'Rode `serve stop` para encerrar o que sobrou.')
+
+
+SHARED_SERVE_WARNING = ('O smoke usou um serve que já estava no ar (do usuário ou de outra sessão) e não o derruba. '
+                        'Limite: um smoke anterior encerrado à força (processo morto sem passar pelo encerramento) '
+                        'deixa o serve e o registro no ar; se esse serve não for seu, confira e rode `serve stop`.')
+ORPHANS_MESSAGE = ('O smoke iniciou o serve e não conseguiu derrubá-lo: podem restar processos órfãos. '
+                   'Rode `serve stop` e repita o smoke.')
 
 
 def run_smoke(args):
+    """Sobe o serve se preciso, confere cada caminho e derruba só o que subiu.
+
+    Limite: se o próprio smoke for morto à força (kill -9, queda da máquina), o `finally` não roda e o serve
+    que ele subiu e o registro ficam; o smoke seguinte os encontra como serve "de outra sessão", usa e
+    avisa em `warnings` para rodar `serve stop`.
+    """
     require_maskable_user_secrets(args.config)
     settings = smoke_settings(args.config)
     flags = {'serve_iniciado_pelo_smoke': False, 'serve_encerrado': False}
+    ledger = {'started': None, 'orphans': False}
+
+    def settle(record):
+        if ledger['orphans'] and record['classification'] in ('passed', 'healthy'):
+            record['classification'] = 'infrastructure'
+            record['infrastructure'] = {'kind': 'serve_stop_failed', 'message': ORPHANS_MESSAGE}
 
     def work(root):
         try:
-            if not serve_is_up(root, args.issue):
-                start_serve(args.config, root, args.issue, flags)
-            origin = locate(root, args.issue, settings['target'])
+            require_local_declarations(args.config)
+            if serve_is_up(root, args.issue):
+                warn(flags, SHARED_SERVE_WARNING)
+            else:
+                start_serve(args.config, root, args.issue, flags, ledger)
+            origin = locate(root, args.issue, settings['target'], args.config)
             results = []
             for path in settings['paths']:
                 status = fetch_status(origin + path, settings['timeout'])
@@ -894,9 +1088,9 @@ def run_smoke(args):
             return {'base_url': origin, 'paths': results, 'failures': failed,
                     'classification': 'product_failure' if failed else 'healthy'}
         finally:
-            stop_started_serve(root, args.issue, flags)
+            stop_started_serve(root, args.issue, flags, ledger)
 
-    return environment_outcome(args, 'smoke', work, flags)
+    return environment_outcome(args, 'smoke', work, flags, settle)
 
 
 SUBCOMMANDS = {'regression': (configure_regression, run_regression),

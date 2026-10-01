@@ -1,4 +1,6 @@
 import contextlib
+import ctypes
+import http.client
 import http.server
 import io
 import json
@@ -10,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 import urllib.request
 from pathlib import Path
 from unittest import mock
@@ -109,9 +112,9 @@ class IntegrationTestCase(unittest.TestCase):
         return {'name': name, 'argv': [sys.executable, str(self.tmp / 'server.py'), str(port)], 'port': port,
                 'health': f'http://127.0.0.1:{port}/health', 'timeoutSeconds': 20}
 
-    def write_config(self, checks_block, processes=None, users=None):
+    def write_config(self, checks_block, processes=None, users=None, base_url='http://127.0.0.1:1'):
         browser = {'processes': processes or [self.process('api'), self.process('web')],
-                   'baseUrl': 'http://127.0.0.1:1',
+                   'baseUrl': base_url,
                    'users': users if users is not None else [{'login': LOGIN, 'password': PASSWORD}]}
         self.config.write_text(json.dumps({'repository': 'OWNER/REPOSITORY', 'roads': None,
                                            'browserTest': browser, 'checks': checks_block}), encoding='utf-8')
@@ -532,9 +535,27 @@ class UserSecretMaskTest(IntegrationTestCase):
                 self.assertEqual(checks.redact(once), once, sample)
             self.assertEqual(checks.redact('[oculto]'), '[oculto]')
             self.assertEqual(checks.redact('xheadx'), 'x[oculto]x')
-            value = {'head': ['path', {'path': 'head'}], 'n': 3}
-            self.assertEqual(checks.scrub(value), {'head': ['[oculto]', {'path': '[oculto]'}], 'n': 3})
+            value = {'name': ['path', {'path': 'head'}], 'n': 3}
+            self.assertEqual(checks.scrub(value), {'name': ['[oculto]', {'path': '[oculto]'}], 'n': 3})
             self.assertEqual(checks.scrub(checks.scrub(value)), checks.scrub(value))
+
+    def test_each_evidence_key_keeps_its_value(self):
+        keys = ('head', 'diff_sha256', 'diff_sha256_vs_base', 'files_sha256', 'timestamp', 'pid', 'port',
+                'classification', 'kind', 'backend_url', 'base_url')
+        with mock.patch.object(checks, 'USER_SECRETS', ['2026']):
+            for key in keys:
+                with self.subTest(key=key):
+                    self.assertEqual(checks.scrub({key: 'a2026b'}), {key: 'a2026b'})
+            self.assertEqual(checks.scrub({'outra': 'a2026b'}), {'outra': 'a[oculto]b'})
+
+    def test_evidence_keys_keep_their_value_and_free_text_is_still_masked(self):
+        with mock.patch.object(checks, 'USER_SECRETS', ['2026', 'abcdef']):
+            value = {'timestamp': '2026-10-01T00:00:00', 'head': 'abcdef0123', 'nested': {'port': '12026'},
+                     'texto': 'ano 2026 e abcdef', 'lista': ['2026']}
+            self.assertEqual(checks.scrub(value), {'timestamp': '2026-10-01T00:00:00', 'head': 'abcdef0123',
+                                                   'nested': {'port': '12026'},
+                                                   'texto': 'ano [oculto] e [oculto]', 'lista': ['[oculto]']})
+            self.assertEqual(checks.scrub({'head': 'abcdef'}, skip=()), {'head': '[oculto]'})
 
     def test_longest_secret_wins_in_a_single_pass(self):
         with mock.patch.object(checks, 'USER_SECRETS', ['senha', 'senha-longa']):
@@ -791,6 +812,566 @@ class EnvironmentCheckSecurityTest(IntegrationTestCase):
             self.assertEqual(code, 2, cwd)
             self.assertIn('cwd', result['error'])
             self.assertFalse((self.tmp / 'cwd.txt').exists(), cwd)
+
+
+class SmokeHelpers:
+    """Auxiliares dos testes que sobem o serve pelo smoke."""
+
+    def smoke_config(self, **smoke):
+        self.write_config({'smoke': {'paths': ['/', '/health'], 'target': 'web', **smoke}})
+
+    def assert_all_down(self):
+        for port in self.ports.values():
+            for _ in range(50):
+                if not port_is_open(port):
+                    break
+                time.sleep(0.1)
+            self.assertFalse(port_is_open(port), port)
+
+    def registry_file(self):
+        return self.root / '.frontlights' / 'serve' / '12.json'
+
+    def counter(self, host='127.0.0.1'):
+        """Servidor que só conta as requisições recebidas; devolve (porta, lista de caminhos)."""
+        hits = []
+
+        class Counting(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                hits.append(self.path)
+                self.send_response(200)
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer((host, 0), Counting)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server.server_address[1], hits
+
+
+class RegistryPidTest(IntegrationTestCase):
+    """Pid fora da faixa no registro é infraestrutura, nunca traceback (ctypes.ArgumentError, OverflowError)."""
+
+    def test_invalid_pids_are_infrastructure_for_integration_and_smoke(self):
+        self.write_config({'integration': {'argv': self.recorder_argv()}, 'smoke': {'paths': ['/']}})
+        for pid in (99999999999, 2 ** 70, 2 ** 31, -1, 0, True, False, 1.5, '12', None):
+            self.write_raw_registry([{'name': 'api', 'pid': pid, 'port': 1, 'url': 'http://127.0.0.1:1/health',
+                                      'startedAt': 'agora', 'identity': serve.UNKNOWN_IDENTITY}])
+            for command in ('integration', 'smoke'):
+                with self.subTest(pid=pid, command=command):
+                    code, result = self.run_check(command)
+                    self.assertEqual(code, 3, result)
+                    self.assertEqual(result['infrastructure']['kind'], 'serve_registry_invalid')
+                    self.assertEqual(self.record(command)['infrastructure']['kind'], 'serve_registry_invalid')
+                    self.assertNotIn('Traceback', self.last_output)
+        self.assertFalse((self.tmp / 'seen.json').exists())
+
+    def test_the_largest_valid_pid_is_not_rejected_as_invalid(self):
+        self.write_config({'integration': {'argv': self.recorder_argv()}})
+        for pid in (1, checks.MAX_PID):
+            self.write_raw_registry([{'name': 'api', 'pid': pid, 'port': 1, 'url': 'http://127.0.0.1:1/health',
+                                      'startedAt': 'agora', 'identity': serve.UNKNOWN_IDENTITY}])
+            with self.subTest(pid=pid):
+                code, result = self.run_check('integration')
+                self.assertNotEqual(result.get('infrastructure', {}).get('kind'), 'serve_registry_invalid', result)
+
+    def test_a_valid_pid_is_still_accepted(self):
+        self.write_config({'integration': {'argv': self.recorder_argv()}})
+        self.write_registry('http://127.0.0.1:8080/health')
+        self.assertEqual(self.run_check('integration')[0], 0)
+
+
+class RegistryReadingCaptureTest(IntegrationTestCase):
+    """Cada exceção do serve ou da leitura do registro vira infraestrutura classificada."""
+
+    EXCEPTIONS = (KeyError('k'), AttributeError('a'), TypeError('t'), ValueError('v'), UnicodeError('u'),
+                  IndexError('i'), RuntimeError('r'), OverflowError('o'), ctypes.ArgumentError('c'))
+    SHAPES = ({}, {'processes': 5}, {'processes': None}, {'processes': [None]}, {'processes': ['texto']},
+              {'processes': [{'name': 'api', 'url': 'http://127.0.0.1:1/h', 'pid': 1}]})
+
+    def setUp(self):
+        super().setUp()
+        self.write_config({'integration': {'argv': self.recorder_argv()}, 'smoke': {'paths': ['/']}})
+        self.write_registry('http://127.0.0.1:8080/health')
+
+    def test_exceptions_raised_by_serve_status_are_infrastructure(self):
+        for error in self.EXCEPTIONS:
+            with mock.patch.object(serve, 'status', side_effect=error):
+                for command in ('integration', 'smoke'):
+                    with self.subTest(error=type(error).__name__, command=command):
+                        code, result = self.run_check(command)
+                        self.assertEqual(code, 3, result)
+                        self.assertEqual(result['infrastructure']['kind'], 'serve_registry_invalid')
+                        self.assertEqual(self.record(command)['classification'], 'infrastructure')
+
+    def test_unexpected_status_shapes_are_infrastructure(self):
+        for shape in self.SHAPES:
+            with mock.patch.object(serve, 'status', return_value=shape):
+                for command in ('integration', 'smoke'):
+                    with self.subTest(shape=shape, command=command):
+                        code, result = self.run_check(command)
+                        self.assertEqual(code, 3, result)
+                        self.assertEqual(result['infrastructure']['kind'], 'serve_registry_invalid')
+
+
+class FetchStatusTest(IntegrationTestCase):
+    """Cada captura de fetch_status tem um teste que a prova."""
+
+    def fetch_with(self, error):
+        with mock.patch.object(urllib.request.OpenerDirector, 'open', side_effect=error):
+            return checks.fetch_status('http://127.0.0.1:1/', 1)
+
+    def kind_of(self, error):
+        with self.assertRaises(checks.Infra) as caught:
+            self.fetch_with(error)
+        return caught.exception.kind
+
+    def test_value_and_unicode_errors_are_invalid_url(self):
+        for error in (ValueError('v'), UnicodeError('u'), UnicodeEncodeError('idna', 'x', 0, 1, 'r')):
+            with self.subTest(error=type(error).__name__):
+                self.assertEqual(self.kind_of(error), 'invalid_url')
+
+    def test_timeouts_are_timeout(self):
+        for error in (TimeoutError(), urllib.error.URLError(TimeoutError())):
+            with self.subTest(error=repr(error)):
+                self.assertEqual(self.kind_of(error), 'timeout')
+
+    def test_connection_problems_are_connection_failed(self):
+        for error in (urllib.error.URLError(ConnectionRefusedError()), ConnectionResetError(), OSError('x'),
+                      http.client.RemoteDisconnected('x'), http.client.BadStatusLine('x')):
+            with self.subTest(error=repr(error)):
+                self.assertEqual(self.kind_of(error), 'connection_failed')
+
+    def test_http_error_returns_its_status_code(self):
+        error = urllib.error.HTTPError('http://127.0.0.1:1/', 404, 'x', {}, io.BytesIO())
+        self.assertEqual(self.fetch_with(error), 404)
+
+    def test_smoke_with_an_unbuildable_request_is_infrastructure(self):
+        self.write_config({'smoke': {'paths': ['/']}})
+        self.write_registry('http://127.0.0.1:8080/health')
+        with mock.patch.object(urllib.request.OpenerDirector, 'open', side_effect=ValueError('v')):
+            code, result = self.run_check('smoke')
+        self.assertEqual((code, result['infrastructure']['kind']), (3, 'invalid_url'))
+
+
+class DirectHealthyTest(IntegrationTestCase):
+    """`direct_healthy` repete a regra do `serve.healthy` (2xx/3xx saudável) sem proxy do ambiente."""
+
+    def healthy_with(self, effect=None, answer=None):
+        with mock.patch.object(urllib.request.OpenerDirector, 'open', side_effect=effect, return_value=answer):
+            return checks.direct_healthy('http://127.0.0.1:1/health')
+
+    def test_answers_and_errors_are_classified_like_the_serve_does(self):
+        def http_error(code):
+            return urllib.error.HTTPError('http://127.0.0.1:1/health', code, 'x', {}, io.BytesIO())
+
+        answer = mock.MagicMock()
+        answer.__enter__.return_value.status = 200
+        self.assertIs(self.healthy_with(answer=answer), True)
+        answer.__enter__.return_value.status = 500
+        self.assertIs(self.healthy_with(answer=answer), False)
+        self.assertIs(self.healthy_with(http_error(302)), True)
+        self.assertIs(self.healthy_with(http_error(500)), False)
+        for error in (urllib.error.URLError(ConnectionRefusedError()), OSError('x'), ValueError('v'),
+                      http.client.RemoteDisconnected('x'), http.client.BadStatusLine('x'),
+                      http.client.IncompleteRead(b'')):
+            with self.subTest(error=repr(error)):
+                self.assertIs(self.healthy_with(error), False)
+
+
+class AutostartHostTest(SmokeHelpers, IntegrationTestCase):
+    """O host de cada health declarado é conferido ANTES de o smoke chamar serve.start."""
+
+    def refused(self, config_processes=None, base_url='http://127.0.0.1:1'):
+        self.write_config({'smoke': {'paths': ['/'], 'target': 'api'}}, processes=config_processes,
+                          base_url=base_url)
+        with mock.patch.object(serve, 'start') as started, \
+                mock.patch.object(urllib.request.OpenerDirector, 'open') as opened:
+            code, result = self.run_check('smoke')
+        started.assert_not_called()
+        opened.assert_not_called()
+        self.assertEqual((code, result['infrastructure']['kind']), (3, 'non_local_url'), result)
+        self.assertIs(result['serve_iniciado_pelo_smoke'], False)
+        self.assertFalse(self.registry_file().exists())
+        self.assertEqual(self.record('smoke')['infrastructure']['kind'], 'non_local_url')
+
+    def test_non_local_health_hosts_are_refused_without_starting_or_requesting_anything(self):
+        for host in ('127.0.0.2', 'evil.example', '127.0.0.1.evil', '0.0.0.0', 'localhost.evil.example'):
+            with self.subTest(host=host):
+                port = self.ports['api']
+                self.refused([dict(self.process('api'), health=f'http://{host}:{port}/health')])
+
+    def test_a_non_local_health_in_any_process_is_refused(self):
+        web = dict(self.process('web'), health='http://evil.example/health')
+        self.refused([self.process('api'), web])
+
+    def test_a_non_local_base_url_is_refused(self):
+        self.refused(base_url='http://evil.example/')
+
+    def test_a_server_on_127_0_0_2_receives_zero_requests_and_nothing_comes_up(self):
+        try:
+            port, hits = self.counter('127.0.0.2')
+        except OSError:
+            self.skipTest('127.0.0.2 não está disponível neste sistema')
+        self.write_config({'smoke': {'paths': ['/'], 'target': 'api'}},
+                          processes=[dict(self.process('api'), health=f'http://127.0.0.2:{port}/health')])
+        code, result = self.run_check('smoke')
+        self.assertEqual((code, result['infrastructure']['kind']), (3, 'non_local_url'), result)
+        self.assertEqual(hits, [])
+        self.assertFalse(self.registry_file().exists())
+        self.assert_all_down()
+
+    def test_local_hosts_and_a_config_without_browser_test_do_not_trigger_the_check(self):
+        self.smoke_config()
+        self.assertEqual(self.run_check('smoke')[0], 0)
+        self.config.write_text(json.dumps({'checks': {'smoke': {'paths': ['/']}}}), encoding='utf-8')
+        code, result = self.run_check('smoke')
+        self.assertEqual((code, result['infrastructure']['kind']), (3, 'serve_start_failed'))
+
+
+class SmokeStartFailureTest(SmokeHelpers, IntegrationTestCase):
+    def smoke_with_start(self, **patch):
+        self.smoke_config()
+        with mock.patch.object(serve, 'start', **patch) as started, \
+                mock.patch.object(serve, 'stop', return_value={'ok': True, 'processes': []}) as stopped:
+            code, result = self.run_check('smoke')
+        return code, result, started, stopped
+
+    def test_failed_start_with_left_processes_tries_one_more_stop(self):
+        left = [{'name': 'api', 'pid': 1}]
+        code, result, _, stopped = self.smoke_with_start(side_effect=serve.Refusal('falhou', extra={'left': left}))
+        self.assertEqual((code, result['infrastructure']['kind']), (3, 'serve_start_failed'))
+        stopped.assert_called_once()
+        self.assertEqual(stopped.call_args.args[1], 12)
+        self.assertNotIn('warnings', result)
+
+    def test_failed_start_without_left_does_not_call_stop(self):
+        for error in (serve.Refusal('falhou'), OSError('sem executável'), RuntimeError('inesperado'),
+                      KeyError('k'), ValueError('v')):
+            with self.subTest(error=type(error).__name__):
+                code, result, _, stopped = self.smoke_with_start(side_effect=error)
+                self.assertEqual((code, result['infrastructure']['kind']), (3, 'serve_start_failed'), result)
+                stopped.assert_not_called()
+                self.assertIs(result['serve_iniciado_pelo_smoke'], False)
+
+    def test_start_that_returns_an_unexpected_value_without_a_registry_leaves_no_warning(self):
+        for value in ({}, None, {'processes': 5}, {'processes': [None]}, {'processes': [{'pid': 1}]}):
+            with self.subTest(value=value):
+                code, result, _, stopped = self.smoke_with_start(return_value=value)
+                self.assertEqual((code, result['infrastructure']['kind']), (3, 'serve_registry_missing'), result)
+                stopped.assert_not_called()
+                self.assertIs(result['serve_iniciado_pelo_smoke'], False)
+                self.assertNotIn('warnings', result)
+
+    def test_cleanup_stop_that_fails_leaves_a_warning_to_run_serve_stop(self):
+        left = [{'name': 'api', 'pid': 1}]
+        self.smoke_config()
+        with mock.patch.object(serve, 'start', side_effect=serve.Refusal('falhou', extra={'left': left})), \
+                mock.patch.object(serve, 'stop', side_effect=serve.Refusal('nem todos', extra={'left': left})):
+            code, result = self.run_check('smoke')
+        self.assertEqual((code, result['infrastructure']['kind']), (3, 'serve_start_failed'))
+        self.assertTrue(any('Rode `serve stop`' in w for w in result['warnings']), result)
+        self.assertIs(result['serve_encerrado'], False)
+
+
+class SmokeStopFailureTest(SmokeHelpers, IntegrationTestCase):
+    """Processos que o próprio smoke subiu e não conseguiu derrubar são órfãos e bloqueiam."""
+
+    LEFT = [{'name': 'web', 'pid': 1}]
+
+    def stop_failures(self):
+        refusal = serve.Refusal('Nem todos os processos foram encerrados.', extra={'left': self.LEFT})
+        return {'refusal com left': dict(side_effect=refusal), 'erro inesperado': dict(side_effect=RuntimeError('x')),
+                'oserror': dict(side_effect=OSError('x')),
+                'retorno ok falso': dict(return_value={'ok': False, 'left': self.LEFT}),
+                'retorno com left': dict(return_value={'ok': True, 'left': self.LEFT, 'processes': []})}
+
+    def run_failing_stop(self, patch, **smoke):
+        self.smoke_config(**smoke)
+        with mock.patch.object(serve, 'stop', **patch):
+            outcome = self.run_check('smoke')
+        self.assertTrue(self.registry_file().is_file())  # o registro foi mantido para nova tentativa
+        self.serve('stop')  # limpeza real entre uma combinação e outra
+        self.assert_all_down()
+        return outcome
+
+    def assert_orphan_warning(self, result):
+        self.assertIs(result['serve_iniciado_pelo_smoke'], True)
+        self.assertIs(result['serve_encerrado'], False)
+        self.assertTrue(any('Rode `serve stop`' in w for w in result['warnings']), result)
+        record = self.record('smoke')
+        self.assertIs(record['serve_encerrado'], False)
+        self.assertEqual(record['warnings'], result['warnings'])
+
+    def test_all_paths_passing_but_stop_failing_blocks_as_infrastructure(self):
+        for name, patch in self.stop_failures().items():
+            with self.subTest(name):
+                code, result = self.run_failing_stop(patch)
+                self.assertEqual(code, 3, result)
+                self.assertIs(result['ok'], False)
+                self.assertIs(result['blocking'], True)
+                self.assertEqual(result['classification'], 'infrastructure')
+                self.assertEqual(result['infrastructure']['kind'], 'serve_stop_failed')
+                self.assertEqual([p['status'] for p in result['paths']], [200, 200])
+                self.assert_orphan_warning(result)
+                self.assertEqual(self.record('smoke')['classification'], 'infrastructure')
+
+    def test_failing_path_and_failing_stop_keep_exit_1_with_the_orphan_warning(self):
+        for name, patch in self.stop_failures().items():
+            with self.subTest(name):
+                code, result = self.run_failing_stop(patch, paths=['/', '/broken'])
+                self.assertEqual(code, 1, result)
+                self.assertEqual(result['classification'], 'product_failure')
+                self.assertEqual(result['failures'], ['/broken'])
+                self.assert_orphan_warning(result)
+
+    def test_infrastructure_failure_and_failing_stop_keep_the_original_kind(self):
+        problem = checks.Infra('connection_failed', 'sem conexão')
+        with mock.patch.object(checks, 'fetch_status', side_effect=problem):
+            code, result = self.run_failing_stop(self.stop_failures()['refusal com left'])
+        self.assertEqual((code, result['infrastructure']['kind']), (3, 'connection_failed'))
+        self.assert_orphan_warning(result)
+
+    def test_unknown_target_after_start_keeps_serve_keys_record_and_orphan_warning(self):
+        code, result = self.run_failing_stop(self.stop_failures()['refusal com left'], target='inexistente')
+        self.assertEqual(code, 2, result)
+        self.assertIn('inexistente', result['error'])
+        self.assertIs(result['ok'], False)
+        self.assert_orphan_warning(result)
+
+    def test_unknown_target_after_start_with_a_good_stop_reports_the_serve_keys(self):
+        self.smoke_config(target='inexistente')
+        code, result = self.run_check('smoke')
+        self.assertEqual(code, 2)
+        self.assertIs(result['serve_iniciado_pelo_smoke'], True)
+        self.assertIs(result['serve_encerrado'], True)
+        self.assertIs(self.record('smoke')['serve_encerrado'], True)
+        self.assertNotIn('warnings', result)
+        self.assert_all_down()
+
+    def test_successful_stop_has_no_warning_and_reports_ended(self):
+        self.smoke_config()
+        code, result = self.run_check('smoke')
+        self.assertEqual(code, 0)
+        self.assertIs(result['serve_encerrado'], True)
+        self.assertNotIn('warnings', result)
+
+    def test_stop_is_not_called_when_the_serve_was_already_running(self):
+        self.smoke_config()
+        self.start_serve()
+        with mock.patch.object(serve, 'stop') as stopped:
+            code, result = self.run_check('smoke')
+        self.assertEqual(code, 0)
+        stopped.assert_not_called()
+        self.assertIs(result['serve_encerrado'], False)
+
+
+class SmokeInterruptionTest(SmokeHelpers, IntegrationTestCase):
+    def test_interruption_right_after_serve_start_returns_still_tears_down(self):
+        self.smoke_config()
+        real_start = serve.start
+
+        def start_then_interrupt(*args, **kwargs):
+            real_start(*args, **kwargs)
+            raise KeyboardInterrupt
+
+        with mock.patch.object(serve, 'start', side_effect=start_then_interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_check('smoke')
+        self.assert_all_down()
+        self.assertFalse(self.registry_file().exists())
+
+    def test_interruption_inside_serve_start_leaves_nothing_and_no_stop_warning(self):
+        self.smoke_config()
+        with mock.patch.object(serve, 'wait_healthy', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_check('smoke')
+        self.assert_all_down()
+        self.assertFalse(self.registry_file().exists())
+
+
+class SmokeSharedServeTest(SmokeHelpers, IntegrationTestCase):
+    """O serve.stop é por issue: outra sessão pode ter feito stop+start entre a subida e o encerramento."""
+
+    def test_registry_replaced_by_another_session_is_not_torn_down(self):
+        self.smoke_config()
+
+        done = []
+
+        def other_session(url, timeout):
+            if not done:  # só na primeira requisição
+                done.append(True)
+                self.assertEqual(self.serve('stop').returncode, 0)
+                self.start_serve()
+            return 200
+
+        with mock.patch.object(checks, 'fetch_status', side_effect=other_session):
+            code, result = self.run_check('smoke')
+        self.assertEqual(code, 0, result)
+        self.assertIs(result['serve_iniciado_pelo_smoke'], True)
+        self.assertIs(result['serve_encerrado'], False)
+        self.assertTrue(any('outra sessão' in w for w in result['warnings']), result)
+        self.assertFalse(any('Rode `serve stop`' in w for w in result['warnings']), result)
+        self.assertTrue(port_is_open(self.ports['web']))
+        self.assertTrue(self.registry_file().is_file())
+
+    def test_registry_removed_by_another_session_is_a_warning_not_a_failure(self):
+        self.smoke_config()
+
+        done = []
+
+        def other_session(url, timeout):
+            if not done:
+                done.append(True)
+                self.assertEqual(self.serve('stop').returncode, 0)
+            return 200
+
+        with mock.patch.object(checks, 'fetch_status', side_effect=other_session):
+            code, result = self.run_check('smoke')
+        self.assertEqual(code, 0, result)
+        self.assertIs(result['serve_encerrado'], False)
+        self.assertTrue(any('outra sessão' in w for w in result['warnings']), result)
+
+    def test_partial_registry_of_a_running_start_is_infrastructure_not_a_config_error(self):
+        pid = self.live_pid()
+        self.write_raw_registry([{'name': 'api', 'pid': pid, 'port': 1, 'url': 'http://127.0.0.1:1/health',
+                                  'startedAt': 'agora', 'identity': serve.process_identity(pid)
+                                  or serve.UNKNOWN_IDENTITY}])
+        self.write_config({'integration': {'argv': self.recorder_argv()}, 'backend': 'web',
+                           'smoke': {'paths': ['/'], 'target': 'web'}})
+        for command in ('smoke', 'integration'):
+            with self.subTest(command=command):
+                code, result = self.run_check(command)
+                self.assertEqual(code, 3, result)
+                self.assertEqual(result['infrastructure']['kind'], 'serve_registry_partial')
+                self.assertEqual(self.record(command)['infrastructure']['kind'], 'serve_registry_partial')
+        self.assertTrue(serve.pid_alive(pid))
+        self.assertTrue(self.registry_file().is_file())
+        self.assertFalse((self.tmp / 'seen.json').exists())
+
+    def test_target_that_the_config_does_not_declare_is_still_a_config_error(self):
+        self.smoke_config(target='inexistente')
+        self.start_serve()
+        code, result = self.run_check('smoke')
+        self.assertEqual(code, 2)
+        self.assertIn('inexistente', result['error'])
+
+    def test_using_a_running_serve_warns_about_the_hard_kill_limit(self):
+        self.smoke_config()
+        self.start_serve()
+        code, result = self.run_check('smoke')
+        self.assertEqual(code, 0)
+        self.assertIs(result['serve_iniciado_pelo_smoke'], False)
+        self.assertTrue(any('à força' in w and 'serve stop' in w for w in result['warnings']), result)
+        self.assertEqual(self.record('smoke')['warnings'], result['warnings'])
+
+    def test_the_hard_kill_limit_is_documented(self):
+        self.assertIn('à força', checks.__doc__)
+        self.assertIn('à força', checks.run_smoke.__doc__)
+
+
+class SmokeProxyTest(SmokeHelpers, IntegrationTestCase):
+    """O health do autostart (serve.healthy) não pode passar por proxy do ambiente."""
+
+    def test_autostart_in_a_process_started_with_proxy_variables_never_touches_the_proxy(self):
+        port, hits = self.counter()
+        address = f'http://127.0.0.1:{port}'
+        self.smoke_config()
+        env = {k: v for k, v in os.environ.items() if k.upper() != 'NO_PROXY'}
+        env.update({name: address for name in ('HTTP_PROXY', 'http_proxy', 'ALL_PROXY', 'all_proxy')})
+        done = subprocess.run([sys.executable, str(SCRIPTS / 'checks.py'), 'smoke', '--config', str(self.config),
+                               '--root', str(self.root), '--issue', '12'], capture_output=True, text=True,
+                              encoding='utf-8', env=env, timeout=120)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(hits, [])
+        self.assert_all_down()
+
+    def test_serve_health_check_is_restored_after_the_start(self):
+        original = serve.healthy
+        self.smoke_config()
+        self.assertEqual(self.run_check('smoke')[0], 0)
+        self.assertIs(serve.healthy, original)
+        with mock.patch.object(serve, 'start', side_effect=RuntimeError('x')):
+            self.run_check('smoke')
+        self.assertIs(serve.healthy, original)
+
+    def test_the_environment_of_the_started_processes_is_not_changed(self):
+        before = dict(os.environ)
+        self.smoke_config()
+        self.run_check('smoke')
+        self.assertEqual(dict(os.environ), before)
+
+
+class EvidenceFieldsTest(SmokeHelpers, IntegrationTestCase):
+    """A máscara só vale para texto livre: head, hashes, horário, porta e classificação ficam exatos."""
+
+    def setUp(self):
+        super().setUp()
+        self.base = self.tmp / 'base'
+        subprocess.run(['git', 'clone', '-q', str(self.root), str(self.base)], check=True, env=GIT_ENV)
+        self.head = subprocess.run(['git', '-C', str(self.root), 'rev-parse', 'HEAD'], capture_output=True,
+                                   text=True, check=True).stdout.strip()
+        self.blocks = {'integration': {'argv': self.recorder_argv()},
+                       'smoke': {'paths': ['/', '/health'], 'target': 'web'}}
+        self.write_config(self.blocks)
+        self.start_serve()  # com o serve no ar, a senha especial não passa pelo registro do serve
+
+    def passwords(self):
+        return {'ano': '2026', 'head': self.head[:6], 'porta api': str(self.ports['api']),
+                'porta web': str(self.ports['web'])}
+
+    def test_evidence_fields_stay_exact_whatever_the_password(self):
+        for label, password in self.passwords().items():
+            self.write_config(self.blocks, users=[{'login': LOGIN, 'password': password}])
+            for command, port_key in (('integration', 'api'), ('smoke', 'web')):
+                with self.subTest(password=label, command=command):
+                    code, result = self.run_check(command, extra=['--base', str(self.base)])
+                    self.assertEqual(code, 0, result)
+                    for shown in (result, self.record(command)):
+                        self.assertEqual(shown['head'], self.head)
+                        self.assertRegex(shown['diff_sha256'], '^[0-9a-f]{64}$')
+                        self.assertRegex(shown['diff_sha256_vs_base'], '^[0-9a-f]{64}$')
+                        self.assertRegex(shown['files_sha256'], '^[0-9a-f]{64}$')
+                        self.assertRegex(shown['timestamp'], r'^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d')
+                        self.assertIn(shown['classification'], ('passed', 'healthy'))
+                        url = shown['backend_url'] if command == 'integration' else shown['base_url']
+                        self.assertEqual(url, f'http://127.0.0.1:{self.ports[port_key]}')
+
+    def test_the_secret_is_still_hidden_in_free_text_argv_and_errors(self):
+        for label, password in self.passwords().items():
+            self.write_config({**self.blocks, 'integration': {'argv': self.recorder_argv() + [password]}},
+                              users=[{'login': LOGIN, 'password': password}])
+            with self.subTest(password=label):
+                _, result = self.run_check('integration')
+                self.assertEqual(result['argv'][-1], '[oculto]')
+                self.assertEqual(self.record('integration')['argv'][-1], '[oculto]')
+                self.write_config({'smoke': {'paths': ['/'], 'target': password}},
+                                  users=[{'login': LOGIN, 'password': password}])
+                code, result = self.run_check('smoke')
+                self.assertEqual(code, 2)
+                self.assertNotIn(password, result['error'])
+                self.assertIn('[oculto]', result['error'])
+
+    def test_regression_records_keep_their_evidence_exact_too(self):
+        (self.tmp / 'suite.py').write_text(FAKE_SUITE, encoding='utf-8')
+        for label, password in self.passwords().items():
+            self.write_config({'regression': {'argv': [sys.executable, str(self.tmp / 'suite.py')]}},
+                              users=[{'login': LOGIN, 'password': password}])
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = checks.main(['regression', '--config', str(self.config), '--root', str(self.root),
+                                    '--base', str(self.base), '--issue', '12'])
+            with self.subTest(password=label):
+                self.assertEqual(code, 0, out.getvalue())
+                shown = json.loads(out.getvalue())
+                for side in ('base', 'branch'):
+                    self.assertEqual(shown[side]['head'], self.head)
+                    self.assertRegex(shown[side]['diff_sha256'], '^[0-9a-f]{64}$')
 
 
 if __name__ == '__main__':
