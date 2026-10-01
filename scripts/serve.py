@@ -69,8 +69,9 @@ def protect(text):
     found_secrets = sorted({secret for secret in _SECRETS if secret}, key=len, reverse=True)
     if not found_secrets:
         return text
-    # secrets first (longest first), then the mask itself, replaced by itself so masking twice changes nothing
-    pattern = '|'.join([re.escape(secret) for secret in found_secrets] + [re.escape(MASK)])
+    # the mask FIRST, replaced by itself (so masking twice changes nothing, even for a secret that is a prefix
+    # of the mask), then the secrets from the longest to the shortest
+    pattern = '|'.join([re.escape(MASK)] + [re.escape(secret) for secret in found_secrets])
     return re.sub(pattern, lambda found: MASK, text)
 
 

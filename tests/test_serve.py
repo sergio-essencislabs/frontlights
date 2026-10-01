@@ -428,20 +428,32 @@ class SecretMaskingTest(ServeTestCase):
                 self.assertFalse(reachable(entry['health']), 'um processo subiu apesar da recusa')
                 self.serve('stop')
 
+    def test_a_secret_that_is_a_prefix_of_the_mask_keeps_masking_idempotent_and_a_second_pass_does_not_grow_the_text(self):
+        for secret in ('[redact', '[redacted', '[', '[r'):
+            with self.subTest(secret=secret):
+                serve._SECRETS[:] = [secret]
+                self.addCleanup(serve._SECRETS.clear)
+                text = 'a ' + secret + ' b [redacted] c'
+                once = serve.protect(text)
+                self.assertEqual(serve.protect(once), once)
+                self.assertEqual(len(serve.protect(once)), len(once))
+
     def test_a_login_or_password_containing_the_mask_text_is_refused_before_starting_anything(self):
         entry = self.web('web')
         for login, password in ((LOGIN, '[redacted]abc'), (LOGIN, 'abc[redacted]'),
                                 ('[redacted]abc', PASSWORD), ('abc[redacted]', PASSWORD)):
             with self.subTest(login=login, password=password):
-                self.write_config([entry], login=login, password=password)
-                done = self.serve('start')
-                self.assertEqual(done.returncode, 1, done.stdout)
-                result = self.payload(done)
-                self.assertEqual(result['category'], 'uso')
-                self.assertIn('marcador de máscara', result['error'])
-                self.assertFalse(self.registry().exists())
-                self.assertFalse(reachable(entry['health']), 'um processo subiu apesar da recusa')
-                self.serve('stop')
+                try:
+                    self.write_config([entry], login=login, password=password)
+                    done = self.serve('start')
+                    self.assertEqual(done.returncode, 1, done.stdout)
+                    result = self.payload(done)
+                    self.assertEqual(result['category'], 'uso')
+                    self.assertIn('marcador de máscara', result['error'])
+                    self.assertFalse(self.registry().exists())
+                    self.assertFalse(reachable(entry['health']), 'um processo subiu apesar da recusa')
+                finally:
+                    self.serve('stop')
 
     def test_a_secret_that_is_a_substring_of_a_key_keeps_the_structure_and_the_registry_readable(self):
         for secret in ('name', 'port', 'dact', 'redacted'):
