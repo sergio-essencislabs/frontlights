@@ -19,6 +19,13 @@ repository; outside Git: `<root>/.frontlights/serve/ports/`), and gives the proc
 `PORT` and `FRONTLIGHTS_PORT_<NAME>` (name upper-cased, non-alphanumerics as `_`). A reservation whose coordinator
 and process are both dead is an orphan and is reused. `stop` and a failed start release the issue's reservations.
 A process that ignores its port fails the start as an infrastructure failure, naming the process and the port.
+All the ports of one start are reserved under one acquisition of a short lock (`.reserve.lock`, O_EXCL, reentrant for
+the same start). A lock or reservation file that cannot be read is treated as being written by its owner (alive)
+while it is recent, and as an orphan once it is older than 60 s. A port counts as busy when it cannot be bound on
+127.0.0.1, 0.0.0.0, or (when IPv6 works) ::1 and ::, or when something already accepts connections there.
+The variable name is the process name upper-cased with non-alphanumerics as `_`, so `web-api` and `web_api` give
+the same `FRONTLIGHTS_PORT_WEB_API`: a config whose names collide after that normalisation is refused (category `uso`).
+The start output says whether the reservations are shared (`reservas_compartilhadas`).
 
 Exit codes: 0 done; 1 refusal or failure (a failed start tears down whatever already came up and
 names the failing process, classified as an infrastructure failure).
@@ -39,6 +46,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -56,6 +64,9 @@ MASK = '[redacted]'
 KILL_WAIT_SECONDS = 15
 PORT_ATTEMPTS = 200
 RESERVE_LOCK_SECONDS = 20
+ORPHAN_SECONDS = 60
+REMOVE_ATTEMPTS = 40
+CONNECT_SECONDS = 0.05
 
 _SECRETS = []
 
@@ -115,7 +126,14 @@ def write_json_atomic(value, path):
     try:
         temporary.write_text(json.dumps(scrub(value, REGISTRY_EXACT), indent=2, ensure_ascii=False),
                              encoding='utf-8')
-        os.replace(temporary, path)
+        for attempt in range(REMOVE_ATTEMPTS):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:  # Windows: a reader holds the target open for a moment
+                if attempt == REMOVE_ATTEMPTS - 1:
+                    raise
+                time.sleep(min(0.002 * (attempt + 1), 0.05))
     finally:
         if temporary.exists():
             temporary.unlink()
@@ -147,7 +165,7 @@ def load_block(config_file):
                     _SECRETS.extend([value, urllib.parse.quote(value, safe=''), urllib.parse.quote_plus(value)])
     processes = block.get('processes')
     require(isinstance(processes, list) and processes, 'browserTest.processes precisa ser uma lista não vazia.')
-    names = set()
+    names, variables = set(), {}
     for item in processes:
         require(isinstance(item, dict), 'Cada item de browserTest.processes precisa ser um objeto.')
         name = item.get('name')
@@ -161,6 +179,12 @@ def load_block(config_file):
         parts = urllib.parse.urlsplit(health) if isinstance(health, str) else None
         require(parts and parts.scheme in ('http', 'https') and parts.hostname,
                 f'O processo {name} precisa de health como URL http(s).', name)
+        variable = env_name(name)
+        require(variable not in variables,
+                f'Os processos {variables.get(variable)} e {name} geram a mesma variável {variable} depois de '
+                'normalizar o nome (maiúsculas, e tudo que não é letra ou número vira "_"). Renomeie um deles.',
+                name, USAGE)
+        variables[variable] = name
         require('port' not in item or item['port'] == PORT_AUTO
                 or isinstance(item['port'], int) and not isinstance(item['port'], bool),
                 f'O processo {name} tem port inválida: use um inteiro ou "{PORT_AUTO}".', name)
@@ -411,21 +435,31 @@ def write_registry(root, issue, entries):
                       registry_path(root, issue))
 
 
-def ports_dir(root):
-    """Folder shared by every worktree of the same repository for port reservations.
+def ports_location(root):
+    """Folder for port reservations and whether it is shared by every worktree of the repository.
 
     It lives in the Git common directory (`frontlights-serve/ports`), so worktrees of one repository see each
-    other's reservations. Outside a Git repository it falls back to `<root>/.frontlights/serve/ports`.
+    other's reservations. Without Git (or when Git cannot say) it falls back to `<root>/.frontlights/serve/ports`
+    and the second value is False.
     """
-    try:
-        done = subprocess.run(['git', '-C', str(root), 'rev-parse', '--path-format=absolute', '--git-common-dir'],
-                              capture_output=True, text=True, encoding='utf-8', timeout=30)
-        common = done.stdout.strip() if done.returncode == 0 else ''
-    except (OSError, subprocess.SubprocessError):
-        common = ''
-    if common and Path(common).is_dir():
-        return Path(common) / 'frontlights-serve' / 'ports'
-    return Path(root) / '.frontlights' / 'serve' / 'ports'
+    for flags in (['--path-format=absolute', '--git-common-dir'], ['--git-common-dir']):
+        try:
+            done = subprocess.run(['git', '-C', str(root), 'rev-parse', *flags], capture_output=True, text=True,
+                                  encoding='utf-8', timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        text = done.stdout.strip() if done.returncode == 0 else ''
+        if text:
+            common = Path(text)
+            if not common.is_absolute():
+                common = Path(root) / common
+            if common.is_dir():
+                return common / 'frontlights-serve' / 'ports', True
+    return Path(root) / '.frontlights' / 'serve' / 'ports', False
+
+
+def ports_dir(root):
+    return ports_location(root)[0]
 
 
 def candidate_ports():
@@ -437,69 +471,157 @@ def candidate_ports():
         yield port  # offered only after the probe socket is closed, so bindable() can test it
 
 
+_IPV6 = []
+
+
+def ipv6_usable():
+    if not _IPV6:
+        try:
+            with socket.socket(socket.AF_INET6) as sock:
+                sock.bind(('::1', 0))
+            _IPV6.append(True)
+        except (OSError, AttributeError):
+            _IPV6.append(False)
+    return _IPV6[0]
+
+
 def bindable(port):
-    """True when nothing else holds the port on 127.0.0.1 (the bind fails for a port in use)."""
+    """True when nothing else holds the port: it binds on every local address and nothing accepts connections.
+
+    Addresses: 127.0.0.1 and 0.0.0.0 and, when IPv6 works, ::1 and ::. A listener on any of them (or one the
+    bind cannot see, like a specific address next to a wildcard on Windows) makes the port busy.
+    """
+    families = [(socket.AF_INET, '127.0.0.1'), (socket.AF_INET, '0.0.0.0')]
+    if ipv6_usable():
+        families += [(socket.AF_INET6, '::1'), (socket.AF_INET6, '::')]
+    for family, address in families:
+        try:
+            with socket.socket(family) as sock:
+                sock.bind((address, port))
+        except OSError:
+            return False
+    for family, address in [families[0]] + families[2:3]:
+        with socket.socket(family) as sock:
+            sock.settimeout(CONNECT_SECONDS)
+            if sock.connect_ex((address, port)) == 0:
+                return False
+    return True
+
+
+def read_brief(path, limit=65536):
+    """Read a small file and close it at once (os.open without delete-sharing would block a delete for longer)."""
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, 'O_BINARY', 0))
     try:
-        with socket.socket() as sock:
-            sock.bind(('127.0.0.1', port))
-        return True
+        return os.read(descriptor, limit).decode('utf-8', errors='replace')
+    finally:
+        os.close(descriptor)
+
+
+def remove_file(path):
+    """Delete a file, retrying a few ms (Windows refuses while a reader has it open). True when it is gone."""
+    for attempt in range(REMOVE_ATTEMPTS):
+        try:
+            os.unlink(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            time.sleep(min(0.002 * (attempt + 1), 0.05))
+    return False
+
+
+def older_than_orphan(path):
+    try:
+        return time.time() - os.stat(path).st_mtime > ORPHAN_SECONDS
     except OSError:
         return False
 
 
-@contextlib.contextmanager
-def reservation_lock(directory):
-    """Short exclusive lock (O_EXCL) so choosing and recording a port is one step across processes."""
-    directory.mkdir(parents=True, exist_ok=True)
+_LOCAL_LOCK = threading.RLock()
+_HELD = {}
+
+
+def take_reserve_file(directory):
+    """Create `.reserve.lock` exclusively (waiting for a live owner) and return its path."""
     path = directory / '.reserve.lock'
     deadline = time.monotonic() + RESERVE_LOCK_SECONDS
     while True:
         try:
             descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            break
-        except FileExistsError:
+        except (FileExistsError, PermissionError):  # PermissionError: Windows, the file is being deleted
             try:
-                text = path.read_text(encoding='utf-8')
+                text = read_brief(path)
                 owner = int(text.strip())
             except FileNotFoundError:
                 continue
             except (OSError, ValueError):
-                owner = None  # still being written by its owner: wait
+                owner, text = None, None  # still being written by its owner, or the owner crashed
             if owner is not None and not pid_alive(owner):
                 try:
-                    if path.read_text(encoding='utf-8') == text:
-                        path.unlink()
+                    if read_brief(path) == text:  # still the stale lock we just judged
+                        remove_file(path)
                 except OSError:
                     pass
+                continue
+            if owner is None and older_than_orphan(path):
+                remove_file(path)  # empty or garbage for over a minute: its writer crashed
                 continue
             require(time.monotonic() < deadline,
                     'Não foi possível obter a trava de reserva de portas (outra reserva demorou demais). '
                     f'Se nenhum start estiver rodando, apague {path.name} da pasta de reservas.')
-            time.sleep(0.05)
-    with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
-        handle.write(str(os.getpid()))
-    try:
-        yield
-    finally:
+            time.sleep(0.02)
+            continue
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+            handle.write(str(os.getpid()))
+        return path
+
+
+@contextlib.contextmanager
+def reservation_lock(directory):
+    """Short exclusive lock so choosing and recording ports is one step across processes and threads.
+
+    Reentrant: a start that reserves several ports holds it once and never waits for itself. Releasing it must
+    work: when the file cannot be removed the failure is raised, never swallowed.
+    """
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    key = str(directory)
+    with _LOCAL_LOCK:
+        if _HELD.get(key):
+            _HELD[key] += 1
+            try:
+                yield
+            finally:
+                _HELD[key] -= 1
+            return
+        path = take_reserve_file(directory)
+        _HELD[key] = 1
         try:
-            path.unlink()
-        except OSError:
-            pass
+            yield
+        finally:
+            _HELD.pop(key, None)
+            if not remove_file(path):
+                raise Refusal(f'Não foi possível liberar a trava de reserva de portas ({path.name}): o arquivo '
+                              'continua em uso. Apague-o à mão da pasta de reservas antes de um novo start.')
 
 
 def read_reservation(path):
     try:
-        record = json.loads(Path(path).read_text(encoding='utf-8'))
+        record = json.loads(read_brief(path))
         return record if isinstance(record, dict) and isinstance(record.get('pid'), int) else None
     except (OSError, ValueError):
         return None
 
 
 def reservation_live(path):
-    """A reservation holds while its coordinator (a running start) or its started process is alive."""
+    """A reservation holds while its coordinator (a running start) or its started process is alive.
+
+    Unreadable (a start that crashed between creating and writing it, or one still writing): alive while the
+    file is recent, an orphan once it is older than 60 s.
+    """
     record = read_reservation(path)
     if record is None:
-        return True  # unreadable: assume it is somebody's, never take it over
+        return not older_than_orphan(path)
     child = record.get('child')
     return same_process(record) or (isinstance(child, dict) and isinstance(child.get('pid'), int)
                                     and same_process(child))
@@ -514,14 +636,15 @@ def reserve_port(root, issue, name):
             if path.exists():
                 if reservation_live(path):
                     continue  # reserved by a live start/issue (maybe of another worktree)
-                path.unlink(missing_ok=True)  # orphan: its start and its process are gone
+                if not remove_file(path):
+                    continue
             if not bindable(port):
                 continue  # another program holds it
             record = {'issue': issue, 'process': name, 'root': str(Path(root).resolve()), 'pid': os.getpid(),
                       'identity': process_identity(os.getpid()) or UNKNOWN_IDENTITY, 'reservedAt': now_iso()}
             try:
                 descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except FileExistsError:
+            except (FileExistsError, PermissionError):
                 continue
             with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
                 handle.write(json.dumps(scrub(record, REGISTRY_EXACT), indent=2, ensure_ascii=False))
@@ -529,17 +652,21 @@ def reserve_port(root, issue, name):
     raise Refusal(f'Não foi possível reservar uma porta livre para o processo {name}.')
 
 
+def reserve_ports(root, issue, names):
+    """Reserve one port per name under a single acquisition of the lock; returns {name: port}."""
+    with reservation_lock(ports_dir(root)):
+        return {name: reserve_port(root, issue, name) for name in names}
+
+
 def release_ports(root, issue, keep=()):
     """Remove this issue's reservations made from this worktree (except the ports in `keep`)."""
     directory = ports_dir(root)
     here = str(Path(root).resolve())
+    kept = {str(port) for port in keep}
     for path in directory.glob('*.json') if directory.is_dir() else ():
         record = read_reservation(path)
-        if record and record.get('issue') == issue and record.get('root') == here                 and path.stem not in {str(port) for port in keep}:
-            try:
-                path.unlink()
-            except OSError:
-                pass
+        if record and record.get('issue') == issue and record.get('root') == here and path.stem not in kept:
+            remove_file(path)
 
 
 def attach_child(root, port, child_entry):
@@ -568,10 +695,11 @@ def start_locked(processes, root, issue):
                 category=USAGE)
     started = []
     try:
+        ports = reserve_ports(root, issue, [item['name'] for item in processes if is_auto(item)])
         for item in processes:
             env = None
             if is_auto(item):
-                port = reserve_port(root, issue, item['name'])
+                port = ports[item['name']]
                 env = {'PORT': str(port), env_name(item['name']): str(port)}
                 item = with_port(item, port)
             cwd = process_cwd(root, item)
@@ -610,7 +738,8 @@ def start_locked(processes, root, issue):
                           failure.process, failure.category,
                           {'left': [{'name': entry['name'], 'pid': entry['pid']} for entry in left]})
         raise
-    return {'ok': True, 'issue': issue, 'processes': started}
+    return {'ok': True, 'issue': issue, 'processes': started,
+            'reservas_compartilhadas': ports_location(root)[1]}
 
 
 def read_registry(root, issue):

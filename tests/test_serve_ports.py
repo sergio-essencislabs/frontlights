@@ -5,6 +5,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.request
@@ -286,6 +287,327 @@ class FixedPortTest(PortsTestCase):
         self.assertNotIn(PASSWORD, text)
         self.assertNotIn(LOGIN, text)
         self.assertIn('redacted', text)
+
+
+def old(path, seconds=120):
+    """Make the file look untouched for `seconds` (a crashed writer's leftover)."""
+    stamp = time.time() - seconds
+    os.utime(path, (stamp, stamp))
+
+
+def dead_pid():
+    gone = subprocess.Popen([sys.executable, '-c', 'pass'])
+    gone.wait()
+    return gone.pid
+
+
+class GitPortsCase(PortsTestCase):
+    """A temporary Git repository whose worktrees share one reservation folder."""
+
+    def git(self, *args, cwd=None):
+        done = subprocess.run(['git', '-c', 'user.name=Teste', '-c', 'user.email=teste@exemplo.test', *args],
+                              cwd=cwd or self.repo, capture_output=True, text=True, encoding='utf-8', timeout=60)
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def make_repo(self):
+        self.repo = self.base / 'repo'
+        self.repo.mkdir()
+        self.git('init', '-q')
+        self.git('commit', '-q', '--allow-empty', '-m', 'inicio')
+        self.shared = self.repo / '.git' / 'frontlights-serve' / 'ports'
+
+    def make_worktree(self, name):
+        path = self.base / name
+        self.git('worktree', 'add', '-q', '-b', name, str(path))
+        return path
+
+
+class RealConcurrencyTest(GitPortsCase):
+    STARTS = 8
+    ROUNDS = 3
+
+    def test_eight_simultaneous_starts_with_two_auto_processes_each_all_succeed_with_distinct_ports(self):
+        self.make_repo()
+        self.write_config([self.auto('web-api'), self.auto('worker', argv_port=False)])
+        trees = [self.make_worktree(f'wt{number}') for number in range(self.STARTS)]
+        for round_number in range(self.ROUNDS):
+            runs = []
+            for number, tree in enumerate(trees):
+                issue = 100 + number
+                self.touched.append((tree, issue))
+                runs.append(self.serve_in_background(issue, root=tree))
+            outputs = [run.communicate(timeout=120) for run in runs]
+            codes = [run.returncode for run in runs]
+            self.assertEqual(codes, [0] * self.STARTS, f'rodada {round_number}: {outputs}')
+            entries = [entry for out, _ in outputs for entry in json.loads(out)['processes']]
+            ports = [entry['port'] for entry in entries]
+            self.assertEqual(len(ports), self.STARTS * 2)
+            self.assertEqual(len(set(ports)), len(ports), ports)
+            for entry in entries:
+                self.assertEqual(fetch(entry['url']).split('|')[0], str(entry['port']))
+            for number, tree in enumerate(trees):
+                self.assertEqual(self.serve('stop', 100 + number, root=tree).returncode, 0, self.last.stdout)
+            self.assertEqual(list(self.shared.glob('*.json')), [])
+            self.assertFalse((self.shared / '.reserve.lock').exists(), 'a trava vazou')
+
+    def test_the_lock_is_reentrant_for_the_same_start(self):
+        directory = self.root / 'ports'
+        with mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 1):
+            with serve.reservation_lock(directory):
+                with serve.reservation_lock(directory):
+                    pass
+        self.assertFalse((directory / '.reserve.lock').exists())
+
+    def test_the_lock_is_not_released_silently_when_the_file_cannot_be_removed(self):
+        directory = self.root / 'ports'
+        real_unlink = os.unlink
+
+        def refuse(path, *args, **kwargs):
+            if os.path.basename(str(path)) == '.reserve.lock':
+                raise PermissionError('em uso')
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(os, 'unlink', refuse), mock.patch.object(os, 'remove', refuse), \
+                mock.patch.object(serve.time, 'sleep', lambda seconds: None):
+            with self.assertRaises(serve.Refusal) as caught:
+                with serve.reservation_lock(directory):
+                    pass
+        self.assertIn('trava', str(caught.exception))
+        (directory / '.reserve.lock').unlink()
+
+
+class LockRecoveryTest(PortsTestCase):
+    def setUp(self):
+        super().setUp()
+        self.ports = self.root / '.frontlights' / 'serve' / 'ports'
+        self.ports.mkdir(parents=True)
+        self.lock = self.ports / '.reserve.lock'
+
+    def test_a_stale_lock_of_a_dead_pid_is_cleaned(self):
+        self.lock.write_text(str(dead_pid()), encoding='utf-8')
+        with mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 3):
+            self.assertIsInstance(serve.reserve_port(self.root, 11, 'web'), int)
+        self.assertFalse(self.lock.exists())
+
+    def test_an_empty_or_garbage_old_lock_is_an_orphan_and_is_cleaned(self):
+        for content in ('', 'lixo-sem-numero'):
+            self.lock.write_text(content, encoding='utf-8')
+            old(self.lock)
+            with mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 3):
+                self.assertIsInstance(serve.reserve_port(self.root, 11, 'web'), int, content)
+            self.assertFalse(self.lock.exists())
+
+    def test_an_empty_recent_lock_is_still_being_written_so_it_is_waited_for(self):
+        self.lock.write_text('', encoding='utf-8')
+        with mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 1):
+            with self.assertRaises(serve.Refusal) as caught:
+                serve.reserve_port(self.root, 11, 'web')
+        self.assertIn('trava de reserva', str(caught.exception))
+        self.assertTrue(self.lock.exists())
+
+
+class ReservationRulesTest(GitPortsCase):
+    def setUp(self):
+        super().setUp()
+        self.ports = self.root / '.frontlights' / 'serve' / 'ports'
+
+    def test_the_reservation_is_created_exclusively_even_when_a_racer_writes_between_check_and_create(self):
+        self.ports.mkdir(parents=True)
+        real = serve.bindable
+        hijacked = []
+
+        def racer(port):
+            if not hijacked:
+                hijacked.append(port)
+                (self.ports / f'{port}.json').write_text(json.dumps({'issue': 99, 'pid': os.getpid(), 'process': 'x',
+                                                                     'root': 'y'}), encoding='utf-8')
+            return real(port)
+
+        with mock.patch.object(serve, 'bindable', racer):
+            got = serve.reserve_port(self.root, 11, 'web')
+        self.assertNotEqual(got, hijacked[0])
+        self.assertEqual(json.loads((self.ports / f'{hijacked[0]}.json').read_text(encoding='utf-8'))['issue'], 99)
+
+    def test_the_lock_serialises_two_reservers_that_both_judge_the_same_reservation_an_orphan(self):
+        port = free_port()
+        self.ports.mkdir(parents=True)
+        (self.ports / f'{port}.json').write_text(json.dumps({'issue': 5, 'process': 'old', 'root': 'x',
+                                                             'pid': dead_pid()}), encoding='utf-8')
+        barrier = threading.Barrier(2, timeout=1.5)
+        real = serve.reservation_live
+
+        def meet(path):
+            answer = real(path)
+            try:
+                barrier.wait()
+            except threading.BrokenBarrierError:
+                pass
+            return answer
+
+        real_remove = serve.remove_file
+
+        def late_remove(path):
+            # the second reserver removes the orphan only after the first one has recreated it as its own
+            if threading.current_thread().name == 'second':
+                wait_until(lambda: (serve.read_reservation(path) or {}).get('issue') == 11, 3)
+            return real_remove(path)
+
+        got, errors = [], []
+
+        def reserve(issue):
+            try:
+                got.append(serve.reserve_port(self.root, issue, 'web'))
+            except Exception as error:  # noqa: BLE001
+                errors.append(error)
+
+        spare = [free_port(), free_port()]
+        offered = lambda: iter([port] * 5 + spare)  # noqa: E731
+        with mock.patch.object(serve, 'reservation_live', meet), \
+                mock.patch.object(serve, 'candidate_ports', offered), \
+                mock.patch.object(serve, 'remove_file', late_remove):
+            threads = [threading.Thread(target=reserve, args=(11,), name='first'),
+                       threading.Thread(target=reserve, args=(12,), name='second')]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(30)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(got), 2)
+        self.assertEqual(len(set(got)), 2, got)
+
+    def test_a_process_that_outlives_its_start_keeps_the_port_for_other_issues(self):
+        self.write_config([self.auto('web-api')])
+        port = self.payload(self.serve('start'))['processes'][0]['port']
+        record = json.loads((self.ports / f'{port}.json').read_text(encoding='utf-8'))
+        self.assertIsInstance(record.get('child', {}).get('pid'), int, record)
+        self.assertFalse(serve.pid_alive(record['pid']), 'o coordenador já terminou')
+        free = free_port()
+        with mock.patch.object(serve, 'bindable', lambda candidate: True), \
+                mock.patch.object(serve, 'candidate_ports', lambda: iter([port, free])):
+            self.assertEqual(serve.reserve_port(self.root, 12, 'web'), free)
+        self.assertTrue((self.ports / f'{port}.json').exists())
+
+    def test_reservation_live_follows_the_child_when_the_coordinator_is_dead(self):
+        self.ports.mkdir(parents=True)
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        self.addCleanup(child.kill)
+        path = self.ports / '1.json'
+        record = {'issue': 5, 'process': 'p', 'root': 'x', 'pid': dead_pid(),
+                  'child': {'pid': child.pid, 'identity': serve.process_identity(child.pid) or 'desconhecida'}}
+        path.write_text(json.dumps(record), encoding='utf-8')
+        self.assertTrue(serve.reservation_live(path))
+        child.kill()
+        child.wait()
+        self.assertFalse(serve.reservation_live(path))
+
+    def test_release_ports_only_touches_reservations_made_from_the_same_worktree(self):
+        self.ports.mkdir(parents=True)
+        mine, theirs = free_port(), free_port()
+        for port, root in ((mine, self.root), (theirs, self.base / 'outra')):
+            (self.ports / f'{port}.json').write_text(json.dumps({'issue': 11, 'root': str(Path(root).resolve()),
+                                                                 'pid': os.getpid()}), encoding='utf-8')
+        serve.release_ports(self.root, 11)
+        self.assertFalse((self.ports / f'{mine}.json').exists())
+        self.assertTrue((self.ports / f'{theirs}.json').exists())
+
+    def test_release_ports_keeps_the_ports_listed_in_keep(self):
+        self.ports.mkdir(parents=True)
+        first, second = free_port(), free_port()
+        for port in (first, second):
+            (self.ports / f'{port}.json').write_text(json.dumps({'issue': 11, 'root': str(self.root.resolve()),
+                                                                 'pid': os.getpid()}), encoding='utf-8')
+        serve.release_ports(self.root, 11, keep=[first])
+        self.assertTrue((self.ports / f'{first}.json').exists())
+        self.assertFalse((self.ports / f'{second}.json').exists())
+
+    def test_an_unreadable_recent_reservation_counts_as_live_and_an_old_one_is_an_orphan(self):
+        self.ports.mkdir(parents=True)
+        taken, free = free_port(), free_port()
+        path = self.ports / f'{taken}.json'
+        for content in ('', '{lixo'):
+            path.write_text(content, encoding='utf-8')
+            with mock.patch.object(serve, 'candidate_ports', lambda: iter([taken, free])):
+                self.assertEqual(serve.reserve_port(self.root, 11, 'web'), free, content)
+            (self.ports / f'{free}.json').unlink()
+            old(path)
+            with mock.patch.object(serve, 'candidate_ports', lambda: iter([taken, free])):
+                self.assertEqual(serve.reserve_port(self.root, 11, 'web'), taken, content)
+            path.unlink()
+
+    def test_reservations_in_the_shared_git_folder_hold_no_login_or_password(self):
+        self.make_repo()
+        tree = self.make_worktree('wt-secret')
+        self.write_config([self.auto('web-api', health=f'http://127.0.0.1:{{port}}/?u={LOGIN}&p={PASSWORD}')])
+        self.touched.append((tree, 11))
+        done = self.serve('start', 11, root=tree)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        files = [path for path in (self.repo / '.git' / 'frontlights-serve').rglob('*') if path.is_file()]
+        self.assertTrue(files)
+        text = ''.join(path.read_text(encoding='utf-8') for path in files)
+        self.assertNotIn(PASSWORD, text)
+        self.assertNotIn(LOGIN, text)
+
+    def test_start_reports_whether_the_reservations_are_shared(self):
+        self.write_config([self.auto('web-api')])
+        self.assertIs(self.payload(self.serve('start'))['reservas_compartilhadas'], False)
+        self.make_repo()
+        tree = self.make_worktree('wt-flag')
+        self.touched.append((tree, 12))
+        self.assertIs(self.payload(self.serve('start', 12, root=tree))['reservas_compartilhadas'], True)
+
+    def test_the_common_dir_is_resolved_when_path_format_absolute_is_not_supported(self):
+        self.make_repo()
+        tree = self.make_worktree('wt-old-git')
+        real = subprocess.run
+
+        def old_git(command, *args, **kwargs):
+            if '--path-format=absolute' in command:
+                return subprocess.CompletedProcess(command, 129, '', 'unknown option')
+            return real(command, *args, **kwargs)
+
+        with mock.patch.object(subprocess, 'run', old_git):
+            folder, shared = serve.ports_location(tree)
+        self.assertTrue(shared)
+        self.assertEqual(folder.resolve(), self.shared.resolve())
+
+
+class NameCollisionTest(PortsTestCase):
+    def test_process_names_that_collide_after_normalisation_are_refused_as_usage(self):
+        self.write_config([self.auto('web-api'), self.auto('web_api')])
+        done = self.serve('start')
+        self.assertEqual(done.returncode, 1, done.stdout)
+        result = self.payload(done)
+        self.assertEqual(result['category'], 'uso')
+        self.assertIn('FRONTLIGHTS_PORT_WEB_API', result['error'])
+
+
+class WideListenerTest(PortsTestCase):
+    def occupied_is_skipped(self, family, address):
+        with socket.socket(family) as busy:
+            busy.bind((address, 0))
+            busy.listen()
+            taken, free = busy.getsockname()[1], free_port()
+            self.assertFalse(serve.bindable(taken), f'{address} não foi detectado')
+            with mock.patch.object(serve, 'candidate_ports', lambda: iter([taken, free])):
+                self.assertEqual(serve.reserve_port(self.root, 11, 'web'), free)
+
+    def ipv6_or_skip(self, address):
+        try:
+            with socket.socket(socket.AF_INET6) as probe:
+                probe.bind((address, 0))
+        except OSError:
+            self.skipTest('IPv6 indisponível')
+
+    def test_a_listener_on_all_ipv4_interfaces_is_detected_and_skipped(self):
+        self.occupied_is_skipped(socket.AF_INET, '0.0.0.0')
+
+    def test_a_listener_on_ipv6_any_is_detected_and_skipped(self):
+        self.ipv6_or_skip('::')
+        self.occupied_is_skipped(socket.AF_INET6, '::')
+
+    def test_a_listener_on_ipv6_loopback_is_detected_and_skipped(self):
+        self.ipv6_or_skip('::1')
+        self.occupied_is_skipped(socket.AF_INET6, '::1')
 
 
 if __name__ == '__main__':
