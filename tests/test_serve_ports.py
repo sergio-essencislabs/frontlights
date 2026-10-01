@@ -7,6 +7,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 import urllib.request
 from pathlib import Path
@@ -376,12 +377,15 @@ class RealConcurrencyTest(GitPortsCase):
         (directory / '.reserve.lock').unlink()
 
 
-class LockRecoveryTest(PortsTestCase):
+class LockCase(PortsTestCase):
     def setUp(self):
         super().setUp()
         self.ports = self.root / '.frontlights' / 'serve' / 'ports'
         self.ports.mkdir(parents=True)
         self.lock = self.ports / '.reserve.lock'
+
+
+class LockRecoveryTest(LockCase):
 
     def test_a_stale_lock_of_a_dead_pid_is_cleaned(self):
         self.lock.write_text(str(dead_pid()), encoding='utf-8')
@@ -608,6 +612,302 @@ class WideListenerTest(PortsTestCase):
     def test_a_listener_on_ipv6_loopback_is_detected_and_skipped(self):
         self.ipv6_or_skip('::1')
         self.occupied_is_skipped(socket.AF_INET6, '::1')
+
+
+class AutoHealthNeedsPortTest(PortsTestCase):
+    def test_an_auto_process_whose_health_url_lacks_the_port_placeholder_is_refused_before_anything_starts(self):
+        other = free_port()
+        other_server = subprocess.Popen([sys.executable, str(self.script), str(other)])
+        self.addCleanup(other_server.kill)
+        self.assertTrue(wait_until(lambda: reachable(f'http://127.0.0.1:{other}/')))
+        sleeper = self.auto('api', argv_port=False, health=f'http://127.0.0.1:{other}/')
+        sleeper['argv'] = [sys.executable, '-c', 'import time; time.sleep(60)']
+        self.write_config([sleeper])
+        done = self.serve('start')
+        self.assertEqual(done.returncode, 1, done.stdout)
+        result = self.payload(done)
+        self.assertEqual(result['category'], 'uso')
+        self.assertIn('{port}', result['error'])
+        self.assertIn('api', result['error'])
+        self.assertFalse((self.root / '.frontlights' / 'serve' / '11.json').exists())
+        self.assertEqual(list((self.root / '.frontlights' / 'serve').glob('ports/*.json')), [])
+
+
+class NameCollisionScopeTest(PortsTestCase):
+    def fixed(self, name):
+        port = free_port()
+        return {'name': name, 'argv': [sys.executable, str(self.script), str(port)], 'port': port,
+                'health': f'http://127.0.0.1:{port}/', 'timeoutSeconds': 20}
+
+    def test_two_fixed_port_processes_with_colliding_names_start_normally(self):
+        self.write_config([self.fixed('web-api'), self.fixed('web_api')])
+        done = self.serve('start')
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+
+    def test_one_auto_and_one_fixed_with_colliding_names_start_and_only_the_auto_gets_the_variable(self):
+        self.write_config([self.auto('web-api'), self.fixed('web_api')])
+        done = self.serve('start')
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        by_name = {item['name']: item for item in self.payload(done)['processes']}
+        auto_port = by_name['web-api']['port']
+        self.assertEqual(fetch(by_name['web-api']['url']).split('|')[2], str(auto_port))
+        self.assertEqual(fetch(by_name['web_api']['url']).split('|')[2], '')
+
+    def test_two_auto_processes_with_colliding_names_are_still_refused(self):
+        self.write_config([self.auto('web-api'), self.auto('web_api')])
+        done = self.serve('start')
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertEqual(self.payload(done)['category'], 'uso')
+
+
+class StaleLockAgeTest(LockCase):
+    def test_an_old_lock_of_a_live_unrelated_pid_is_an_orphan_and_is_cleaned(self):
+        self.lock.write_text(str(os.getpid()), encoding='utf-8')
+        old(self.lock, 3600)
+        with mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 3):
+            self.assertIsInstance(serve.reserve_port(self.root, 11, 'web'), int)
+        self.assertFalse(self.lock.exists())
+
+    def test_a_recent_lock_of_a_live_pid_is_still_waited_for(self):
+        self.lock.write_text(str(os.getpid()), encoding='utf-8')
+        with mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 1):
+            with self.assertRaises(serve.Refusal):
+                serve.reserve_port(self.root, 11, 'web')
+        self.assertEqual(self.lock.read_text(encoding='utf-8'), str(os.getpid()))
+
+
+class RecreatedLockTest(LockCase):
+    """A lock recreated by a live start between the staleness judgement and the removal must survive."""
+
+    def run_with_recreation(self, after_read):
+        holder = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        self.addCleanup(holder.kill)
+        self.lock.write_text(str(dead_pid()), encoding='utf-8')
+        real = serve.read_brief
+        reads = []
+
+        def hooked(path, *args, **kwargs):
+            text = real(path, *args, **kwargs)
+            if os.path.basename(str(path)).startswith('.reserve.lock'):
+                reads.append(path)
+                if len(reads) == after_read:
+                    self.lock.write_text(str(holder.pid), encoding='utf-8')
+            return text
+
+        with mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 1), mock.patch.object(serve, 'read_brief', hooked):
+            with self.assertRaises(serve.Refusal) as caught:
+                serve.reserve_port(self.root, 11, 'web')
+        self.assertIn('trava de reserva', str(caught.exception))
+        self.assertEqual(self.lock.read_text(encoding='utf-8'), str(holder.pid), 'a trava recriada foi apagada')
+        self.assertEqual([path.name for path in self.ports.iterdir()], ['.reserve.lock'], 'sobrou arquivo de lixo')
+
+    def test_a_lock_recreated_right_after_the_second_check_is_not_removed(self):
+        self.run_with_recreation(2)
+
+    def test_a_lock_recreated_right_after_the_first_judgement_is_not_removed(self):
+        self.run_with_recreation(1)
+
+
+class SpawnWindowTest(PortsTestCase):
+    def test_a_start_that_dies_between_spawn_and_recording_the_child_keeps_the_port_for_a_while(self):
+        self.write_config([self.auto('web-api')])
+        driver = (
+            'import json, os, sys\n'
+            f'sys.path.insert(0, {str(SCRIPT.parent)!r})\n'
+            'import serve\n'
+            'def die(root, port, entry):\n'
+            "    print(json.dumps({'port': port, 'pid': entry['pid']}), flush=True)\n"
+            '    os._exit(0)\n'
+            'serve.attach_child = die\n'
+            f'serve.start({str(self.config)!r}, {str(self.root)!r}, 11)\n')
+        done = subprocess.run([sys.executable, '-c', driver], capture_output=True, text=True, encoding='utf-8',
+                              timeout=120)
+        info = json.loads(done.stdout.strip().splitlines()[-1])
+        self.addCleanup(serve.kill_tree, info['pid'])
+        self.assertTrue(wait_until(lambda: reachable(f'http://127.0.0.1:{info["port"]}/')))
+        reservation = self.root / '.frontlights' / 'serve' / 'ports' / f'{info["port"]}.json'
+        self.assertFalse(serve.pid_alive(json.loads(reservation.read_text(encoding='utf-8'))['pid']))
+        free = free_port()
+        with mock.patch.object(serve, 'bindable', lambda candidate: True), \
+                mock.patch.object(serve, 'candidate_ports', lambda: iter([info['port'], free])):
+            self.assertEqual(serve.reserve_port(self.root, 12, 'web'), free)
+
+    def test_the_grace_for_a_spawning_reservation_ends_after_the_orphan_period(self):
+        ports = self.root / '.frontlights' / 'serve' / 'ports'
+        ports.mkdir(parents=True)
+        path = ports / '1.json'
+        path.write_text(json.dumps({'issue': 5, 'process': 'p', 'root': 'x', 'pid': dead_pid(),
+                                    'spawning': 'agora'}), encoding='utf-8')
+        self.assertTrue(serve.reservation_live(path))
+        old(path)
+        self.assertFalse(serve.reservation_live(path))
+
+    def test_a_reservation_of_a_dead_coordinator_that_never_reached_spawn_is_an_orphan_at_once(self):
+        ports = self.root / '.frontlights' / 'serve' / 'ports'
+        ports.mkdir(parents=True)
+        path = ports / '1.json'
+        path.write_text(json.dumps({'issue': 5, 'process': 'p', 'root': 'x', 'pid': dead_pid()}), encoding='utf-8')
+        self.assertFalse(serve.reservation_live(path))
+
+
+def fake_sockets(refuse_bind=(), connect_ok=(), seen=None):
+    """Replacement for the socket module seen by serve: scripted bind refusals and connect answers."""
+    seen = [] if seen is None else seen
+
+    class Fake:
+        def __init__(self, family=socket.AF_INET, *args):
+            self.family = family
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def bind(self, address):
+            seen.append(('bind', address[0]))
+            if address[0] in refuse_bind:
+                raise OSError('em uso')
+
+        def settimeout(self, seconds):
+            pass
+
+        def connect_ex(self, address):
+            seen.append(('connect', address[0]))
+            return 0 if address[0] in connect_ok else 10061
+
+    return types.SimpleNamespace(socket=Fake, AF_INET=socket.AF_INET, AF_INET6=socket.AF_INET6)
+
+
+class BindableDetailTest(PortsTestCase):
+    def check(self, module, ipv6=False, extra=True):
+        with mock.patch.object(serve, 'socket', module), mock.patch.object(serve, 'ipv6_usable', lambda: ipv6), \
+                mock.patch.object(serve, 'loopback_alias_usable', lambda: extra, create=True):
+            return serve.bindable(40000)
+
+    def test_a_bind_refusal_on_the_wildcard_address_alone_makes_the_port_busy(self):
+        self.assertFalse(self.check(fake_sockets(refuse_bind=('0.0.0.0',))))
+
+    def test_a_bind_refusal_on_the_loopback_alias_alone_makes_the_port_busy(self):
+        self.assertFalse(self.check(fake_sockets(refuse_bind=('127.0.0.2',))))
+
+    def test_a_connection_that_is_accepted_makes_the_port_busy_even_when_every_bind_succeeds(self):
+        for address in ('127.0.0.1', '127.0.0.2'):
+            self.assertFalse(self.check(fake_sockets(connect_ok=(address,))), address)
+
+    def test_the_loopback_alias_is_skipped_when_the_platform_has_none(self):
+        seen = []
+        self.assertTrue(self.check(fake_sockets(refuse_bind=('127.0.0.2',), seen=seen), extra=False))
+        self.assertNotIn(('bind', '127.0.0.2'), seen)
+
+    def test_a_free_port_is_bound_and_probed_on_every_address(self):
+        seen = []
+        self.assertTrue(self.check(fake_sockets(seen=seen)))
+        for address in ('127.0.0.1', '0.0.0.0', '127.0.0.2'):
+            self.assertIn(('bind', address), seen)
+        self.assertIn(('connect', '127.0.0.1'), seen)
+        self.assertIn(('connect', '127.0.0.2'), seen)
+
+    def test_a_real_listener_that_only_accepts_connections_is_detected_by_the_connect_probe(self):
+        real = socket
+
+        class NoBind:
+            def __init__(self, family=real.AF_INET, *args):
+                self.inner = real.socket(family)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self.inner.close()
+                return False
+
+            def bind(self, address):
+                pass
+
+            def settimeout(self, seconds):
+                self.inner.settimeout(seconds)
+
+            def connect_ex(self, address):
+                return self.inner.connect_ex(address)
+
+        module = types.SimpleNamespace(socket=NoBind, AF_INET=real.AF_INET, AF_INET6=real.AF_INET6)
+        with socket.socket() as listener:
+            listener.bind(('127.0.0.1', 0))
+            listener.listen()
+            busy = listener.getsockname()[1]
+            with mock.patch.object(serve, 'socket', module), mock.patch.object(serve, 'ipv6_usable', lambda: False), \
+                    mock.patch.object(serve, 'loopback_alias_usable', lambda: False, create=True):
+                self.assertFalse(serve.bindable(busy))
+        with mock.patch.object(serve, 'socket', module), mock.patch.object(serve, 'ipv6_usable', lambda: False), \
+                mock.patch.object(serve, 'loopback_alias_usable', lambda: False, create=True):
+            self.assertTrue(serve.bindable(busy))
+
+
+class SpecificAddressListenerTest(PortsTestCase):
+    def alias_or_skip(self):
+        try:
+            with socket.socket() as probe:
+                probe.bind(('127.0.0.2', 0))
+        except OSError:
+            self.skipTest('127.0.0.2 indisponível')
+
+    def test_a_listener_on_the_loopback_alias_is_detected_and_skipped(self):
+        self.alias_or_skip()
+        with socket.socket() as busy:
+            busy.bind(('127.0.0.2', 0))
+            busy.listen()
+            taken, free = busy.getsockname()[1], free_port()
+            self.assertFalse(serve.bindable(taken))
+            with mock.patch.object(serve, 'candidate_ports', lambda: iter([taken, free])):
+                self.assertEqual(serve.reserve_port(self.root, 11, 'web'), free)
+
+    def test_a_bound_socket_that_does_not_listen_on_all_interfaces_makes_the_port_busy(self):
+        with socket.socket() as busy:
+            busy.bind(('0.0.0.0', 0))
+            self.assertFalse(serve.bindable(busy.getsockname()[1]))
+
+
+class StopWithoutRegistryTest(PortsTestCase):
+    def reservation(self, port, issue, root):
+        ports = self.root / '.frontlights' / 'serve' / 'ports'
+        ports.mkdir(parents=True, exist_ok=True)
+        (ports / f'{port}.json').write_text(json.dumps({'issue': issue, 'process': 'web', 'pid': os.getpid(),
+                                                        'root': str(Path(root).resolve())}), encoding='utf-8')
+        return ports / f'{port}.json'
+
+    def test_stop_without_a_registry_still_releases_the_reservations_of_the_issue_from_this_worktree(self):
+        mine, other_issue, other_tree = free_port(), free_port(), free_port()
+        mine_file = self.reservation(mine, 11, self.root)
+        other_file = self.reservation(other_issue, 12, self.root)
+        foreign_file = self.reservation(other_tree, 11, self.base / 'outra')
+        done = self.serve('stop')
+        self.assertEqual(done.returncode, 1, done.stdout)
+        result = self.payload(done)
+        self.assertEqual(result['reservas_liberadas'], [mine])
+        self.assertFalse(mine_file.exists())
+        self.assertTrue(other_file.exists())
+        self.assertTrue(foreign_file.exists())
+
+    def test_stop_reports_the_released_ports_when_it_succeeds(self):
+        self.write_config([self.auto('web-api')])
+        port = self.payload(self.serve('start'))['processes'][0]['port']
+        self.assertEqual(self.payload(self.serve('stop'))['reservas_liberadas'], [port])
+
+
+class SingleAcquisitionTest(PortsTestCase):
+    def test_all_the_ports_of_one_start_are_reserved_under_one_acquisition_of_the_lock(self):
+        real = serve.take_reserve_file
+        taken = []
+
+        def counting(directory):
+            taken.append(directory)
+            return real(directory)
+
+        with mock.patch.object(serve, 'take_reserve_file', counting):
+            ports = serve.reserve_ports(self.root, 11, ['web', 'worker'])
+        self.assertEqual(len(set(ports.values())), 2)
+        self.assertEqual(len(taken), 1)
 
 
 if __name__ == '__main__':

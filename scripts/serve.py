@@ -8,7 +8,8 @@ Operations (each prints one JSON object on stdout):
   start   spawn every process, wait for its health URL (HTTP 2xx/3xx, polled until a deadline)
           and record pids and times in `<root>/.frontlights/serve/<issue>.json`.
   status  read that record and check whether each pid is still alive.
-  stop    kill the whole process tree of each recorded process and remove the record.
+  stop    kill the whole process tree of each recorded process, remove the record and release the issue's
+          port reservations (`reservas_liberadas`; also when there is no record, which still reports a refusal).
 
 Automatic ports: a process declares `"port": "auto"` (the only rule: omitting `port` keeps the #9 behaviour,
 where the port is read from the health URL). Its `argv` elements and `health` may use `{port}`; with "auto" the
@@ -17,14 +18,20 @@ succeed, and it must not be reserved by a live start or process of another issue
 exclusively (O_EXCL) in `<git-common-dir>/frontlights-serve/ports/<port>.json` (shared by all worktrees of the
 repository; outside Git: `<root>/.frontlights/serve/ports/`), and gives the process the environment variables
 `PORT` and `FRONTLIGHTS_PORT_<NAME>` (name upper-cased, non-alphanumerics as `_`). A reservation whose coordinator
-and process are both dead is an orphan and is reused. `stop` and a failed start release the issue's reservations.
+and process are both dead is an orphan and is reused, except for a grace of 60 s when the coordinator died after
+marking the reservation `spawning` and before recording the child pid. `stop` and a failed start release the issue's
+reservations.
 A process that ignores its port fails the start as an infrastructure failure, naming the process and the port.
 All the ports of one start are reserved under one acquisition of a short lock (`.reserve.lock`, O_EXCL, reentrant for
 the same start). A lock or reservation file that cannot be read is treated as being written by its owner (alive)
-while it is recent, and as an orphan once it is older than 60 s. A port counts as busy when it cannot be bound on
-127.0.0.1, 0.0.0.0, or (when IPv6 works) ::1 and ::, or when something already accepts connections there.
-The variable name is the process name upper-cased with non-alphanumerics as `_`, so `web-api` and `web_api` give
-the same `FRONTLIGHTS_PORT_WEB_API`: a config whose names collide after that normalisation is refused (category `uso`).
+while it is recent, and as an orphan once it is older than 60 s; a lock lasts milliseconds, so one older than 120 s
+is an orphan even if its pid is alive (it may have been reused). A stale lock is moved aside atomically and checked
+before it is deleted, so a lock recreated by a live start is never removed. A port counts as busy when it cannot be
+bound on 127.0.0.1, 0.0.0.0, 127.0.0.2 (when the platform has it) or (when IPv6 works) ::1 and ::, or when
+something already accepts connections there.
+The variable name is the process name upper-cased with non-alphanumerics as `_`, so two `auto` processes named
+`web-api` and `web_api` would get the same `FRONTLIGHTS_PORT_WEB_API`: such a config is refused (category `uso`).
+Processes with a fixed port or without `port` do not receive the variable, so their names may collide.
 The start output says whether the reservations are shared (`reservas_compartilhadas`).
 
 Exit codes: 0 done; 1 refusal or failure (a failed start tears down whatever already came up and
@@ -65,6 +72,7 @@ KILL_WAIT_SECONDS = 15
 PORT_ATTEMPTS = 200
 RESERVE_LOCK_SECONDS = 20
 ORPHAN_SECONDS = 60
+LOCK_STALE_SECONDS = 120
 REMOVE_ATTEMPTS = 40
 CONNECT_SECONDS = 0.05
 
@@ -179,15 +187,19 @@ def load_block(config_file):
         parts = urllib.parse.urlsplit(health) if isinstance(health, str) else None
         require(parts and parts.scheme in ('http', 'https') and parts.hostname,
                 f'O processo {name} precisa de health como URL http(s).', name)
-        variable = env_name(name)
-        require(variable not in variables,
-                f'Os processos {variables.get(variable)} e {name} geram a mesma variável {variable} depois de '
-                'normalizar o nome (maiúsculas, e tudo que não é letra ou número vira "_"). Renomeie um deles.',
-                name, USAGE)
-        variables[variable] = name
         require('port' not in item or item['port'] == PORT_AUTO
                 or isinstance(item['port'], int) and not isinstance(item['port'], bool),
                 f'O processo {name} tem port inválida: use um inteiro ou "{PORT_AUTO}".', name)
+        if is_auto(item):  # only these receive FRONTLIGHTS_PORT_<NAME>, so only they can collide
+            require('{port}' in health,
+                    f'O processo {name} usa port "{PORT_AUTO}", então o health precisa conter {{port}}: sem isso a '
+                    'saúde não prova que o processo escutou a porta reservada.', name, USAGE)
+            variable = env_name(name)
+            require(variable not in variables,
+                    f'Os processos {variables.get(variable)} e {name} geram a mesma variável {variable} depois de '
+                    'normalizar o nome (maiúsculas, e tudo que não é letra ou número vira "_"). Renomeie um deles.',
+                    name, USAGE)
+            variables[variable] = name
     return processes
 
 
@@ -472,6 +484,8 @@ def candidate_ports():
 
 
 _IPV6 = []
+_ALIAS = []
+LOOPBACK_ALIAS = '127.0.0.2'
 
 
 def ipv6_usable():
@@ -485,22 +499,41 @@ def ipv6_usable():
     return _IPV6[0]
 
 
+def loopback_alias_usable():
+    """True when the platform has the second loopback address (127.0.0.2); macOS has it only when configured."""
+    if not _ALIAS:
+        try:
+            with socket.socket(socket.AF_INET) as sock:
+                sock.bind((LOOPBACK_ALIAS, 0))
+            _ALIAS.append(True)
+        except OSError:
+            _ALIAS.append(False)
+    return _ALIAS[0]
+
+
 def bindable(port):
     """True when nothing else holds the port: it binds on every local address and nothing accepts connections.
 
-    Addresses: 127.0.0.1 and 0.0.0.0 and, when IPv6 works, ::1 and ::. A listener on any of them (or one the
-    bind cannot see, like a specific address next to a wildcard on Windows) makes the port busy.
+    Addresses: 127.0.0.1, 0.0.0.0 and the loopback alias 127.0.0.2 (when the platform has it) and, when IPv6 works,
+    ::1 and ::. A listener on any of them (or one the bind cannot see, like a specific address next to a wildcard on
+    Windows) makes the port busy. Limit: a listener on another specific address (say 127.0.0.3) is seen only on
+    platforms where the wildcard bind already fails because of it; the 127/8 block cannot be enumerated.
     """
     families = [(socket.AF_INET, '127.0.0.1'), (socket.AF_INET, '0.0.0.0')]
+    connects = [(socket.AF_INET, '127.0.0.1')]
+    if loopback_alias_usable():
+        families.append((socket.AF_INET, LOOPBACK_ALIAS))
+        connects.append((socket.AF_INET, LOOPBACK_ALIAS))
     if ipv6_usable():
         families += [(socket.AF_INET6, '::1'), (socket.AF_INET6, '::')]
+        connects.append((socket.AF_INET6, '::1'))
     for family, address in families:
         try:
             with socket.socket(family) as sock:
                 sock.bind((address, port))
         except OSError:
             return False
-    for family, address in [families[0]] + families[2:3]:
+    for family, address in connects:
         with socket.socket(family) as sock:
             sock.settimeout(CONNECT_SECONDS)
             if sock.connect_ex((address, port)) == 0:
@@ -530,11 +563,46 @@ def remove_file(path):
     return False
 
 
-def older_than_orphan(path):
+def older_than(path, seconds):
     try:
-        return time.time() - os.stat(path).st_mtime > ORPHAN_SECONDS
+        return time.time() - os.stat(path).st_mtime > seconds
     except OSError:
         return False
+
+
+def older_than_orphan(path):
+    return older_than(path, ORPHAN_SECONDS)
+
+
+def discard_if_unchanged(path, text):
+    """Delete the stale file `path` judged to hold `text`, without ever deleting a file that replaced it.
+
+    The file is first moved (atomic rename) to a name nobody else uses, and its content is checked there. If it
+    is still the stale one it is deleted; if a live start recreated it in the meantime, the file taken by mistake is
+    given back under its own name (os.link never overwrites) and nothing is deleted.
+    """
+    path = Path(path)
+    aside = path.with_name(f'{path.name}.{secrets.token_hex(6)}.stale')
+    for attempt in range(REMOVE_ATTEMPTS):
+        try:
+            os.replace(path, aside)
+            break
+        except FileNotFoundError:
+            return
+        except OSError:  # Windows: a reader holds the file open for a moment
+            if attempt == REMOVE_ATTEMPTS - 1:
+                return
+            time.sleep(min(0.002 * (attempt + 1), 0.05))
+    try:
+        unchanged = read_brief(aside) == text
+    except OSError:
+        unchanged = False
+    if not unchanged:
+        try:
+            os.link(aside, path)
+        except OSError:
+            pass  # another start already holds a newer lock; the one taken aside is gone with this call
+    remove_file(aside)
 
 
 _LOCAL_LOCK = threading.RLock()
@@ -556,15 +624,14 @@ def take_reserve_file(directory):
                 continue
             except (OSError, ValueError):
                 owner, text = None, None  # still being written by its owner, or the owner crashed
-            if owner is not None and not pid_alive(owner):
-                try:
-                    if read_brief(path) == text:  # still the stale lock we just judged
-                        remove_file(path)
-                except OSError:
-                    pass
+                with contextlib.suppress(OSError):
+                    text = read_brief(path)
+            if owner is not None and (not pid_alive(owner) or older_than(path, LOCK_STALE_SECONDS)):
+                # dead owner, or a lock held for minutes (it lasts milliseconds): the pid may have been reused
+                discard_if_unchanged(path, text)
                 continue
             if owner is None and older_than_orphan(path):
-                remove_file(path)  # empty or garbage for over a minute: its writer crashed
+                discard_if_unchanged(path, text)  # empty or garbage for over a minute: its writer crashed
                 continue
             require(time.monotonic() < deadline,
                     'Não foi possível obter a trava de reserva de portas (outra reserva demorou demais). '
@@ -623,8 +690,12 @@ def reservation_live(path):
     if record is None:
         return not older_than_orphan(path)
     child = record.get('child')
-    return same_process(record) or (isinstance(child, dict) and isinstance(child.get('pid'), int)
-                                    and same_process(child))
+    if same_process(record) or (isinstance(child, dict) and isinstance(child.get('pid'), int)
+                                and same_process(child)):
+        return True
+    # a coordinator that died between spawning the process and recording its pid leaves a process nobody tracks:
+    # the "spawning" mark keeps the port for a grace period (a start that never got to spawn leaves no mark)
+    return bool(record.get('spawning')) and not isinstance(child, dict) and not older_than_orphan(path)
 
 
 def reserve_port(root, issue, name):
@@ -659,14 +730,26 @@ def reserve_ports(root, issue, names):
 
 
 def release_ports(root, issue, keep=()):
-    """Remove this issue's reservations made from this worktree (except the ports in `keep`)."""
+    """Remove this issue's reservations made from this worktree (except the ports in `keep`); returns the ports."""
     directory = ports_dir(root)
     here = str(Path(root).resolve())
     kept = {str(port) for port in keep}
+    released = []
     for path in directory.glob('*.json') if directory.is_dir() else ():
         record = read_reservation(path)
         if record and record.get('issue') == issue and record.get('root') == here and path.stem not in kept:
-            remove_file(path)
+            if remove_file(path) and path.stem.isdigit():
+                released.append(int(path.stem))
+    return sorted(released)
+
+
+def mark_spawning(root, port):
+    """Mark the reservation just before the process is spawned (see reservation_live)."""
+    path = ports_dir(root) / f'{port}.json'
+    record = read_reservation(path)
+    if record is not None:
+        record['spawning'] = now_iso()
+        write_json_atomic(record, path)
 
 
 def attach_child(root, port, child_entry):
@@ -704,6 +787,8 @@ def start_locked(processes, root, issue):
                 item = with_port(item, port)
             cwd = process_cwd(root, item)
             guard_batch(item['argv'], item['name'])
+            if env:
+                mark_spawning(root, port)
             try:
                 child = spawn(item['argv'], cwd, env)
             except OSError:
@@ -767,7 +852,14 @@ def status(root, issue):
 
 
 def stop(root, issue):
-    record = read_registry(root, issue)
+    try:
+        record = read_registry(root, issue)
+    except Refusal as refusal:
+        if not registry_path(root, issue).is_file():
+            # no record at all (a start that died early): nothing to kill, but its reservations must not leak;
+            # an unreadable record may still describe live processes, so then the reservations stay
+            refusal.extra = dict(refusal.extra, reservas_liberadas=release_ports(root, issue))
+        raise
     name = relative(Path(root), registry_path(root, issue))
     stopped, left = [], []
     for entry in record['processes']:  # check every identity first, so a refusal kills nothing
@@ -799,8 +891,7 @@ def stop(root, issue):
         raise Refusal('Nem todos os processos foram encerrados; o registro foi mantido para nova tentativa.',
                       extra={'left': left, 'processes': stopped})
     registry_path(root, issue).unlink()
-    release_ports(root, issue)
-    return {'ok': True, 'issue': issue, 'processes': stopped}
+    return {'ok': True, 'issue': issue, 'processes': stopped, 'reservas_liberadas': release_ports(root, issue)}
 
 
 def run(operation, config_file, root, issue):
