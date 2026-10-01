@@ -10,6 +10,16 @@ Operations (each prints one JSON object on stdout):
   status  read that record and check whether each pid is still alive.
   stop    kill the whole process tree of each recorded process and remove the record.
 
+Automatic ports: a process declares `"port": "auto"` (the only rule: omitting `port` keeps the #9 behaviour,
+where the port is read from the health URL). Its `argv` elements and `health` may use `{port}`; with "auto" the
+health URL must contain it. For each such process start reserves a free port (the OS offers one, the bind must
+succeed, and it must not be reserved by a live start or process of another issue or worktree), records it
+exclusively (O_EXCL) in `<git-common-dir>/frontlights-serve/ports/<port>.json` (shared by all worktrees of the
+repository; outside Git: `<root>/.frontlights/serve/ports/`), and gives the process the environment variables
+`PORT` and `FRONTLIGHTS_PORT_<NAME>` (name upper-cased, non-alphanumerics as `_`). A reservation whose coordinator
+and process are both dead is an orphan and is reused. `stop` and a failed start release the issue's reservations.
+A process that ignores its port fails the start as an infrastructure failure, naming the process and the port.
+
 Exit codes: 0 done; 1 refusal or failure (a failed start tears down whatever already came up and
 names the failing process, classified as an infrastructure failure).
 
@@ -18,6 +28,7 @@ config are never read into the record and are redacted from every string this he
 """
 
 import argparse
+import contextlib
 import datetime as dt
 import json
 import os
@@ -25,6 +36,7 @@ from pathlib import Path
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -34,6 +46,7 @@ import urllib.request
 
 POLL_SECONDS = 0.2
 DEFAULT_TIMEOUT = 60
+PORT_AUTO = 'auto'
 INFRASTRUCTURE = 'infraestrutura'
 USAGE = 'uso'
 UNKNOWN_IDENTITY = 'desconhecida'
@@ -41,6 +54,8 @@ BATCH_UNSAFE = '&|^%<>!"'
 MIN_SECRET = 4
 MASK = '[redacted]'
 KILL_WAIT_SECONDS = 15
+PORT_ATTEMPTS = 200
+RESERVE_LOCK_SECONDS = 20
 
 _SECRETS = []
 
@@ -146,9 +161,25 @@ def load_block(config_file):
         parts = urllib.parse.urlsplit(health) if isinstance(health, str) else None
         require(parts and parts.scheme in ('http', 'https') and parts.hostname,
                 f'O processo {name} precisa de health como URL http(s).', name)
-        require('port' not in item or isinstance(item['port'], int) and not isinstance(item['port'], bool),
-                f'O processo {name} tem port inválida: use um inteiro.', name)
+        require('port' not in item or item['port'] == PORT_AUTO
+                or isinstance(item['port'], int) and not isinstance(item['port'], bool),
+                f'O processo {name} tem port inválida: use um inteiro ou "{PORT_AUTO}".', name)
     return processes
+
+
+def is_auto(item):
+    return item.get('port') == PORT_AUTO
+
+
+def env_name(name):
+    return 'FRONTLIGHTS_PORT_' + re.sub(r'[^A-Z0-9]', '_', name.upper())
+
+
+def with_port(item, port):
+    """Copy of the process with {port} replaced in every argv element and in the health URL."""
+    token = str(port)
+    return dict(item, port=port, autoPort=True, argv=[part.replace('{port}', token) for part in item['argv']],
+                health=item['health'].replace('{port}', token))
 
 
 def process_port(item):
@@ -169,12 +200,14 @@ def process_cwd(root, item):
 
 # ---------------------------------------------------------------- process control
 
-def spawn(argv, cwd):
+def spawn(argv, cwd, env=None):
     executable = shutil.which(argv[0])
     if executable is None:
         raise OSError('executável não encontrado')
     options = {'cwd': str(cwd), 'stdin': subprocess.DEVNULL, 'stdout': subprocess.DEVNULL,
                'stderr': subprocess.DEVNULL}
+    if env:
+        options['env'] = dict(os.environ, **env)
     if os.name == 'nt':
         options['creationflags'] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
     else:
@@ -204,15 +237,18 @@ def wait_healthy(child, item):
     timeout = item.get('timeoutSeconds', DEFAULT_TIMEOUT)
     require(isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0,
             f'O processo {item["name"]} tem timeoutSeconds inválido.', item['name'])
+    reserved = f' (porta reservada {item["port"]})' if item.get('autoPort') else ''
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if child.poll() is not None:
-            raise Refusal(f'O processo {item["name"]} terminou antes de ficar saudável '
+            raise Refusal(f'O processo {item["name"]} terminou antes de ficar saudável{reserved} '
                           f'(código {child.returncode}).', item['name'])
         if healthy(item['health']):
             return
         time.sleep(POLL_SECONDS)
-    raise Refusal(f'O processo {item["name"]} não ficou saudável em {timeout} s.', item['name'])
+    raise Refusal(f'O processo {item["name"]} não ficou saudável em {timeout} s{reserved}. Se ele ignora a porta '
+                  'reservada, faça-o ler PORT, a variável FRONTLIGHTS_PORT_<NOME> ou {port} no argv.'
+                  if reserved else f'O processo {item["name"]} não ficou saudável em {timeout} s.', item['name'])
 
 
 def guard_batch(argv, name):
@@ -375,6 +411,146 @@ def write_registry(root, issue, entries):
                       registry_path(root, issue))
 
 
+def ports_dir(root):
+    """Folder shared by every worktree of the same repository for port reservations.
+
+    It lives in the Git common directory (`frontlights-serve/ports`), so worktrees of one repository see each
+    other's reservations. Outside a Git repository it falls back to `<root>/.frontlights/serve/ports`.
+    """
+    try:
+        done = subprocess.run(['git', '-C', str(root), 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+                              capture_output=True, text=True, encoding='utf-8', timeout=30)
+        common = done.stdout.strip() if done.returncode == 0 else ''
+    except (OSError, subprocess.SubprocessError):
+        common = ''
+    if common and Path(common).is_dir():
+        return Path(common) / 'frontlights-serve' / 'ports'
+    return Path(root) / '.frontlights' / 'serve' / 'ports'
+
+
+def candidate_ports():
+    """Ports offered by the operating system (bind to port 0), one per attempt."""
+    for _ in range(PORT_ATTEMPTS):
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', 0))
+            port = sock.getsockname()[1]
+        yield port  # offered only after the probe socket is closed, so bindable() can test it
+
+
+def bindable(port):
+    """True when nothing else holds the port on 127.0.0.1 (the bind fails for a port in use)."""
+    try:
+        with socket.socket() as sock:
+            sock.bind(('127.0.0.1', port))
+        return True
+    except OSError:
+        return False
+
+
+@contextlib.contextmanager
+def reservation_lock(directory):
+    """Short exclusive lock (O_EXCL) so choosing and recording a port is one step across processes."""
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / '.reserve.lock'
+    deadline = time.monotonic() + RESERVE_LOCK_SECONDS
+    while True:
+        try:
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            try:
+                text = path.read_text(encoding='utf-8')
+                owner = int(text.strip())
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError):
+                owner = None  # still being written by its owner: wait
+            if owner is not None and not pid_alive(owner):
+                try:
+                    if path.read_text(encoding='utf-8') == text:
+                        path.unlink()
+                except OSError:
+                    pass
+                continue
+            require(time.monotonic() < deadline,
+                    'Não foi possível obter a trava de reserva de portas (outra reserva demorou demais). '
+                    f'Se nenhum start estiver rodando, apague {path.name} da pasta de reservas.')
+            time.sleep(0.05)
+    with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+        handle.write(str(os.getpid()))
+    try:
+        yield
+    finally:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def read_reservation(path):
+    try:
+        record = json.loads(Path(path).read_text(encoding='utf-8'))
+        return record if isinstance(record, dict) and isinstance(record.get('pid'), int) else None
+    except (OSError, ValueError):
+        return None
+
+
+def reservation_live(path):
+    """A reservation holds while its coordinator (a running start) or its started process is alive."""
+    record = read_reservation(path)
+    if record is None:
+        return True  # unreadable: assume it is somebody's, never take it over
+    child = record.get('child')
+    return same_process(record) or (isinstance(child, dict) and isinstance(child.get('pid'), int)
+                                    and same_process(child))
+
+
+def reserve_port(root, issue, name):
+    """Reserve a free port for the process: record it exclusively and return it (the reservation path too)."""
+    directory = ports_dir(root)
+    with reservation_lock(directory):
+        for port in candidate_ports():
+            path = directory / f'{port}.json'
+            if path.exists():
+                if reservation_live(path):
+                    continue  # reserved by a live start/issue (maybe of another worktree)
+                path.unlink(missing_ok=True)  # orphan: its start and its process are gone
+            if not bindable(port):
+                continue  # another program holds it
+            record = {'issue': issue, 'process': name, 'root': str(Path(root).resolve()), 'pid': os.getpid(),
+                      'identity': process_identity(os.getpid()) or UNKNOWN_IDENTITY, 'reservedAt': now_iso()}
+            try:
+                descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                continue
+            with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+                handle.write(json.dumps(scrub(record, REGISTRY_EXACT), indent=2, ensure_ascii=False))
+            return port
+    raise Refusal(f'Não foi possível reservar uma porta livre para o processo {name}.')
+
+
+def release_ports(root, issue, keep=()):
+    """Remove this issue's reservations made from this worktree (except the ports in `keep`)."""
+    directory = ports_dir(root)
+    here = str(Path(root).resolve())
+    for path in directory.glob('*.json') if directory.is_dir() else ():
+        record = read_reservation(path)
+        if record and record.get('issue') == issue and record.get('root') == here                 and path.stem not in {str(port) for port in keep}:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def attach_child(root, port, child_entry):
+    """Record the started process in its reservation, so it keeps holding after the start command exits."""
+    path = ports_dir(root) / f'{port}.json'
+    record = read_reservation(path)
+    if record is not None:
+        record['child'] = {'pid': child_entry['pid'], 'identity': child_entry['identity']}
+        write_json_atomic(record, path)
+
+
 def start(config_file, root, issue):
     processes = load_block(config_file)
     lock = acquire_lock(root, issue)
@@ -393,15 +569,22 @@ def start_locked(processes, root, issue):
     started = []
     try:
         for item in processes:
+            env = None
+            if is_auto(item):
+                port = reserve_port(root, issue, item['name'])
+                env = {'PORT': str(port), env_name(item['name']): str(port)}
+                item = with_port(item, port)
             cwd = process_cwd(root, item)
             guard_batch(item['argv'], item['name'])
             try:
-                child = spawn(item['argv'], cwd)
+                child = spawn(item['argv'], cwd, env)
             except OSError:
                 raise Refusal(f'Não foi possível iniciar o processo {item["name"]}.', item['name'])
             started.append({'name': item['name'], 'pid': child.pid, 'port': process_port(item),
                             'url': item['health'], 'startedAt': now_iso(),
                             'identity': process_identity(child.pid) or UNKNOWN_IDENTITY})
+            if env:
+                attach_child(root, port, started[-1])
             write_registry(root, issue, started)  # a crash from here on leaves something stop can tear down
             wait_healthy(child, item)
     except BaseException as failure:
@@ -420,6 +603,7 @@ def start_locked(processes, root, issue):
                 registry_path(root, issue).unlink(missing_ok=True)
         except OSError:
             pass
+        release_ports(root, issue, keep=[entry['port'] for entry in left])
         if left and isinstance(failure, Refusal):
             names = ', '.join(f'{entry["name"]} (pid {entry["pid"]})' for entry in left)
             raise Refusal(f'{failure} Não foi possível derrubar: {names}; rode stop para tentar de novo.',
@@ -486,6 +670,7 @@ def stop(root, issue):
         raise Refusal('Nem todos os processos foram encerrados; o registro foi mantido para nova tentativa.',
                       extra={'left': left, 'processes': stopped})
     registry_path(root, issue).unlink()
+    release_ports(root, issue)
     return {'ok': True, 'issue': issue, 'processes': stopped}
 
 
