@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -21,11 +22,14 @@ def git(path, *args):
 
 
 def make_suite(path, tests, message='suite'):
-    """Tiny fake suite: `tests` maps a test name to True when it must fail."""
+    """Tiny fake suite: `tests` maps a test name to True (falha) ou a um texto (falha com essa mensagem)."""
     (path / 'tests').mkdir(parents=True, exist_ok=True)
     body = ['import unittest', 'class FakeCase(unittest.TestCase):']
     for name, fails in sorted(tests.items()):
-        body += [f'    def test_{name}(self):', f'        self.assertEqual({1 if fails else 0}, 0)']
+        if isinstance(fails, str):
+            body += [f'    def test_{name}(self):', f'        self.fail({fails!r})']
+        else:
+            body += [f'    def test_{name}(self):', f'        self.assertEqual({1 if fails else 0}, 0)']
     (path / 'tests' / 'test_fake.py').write_text('\n'.join(body) + '\n', encoding='utf-8')
     if not (path / '.git').exists():
         git(path, 'init', '-q')
@@ -41,11 +45,20 @@ class ChecksTestCase(unittest.TestCase):
         self.root = Path(tmp.name) / 'branch'
         self.base.mkdir()
         self.root.mkdir()
+        self.tmp = Path(tmp.name)
         self.config = Path(tmp.name) / 'config.json'
         self.write_config({'regression': {'argv': SUITE_ARGV, 'timeoutSeconds': 60}})
 
     def write_config(self, checks_block):
         self.config.write_text(json.dumps({'checks': checks_block}), encoding='utf-8')
+
+    def script(self, code, *extra):
+        """Argv que roda `code` como arquivo de script (a recusa de `python -c` vale para o config)."""
+        folder = self.tmp / 'scripts'
+        folder.mkdir(exist_ok=True)
+        path = folder / f'script{len(list(folder.iterdir()))}.py'
+        path.write_text(code, encoding='utf-8')
+        return [sys.executable, str(path), *extra]
 
     def regression(self, issue=10):
         out = io.StringIO()
@@ -87,6 +100,40 @@ class RegressionComparisonTest(ChecksTestCase):
         self.assertEqual([('test_healed' in n) for n in result['fixed']], [True])
 
 
+    def test_same_name_with_a_different_cause_is_a_new_changed_failure(self):
+        make_suite(self.base, {'a': 'causa antiga na base'})
+        make_suite(self.root, {'a': 'causa diferente na branch'})
+        code, result = self.regression()
+        self.assertEqual(code, 1)
+        self.assertTrue(result['blocking'])
+        self.assertEqual(len(result['new_failures']), 1)
+        self.assertEqual(result['new_failures'], result['changed_failures'])
+        self.assertEqual(result['existing_failures'], [])
+
+    def test_same_name_with_the_same_cause_is_existing(self):
+        make_suite(self.base, {'a': 'mesma causa'})
+        make_suite(self.root, {'a': 'mesma causa'})
+        code, result = self.regression()
+        self.assertEqual(code, 0)
+        self.assertEqual(len(result['existing_failures']), 1)
+        self.assertEqual(result['changed_failures'], [])
+        self.assertEqual(result['new_failures'], [])
+
+    def test_fingerprint_ignores_paths_addresses_and_line_numbers(self):
+        a = checks.normalize_message(r'Erro em C:\Users\x\app.py line 10 objeto 0x7f12ab34 em /tmp/abc/def.py')
+        b = checks.normalize_message(r'Erro em D:\outro\app.py line 99 objeto 0x55aa00ff em /var/zzz/ghi.py')
+        self.assertEqual(a, b)
+
+    def test_flaky_check_is_reported_as_not_done_only_with_new_failures(self):
+        make_suite(self.base, {'alpha': False})
+        make_suite(self.root, {'alpha': False, 'fresh': True})
+        _, result = self.regression()
+        self.assertEqual(result['flaky_check'], 'nao_realizado')
+        make_suite(self.root, {'alpha': False, 'fresh': False})
+        _, result = self.regression()
+        self.assertNotIn('flaky_check', result)
+
+
 class RecordsTest(ChecksTestCase):
     def record(self, which):
         path = self.root / '.frontlights' / 'issues' / '10' / 'checks' / f'regression-{which}.json'
@@ -126,6 +173,61 @@ class RecordsTest(ChecksTestCase):
         self.regression()
         self.assertNotEqual(self.record('branch')['diff_sha256'], clean)
 
+    def worktree_pair(self):
+        """Base e branch como worktrees do mesmo repositório (há merge-base)."""
+        make_suite(self.base, {'alpha': False}, 'base commit')
+        git(self.base, 'worktree', 'add', '-q', '-b', 'feature', str(self.root))
+
+    def test_diff_vs_base_follows_commits_and_dirty_tree_while_plain_diff_ignores_commits(self):
+        self.worktree_pair()
+        self.regression()
+        clean_plain = self.record('branch')['diff_sha256']
+        clean_vs = self.record('branch')['diff_sha256_vs_base']
+        self.assertEqual(self.record('base')['diff_sha256_vs_base'], clean_vs)
+        make_suite(self.root, {'alpha': False, 'extra': False}, 'branch commit')
+        self.regression()
+        committed = self.record('branch')
+        self.assertEqual(committed['diff_sha256'], clean_plain, 'diff HEAD continua vazio em branch commitada')
+        self.assertNotEqual(committed['diff_sha256_vs_base'], clean_vs)
+        self.assertNotEqual(committed['diff_sha256_vs_base'], self.record('base')['diff_sha256_vs_base'])
+        (self.root / 'tests' / 'test_fake.py').write_text('import unittest' + chr(10), encoding='utf-8')
+        self.regression()
+        dirty = self.record('branch')
+        self.assertNotEqual(dirty['diff_sha256'], clean_plain)
+        self.assertNotEqual(dirty['diff_sha256_vs_base'], committed['diff_sha256_vs_base'])
+
+    def test_files_hash_follows_files_but_not_the_records(self):
+        make_suite(self.base, {'alpha': False})
+        make_suite(self.root, {'alpha': False})
+        self.regression()  # a primeira execução deixa __pycache__ (não ignorado) na árvore
+        self.regression()
+        first = self.record('branch')['files_sha256']
+        self.regression()
+        self.assertEqual(self.record('branch')['files_sha256'], first)
+        (self.root / 'notes.txt').write_text('novo', encoding='utf-8')
+        self.regression()
+        self.assertNotEqual(self.record('branch')['files_sha256'], first)
+
+    def test_argv_secrets_never_reach_the_records_or_the_output(self):
+        make_suite(self.base, {'alpha': False})
+        make_suite(self.root, {'alpha': False})
+        script = 'import sys; sys.stderr.write("Ran 1 test in 0s" + chr(10))'
+        argv = self.script(script, '--password=hunter22xx', '--token', 'abcdef123456', 'admin:s3cretpw')
+        self.write_config({'regression': {'argv': argv, 'timeoutSeconds': 60}})
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = checks.main(['regression', '--config', str(self.config), '--root', str(self.root),
+                                '--base', str(self.base), '--issue', '10'])
+        self.assertEqual(code, 0)
+        texts = [out.getvalue()] + [r.read_text(encoding='utf-8') for r in
+                                    (self.root / '.frontlights' / 'issues' / '10' / 'checks').glob('*.json')]
+        self.assertEqual(len(texts), 3)
+        for text in texts:
+            for secret in ('hunter22xx', 'abcdef123456', 's3cretpw'):
+                self.assertNotIn(secret, text)
+            self.assertIn('--password=', text)
+        self.assertIn('[oculto]', self.record('branch')['argv'][4])
+
     def test_base_runs_before_the_branch(self):
         make_suite(self.base, {'alpha': False})
         make_suite(self.root, {'alpha': False})
@@ -163,6 +265,51 @@ class ConfigValidationTest(ChecksTestCase):
                      ['python', ';', 'ls'], ['python', '>', 'out.txt'], ['python', '2>&1']):
             with self.subTest(argv=argv):
                 self.assertRefused({'argv': argv}, 'shell')
+
+    def test_hardened_shell_variants_are_refused(self):
+        for argv in (['env', 'sh', '-c', 'x'], ['xargs', 'sh'], ['nohup', 'bash'], ['busybox', 'sh'], ['wsl', 'x'],
+                     ['sudo', 'sh'], ['sudo', 'bash', '-c', 'x'],
+                     ['python', '-c', 'import os'], ['python3', '-c', 'x'], ['py', '-c', 'x'],
+                     ['run.bat'], ['cmd.bat'], ['cmd.com'], ['tools/x.cmd', 'a'],
+                     ['"sh"', 'x'], ["'bash'", 'x'], ['powershell.exe '], ['pwsh\t'], ['cmd '], [' sh', 'x']):
+            with self.subTest(argv=argv):
+                self.assertRefused({'argv': argv}, 'shell')
+
+    def test_legitimate_argv_is_accepted(self):
+        for argv in (['python', '-m', 'unittest'], ['python', '>=3'], ['python', '-m', 'pytest', '-q'],
+                     ['npm', 'test']):
+            with self.subTest(argv=argv):
+                self.write_config({'regression': {'argv': argv}})
+                self.assertEqual(checks.regression_settings(self.config)['argv'], argv)
+
+    def test_non_positive_issue_is_refused(self):
+        make_suite(self.base, {'alpha': False})
+        make_suite(self.root, {'alpha': False})
+        for issue in (0, -3):
+            with self.subTest(issue=issue):
+                code, result = self.regression(issue=issue)
+                self.assertEqual(code, 2)
+                self.assertIn('issue', result['error'])
+        self.assertFalse((self.root / '.frontlights').exists())
+
+    def test_nested_base_and_root_are_refused(self):
+        make_suite(self.root, {'alpha': False})
+        inner = self.root / 'inner'
+        inner.mkdir()
+        make_suite(inner, {'alpha': False})
+        for base, root in ((inner, self.root), (self.root, inner)):
+            with self.subTest(base=base.name):
+                self.base, self.root = base, root
+                code, result = self.regression()
+                self.assertEqual(code, 2)
+                self.assertIn('base', result['error'])
+
+    def test_base_without_git_does_not_print_the_full_local_path(self):
+        make_suite(self.root, {'alpha': False})
+        code, result = self.regression()
+        self.assertEqual(code, 2)
+        self.assertNotIn(str(self.base), result['error'])
+        self.assertNotIn(str(self.tmp), result['error'])
 
     def test_cwd_escaping_the_tree_is_refused(self):
         self.assertRefused({'argv': SUITE_ARGV, 'cwd': '..'}, 'cwd')
@@ -203,46 +350,132 @@ class InfrastructureTest(ChecksTestCase):
 
     def test_timeout_is_infrastructure(self):
         self.two_trees()
-        self.use_argv([sys.executable, '-c', 'import time; time.sleep(30)'], timeout=1)
+        self.use_argv(self.script('import time; time.sleep(30)'), timeout=1)
         code, result = self.regression()
         self.assertInfrastructure(code, result, 'timeout')
 
+    def pid_alive(self, pid):
+        if os.name == 'nt':
+            out = subprocess.run(['tasklist', '/FI', f'PID eq {pid}', '/NH'], capture_output=True, text=True).stdout
+            return str(pid) in out.split()
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+
+    def kill_pid(self, pid):
+        if os.name == 'nt':
+            subprocess.run(['taskkill', '/PID', str(pid), '/F'], capture_output=True)
+        else:
+            with contextlib.suppress(OSError):
+                os.kill(pid, 9)
+
+    def test_timeout_is_enforced_even_with_a_live_grandchild_and_leaves_no_orphan(self):
+        self.two_trees()
+        pidfile = self.tmp / 'grandchild.pids'
+        script = ('import subprocess, sys, time\n'
+                  'p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(20)"])\n'
+                  'open(sys.argv[1], "a").write(str(p.pid) + chr(10))\n'
+                  'time.sleep(60)\n')
+        self.use_argv(self.script(script, str(pidfile)), timeout=2)
+        started = time.monotonic()
+        code, result = self.regression()
+        elapsed = time.monotonic() - started
+        pids = [int(x) for x in pidfile.read_text(encoding='utf-8').split()]
+        for pid in pids:
+            self.addCleanup(self.kill_pid, pid)
+        self.assertInfrastructure(code, result, 'timeout')
+        self.assertLess(elapsed, 14, 'o prazo precisa valer mesmo com neto vivo (dois lados de 2 s)')
+        time.sleep(0.5)
+        self.assertEqual([p for p in pids if self.pid_alive(p)], [])
+
+    def test_suite_reporting_zero_tests_is_infrastructure(self):
+        self.two_trees()
+        self.use_argv(self.script('import sys; sys.stderr.write("Ran 0 tests in 0.000s" + chr(10))'))
+        code, result = self.regression()
+        self.assertInfrastructure(code, result, 'no_result')
+
+    def test_different_test_counts_between_base_and_branch_are_recorded(self):
+        make_suite(self.base, {'alpha': False})
+        make_suite(self.root, {'alpha': False, 'beta': False, 'gamma': False})
+        code, result = self.regression()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.record('base')['tests_run'], 1)
+        self.assertEqual(self.record('branch')['tests_run'], 3)
+
+    def test_cwd_symlink_escaping_the_tree_is_refused(self):
+        self.two_trees()
+        outside = self.tmp / 'outside'
+        outside.mkdir()
+        try:
+            os.symlink(outside, self.root / 'link', target_is_directory=True)
+            os.symlink(outside, self.base / 'link', target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest('a plataforma não permite criar link simbólico')
+        self.write_config({'regression': {'argv': SUITE_ARGV, 'cwd': 'link'}})
+        code, result = self.regression()
+        self.assertEqual(code, 2)
+        self.assertIn('cwd', result['error'])
+
+    def test_non_secret_environment_names_do_not_deform_test_names(self):
+        make_suite(self.base, {'alpha': False})
+        make_suite(self.root, {'alpha': True})
+        os.environ['FRONTLIGHTS_MODE'] = 'alpha'
+        self.addCleanup(os.environ.pop, 'FRONTLIGHTS_MODE', None)
+        code, result = self.regression()
+        self.assertEqual(code, 1)
+        self.assertIn('test_alpha', result['new_failures'][0])
+
     def test_nonzero_exit_without_any_result_is_infrastructure(self):
         self.two_trees()
-        self.use_argv([sys.executable, '-c', 'import sys; sys.exit(3)'])
+        self.use_argv(self.script('import sys; sys.exit(3)'))
         code, result = self.regression()
         self.assertInfrastructure(code, result, 'no_result')
 
     def test_clean_exit_without_any_test_run_is_not_a_pass(self):
         self.two_trees()
-        self.use_argv([sys.executable, '-c', 'pass'])
+        self.use_argv(self.script('pass'))
         code, result = self.regression()
         self.assertInfrastructure(code, result, 'no_result')
 
     def test_base_infrastructure_failure_blocks_even_if_branch_is_green(self):
         make_suite(self.root, {'alpha': False})
         make_suite(self.base, {'alpha': False})
-        script = ('import os, sys; sys.stderr.write("Ran 1 test in 0s" + chr(10)); '
-                  'sys.exit(5 if os.path.basename(os.getcwd()) == "base" and False else 0)')
         # the base run is made to die before producing any result
         script = ('import os, sys\n'
                   'if os.path.basename(os.getcwd()) == "base": sys.exit(5)\n'
                   'sys.stderr.write("Ran 1 test in 0s" + chr(10))\n')
-        self.use_argv([sys.executable, '-c', script])
+        self.use_argv(self.script(script))
         code, result = self.regression()
         self.assertEqual(code, 3)
         self.assertTrue(result['blocking'])
         self.assertEqual([i['side'] for i in result['infrastructure']], ['base'])
 
-    def test_nonzero_exit_with_unnamed_failure_still_counts_as_product_failure(self):
+    def test_unnamed_failure_in_the_branch_is_not_comparable_and_blocks(self):
         self.two_trees()
         script = ('import sys; sys.stderr.write("Ran 4 tests in 0.1s" + chr(10) + "FAILED (failures=1)" + chr(10)); '
                   'sys.exit(1)')
-        self.use_argv([sys.executable, '-c', script])
+        self.use_argv(self.script(script))
         code, result = self.regression()
-        self.assertEqual(code, 0)
-        self.assertEqual(len(result['existing_failures']), 1)
+        self.assertEqual(code, 1)
+        self.assertTrue(result['blocking'])
+        self.assertEqual(len(result['new_failures']), 1)
+        self.assertEqual(result['existing_failures'], [])
         self.assertEqual(self.record('branch')['classification'], 'product_failure')
+
+    def test_unnamed_failures_with_a_bigger_count_in_the_branch_block(self):
+        self.two_trees()
+        script = ('import os, sys\n'
+                  'n = 1 if os.path.basename(os.getcwd()) == "base" else 3\n'
+                  'sys.stderr.write("Ran 4 tests in 0.1s" + chr(10) + f"FAILED (failures={n})" + chr(10))\n'
+                  'sys.exit(1)\n')
+        self.use_argv(self.script(script))
+        code, result = self.regression()
+        self.assertEqual(code, 1)
+        self.assertTrue(result['blocking'])
+        self.assertEqual(self.record('base')['failure_count'], 1)
+        self.assertEqual(self.record('branch')['failure_count'], 3)
 
     def test_pytest_style_failures_are_extracted(self):
         self.two_trees()
@@ -253,7 +486,7 @@ class InfrastructureTest(ChecksTestCase):
                   '    print("1 failed, 1 error, 3 passed in 0.12s")\n'
                   '    sys.exit(1)\n'
                   'print("5 passed in 0.1s")\n')
-        self.use_argv([sys.executable, '-c', script])
+        self.use_argv(self.script(script))
         code, result = self.regression()
         self.assertEqual(code, 1)
         self.assertEqual(result['new_failures'], ['tests/test_a.py::test_x', 'tests/test_b.py::test_y'])
@@ -267,7 +500,7 @@ class InfrastructureTest(ChecksTestCase):
         script = ('import os, sys\n'
                   'sys.stderr.write("Ran 1 test in 0s" + chr(10))\n'
                   'sys.exit(0 if os.path.exists("marker.txt") else 1)\n')
-        self.write_config({'regression': {'argv': [sys.executable, '-c', script], 'cwd': 'sub'}})
+        self.write_config({'regression': {'argv': self.script(script), 'cwd': 'sub'}})
         code, result = self.regression()
         self.assertEqual(code, 0, result)
 
@@ -278,7 +511,7 @@ class InfrastructureTest(ChecksTestCase):
                   'sys.stderr.write("FAIL: leak_" + os.environ["FRONTLIGHTS_FAKE_TOKEN"] + " (m.C.t)" + chr(10))\n'
                   'sys.stderr.write("Ran 1 test in 0s" + chr(10))\n'
                   'sys.exit(1)\n')
-        self.use_argv([sys.executable, '-c', script])
+        self.use_argv(self.script(script))
         os.environ['FRONTLIGHTS_FAKE_TOKEN'] = secret
         self.addCleanup(os.environ.pop, 'FRONTLIGHTS_FAKE_TOKEN', None)
         out = io.StringIO()
