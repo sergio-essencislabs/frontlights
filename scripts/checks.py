@@ -11,11 +11,18 @@ Códigos de saída de `regression`: 0 sem falha nova; 1 falha nova; 2 config ou 
 foi executado; 3 falha de infraestrutura (suíte não inicia, timeout, executável ausente, nenhum
 teste rodou), que nunca conta como "passou" e sempre bloqueia.
 
-O `argv` do config é sempre uma lista executada sem shell. Shell embutido é recusado (filtro de
-erro de configuração, não prova de inocuidade). Falha instável não é reexecutada: `flaky_check` fica
-`nao_realizado` quando há falha nova. O resultado
-e os registros não trazem a saída bruta da suíte, e o valor de variáveis de ambiente com nome de
-segredo é ocultado de tudo que é impresso ou gravado.
+O `argv` do config é sempre uma lista executada sem shell; texto com byte NUL é recusado (código 2).
+Shell embutido é recusado por um filtro de erro de configuração, não por prova de inocuidade. O filtro
+olha só o argv: não enxerga o que um script ou executável faz por dentro (`python script.py`, `npm test`
+ou uma ferramenta qualquer ainda podem chamar shell), não reconhece shells com nome incomum ou
+renomeados, nem wrappers fora da lista (`env`, `xargs`, `nohup`, `busybox`, `wsl`, `sudo`). Os limites
+de aplicação estão em docs/security.md. Falha instável não é reexecutada: `flaky_check` fica
+`nao_realizado` quando há falha nova. O resultado e os registros não trazem a saída bruta da suíte, e o
+valor de variáveis de ambiente com nome de segredo é ocultado de tudo que é impresso ou gravado.
+
+No timeout a suíte inteira é encerrada: grupo de processos próprio no POSIX e Job Object no Windows
+(alcança também netos cujo pai já morreu). Se o Job Object não puder ser criado, a execução segue só
+com `taskkill /T` e o resultado traz `warnings` em português.
 
 Novos subcomandos entram em SUBCOMMANDS com uma função `configure(parser)` e uma função
 `run(args)` que devolve (resultado, código de saída).
@@ -45,11 +52,16 @@ SECRET_OPTION = re.compile(r'^--?[\w-]*(?:password|passwd|pwd|token|secret|crede
 CREDENTIAL_OPTION = re.compile(r'^--?(?:u|user|username|login|basic|auth)$', re.I)
 MIN_SECRET_LENGTH = 8
 UNITTEST_FAILURE = re.compile(r'^(?:FAIL|ERROR): (.+?)\s*$')
-PYTEST_FAILURE = re.compile(r'^(?:FAILED|ERROR) (\S*(?:::|\.py)\S*)')
+# O id vai até o separador ` - ` da mensagem ou o fim da linha: ids parametrizados podem ter espaço.
+PYTEST_FAILURE = re.compile(r'^(?:FAILED|ERROR) (\S*(?:::|\.py).*?)(?: - |\s*$)')
 PYTEST_SUMMARY = re.compile(r'^=*\s*((?:\d+ \w+(?:, )?)+) in [\d.]+s')
 UNITTEST_RAN = re.compile(r'^Ran (\d+) tests? in ', re.M)
 UNITTEST_FAILED_COUNT = re.compile(r'^FAILED \(([^)]*)\)', re.M)
 UNNAMED_FAILURE = '<suite exit code {}>'
+JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+JOB_WARNING = ('Não foi possível usar um Job Object do Windows; netos órfãos podem sobreviver a um '
+               'timeout (encerramento só por taskkill).')
 
 
 class Refused(Exception):
@@ -88,7 +100,9 @@ def redact_argv(argv):
 
 def normalize_message(text):
     """Impressão estável da causa: sem caminhos de máquina, endereços de memória e números de linha."""
-    text = re.sub(r'0x[0-9a-fA-F]+', '0xADDR', text)
+    # Só endereços de memória típicos (`at 0x...` de repr de objeto, ou 12+ dígitos); outros valores hex ficam.
+    text = re.sub(r'\bat 0x[0-9a-fA-F]+', 'at 0xADDR', text)
+    text = re.sub(r'0x[0-9a-fA-F]{12,}', '0xADDR', text)
     text = re.sub(r'[A-Za-z]:[\\/][^\s\'"]*', '<caminho>', text)
     text = re.sub(r'(?:/[\w.\-]+){2,}', '<caminho>', text)
     text = re.sub(r'\bline \d+', 'line N', text)
@@ -147,6 +161,8 @@ def regression_settings(config_path):
         raise Refused('checks.regression.argv precisa ser uma lista de argumentos, não uma string.')
     if not argv or not all(isinstance(a, str) and a for a in argv):
         raise Refused('checks.regression.argv precisa ter só textos não vazios.')
+    if any('\0' in a for a in argv):
+        raise Refused('checks.regression.argv não aceita byte NUL em nenhum argumento.')
     reason = embedded_shell(argv)
     if reason:
         raise Refused(f'checks.regression.argv não aceita shell embutido ({reason}; cmd, sh, bash, powershell, '
@@ -187,18 +203,22 @@ def unittest_cause(lines, start):
 
 
 def parse_failures(output):
-    """Falhas na ordem em que aparecem: lista de (nome, impressão da causa ou None)."""
+    """Falhas na ordem em que aparecem: lista de (nome, impressões de causa, ordenadas e sem repetição).
+
+    O mesmo nome pode aparecer mais de uma vez (falha do teste e erro de tearDown); guarda todas as
+    causas. Causa não extraível vira texto vazio.
+    """
     lines = output.splitlines()
     found = {}
     for index, line in enumerate(lines):
         match = UNITTEST_FAILURE.match(line)
         if match:
-            found.setdefault(match.group(1), fingerprint(unittest_cause(lines, index)))
+            found.setdefault(match.group(1), set()).add(fingerprint(unittest_cause(lines, index)) or '')
             continue
         match = PYTEST_FAILURE.match(line)
         if match:
-            found.setdefault(match.group(1), fingerprint(line.partition(' - ')[2]))
-    return list(found.items())
+            found.setdefault(match.group(1), set()).add(fingerprint(line[match.end():]) or '')
+    return [(name, sorted(prints)) for name, prints in found.items()]
 
 
 def count_failures(output, names):
@@ -276,9 +296,75 @@ def infrastructure(kind, message):
             'infrastructure': {'kind': kind, 'message': message}}
 
 
-def kill_tree(process):
-    """Encerra o processo da suíte e todos os descendentes (grupo/sessão próprios)."""
+def create_job():
+    """Job Object do Windows que mata todos os processos dele ao ser fechado; OSError se não puder."""
+    import ctypes
+    from ctypes import wintypes
+
+    class BasicLimits(ctypes.Structure):
+        _fields_ = [('PerProcessUserTimeLimit', ctypes.c_int64), ('PerJobUserTimeLimit', ctypes.c_int64),
+                    ('LimitFlags', wintypes.DWORD), ('MinimumWorkingSetSize', ctypes.c_size_t),
+                    ('MaximumWorkingSetSize', ctypes.c_size_t), ('ActiveProcessLimit', wintypes.DWORD),
+                    ('Affinity', ctypes.c_size_t), ('PriorityClass', wintypes.DWORD),
+                    ('SchedulingClass', wintypes.DWORD)]
+
+    class IoCounters(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_uint64) for name in ('Read', 'Write', 'Other', 'ReadBytes', 'WriteBytes',
+                                                         'OtherBytes')]
+
+    class ExtendedLimits(ctypes.Structure):
+        _fields_ = [('Basic', BasicLimits), ('Io', IoCounters), ('ProcessMemoryLimit', ctypes.c_size_t),
+                    ('JobMemoryLimit', ctypes.c_size_t), ('PeakProcessMemoryUsed', ctypes.c_size_t),
+                    ('PeakJobMemoryUsed', ctypes.c_size_t)]
+
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        raise ctypes.WinError(ctypes.get_last_error())
+    limits = ExtendedLimits()
+    limits.Basic.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if not kernel32.SetInformationJobObject(job, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, ctypes.byref(limits),
+                                            ctypes.sizeof(limits)):
+        error = ctypes.WinError(ctypes.get_last_error())
+        kernel32.CloseHandle(job)
+        raise error
+    return job
+
+
+def job_call(name, argtypes, *args):
+    import ctypes
+    function = getattr(ctypes.WinDLL('kernel32', use_last_error=True), name)
+    function.argtypes = argtypes
+    if not function(*args):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def assign_to_job(job, process):
+    from ctypes import wintypes
+    job_call('AssignProcessToJobObject', [wintypes.HANDLE, wintypes.HANDLE], job, int(process._handle))
+
+
+def terminate_job(job):
+    from ctypes import wintypes
+    job_call('TerminateJobObject', [wintypes.HANDLE, wintypes.UINT], job, 1)
+
+
+def close_job(job):
+    from ctypes import wintypes
+    job_call('CloseHandle', [wintypes.HANDLE], job)
+
+
+def kill_tree(process, job=None):
+    """Encerra o processo da suíte e todos os descendentes (Job Object no Windows, grupo no POSIX)."""
     if os.name == 'nt':
+        if job is not None:
+            try:
+                terminate_job(job)
+            except OSError:
+                pass
         subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'], capture_output=True)
     else:
         try:
@@ -291,31 +377,60 @@ def kill_tree(process):
         pass
 
 
-def run_process(argv, cwd, timeout):
+def run_process(argv, cwd, timeout, warnings):
     """Roda a suíte em grupo/sessão novos, com a saída em arquivo (um neto vivo não prende a leitura).
 
     Devolve (código de saída, saída). No prazo estourado mata a árvore inteira e levanta TimeoutExpired.
+    No Windows a suíte inteira roda dentro de um Job Object; sem ele, `warnings` recebe um aviso.
     """
     options = ({'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP} if os.name == 'nt'
                else {'start_new_session': True})
-    with tempfile.TemporaryFile() as sink:
-        process = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=sink,
-                                   stderr=subprocess.STDOUT, **options)
+    job = None
+    if os.name == 'nt':
         try:
-            process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            kill_tree(process)
-            process.wait()
-            raise
-        if os.name != 'nt':
-            kill_tree(process)  # sobras de netos depois de uma execução normal
-        sink.seek(0)
-        return process.returncode, sink.read().decode(errors='replace')
+            job = create_job()
+        except OSError:
+            warnings.append(JOB_WARNING)
+    try:
+        with tempfile.TemporaryFile() as sink:
+            process = subprocess.Popen(argv, cwd=cwd, stdin=subprocess.DEVNULL, stdout=sink,
+                                       stderr=subprocess.STDOUT, **options)
+            if job is not None:
+                try:
+                    assign_to_job(job, process)
+                except OSError:
+                    warnings.append(JOB_WARNING)
+                    close_job(job)
+                    job = None
+            try:
+                process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                kill_tree(process, job)
+                process.wait()
+                raise
+            if os.name != 'nt':
+                kill_tree(process)  # sobras de netos depois de uma execução normal
+            sink.seek(0)
+            return process.returncode, sink.read().decode(errors='replace')
+    finally:
+        if job is not None:
+            try:
+                close_job(job)  # KILL_ON_JOB_CLOSE: nada da suíte sobrevive à execução
+            except OSError:
+                pass
 
 
 def run_suite(argv, cwd, timeout):
+    warnings = []
+    result = run_suite_inner(argv, cwd, timeout, warnings)
+    if warnings:
+        result['warnings'] = warnings
+    return result
+
+
+def run_suite_inner(argv, cwd, timeout, warnings):
     try:
-        returncode, raw = run_process(argv, cwd, timeout)
+        returncode, raw = run_process(argv, cwd, timeout, warnings)
     except FileNotFoundError:
         return infrastructure('executable_missing', 'Executável da suíte não encontrado.')
     except subprocess.TimeoutExpired:
@@ -372,12 +487,17 @@ def compare(base, branch):
         elif name not in base['failures']:
             new.append(name)
         else:
-            before, after = base_prints.get(name), branch['failure_fingerprints'].get(name)
-            if before and after and before != after:
+            # Compara o conjunto de causas: causa só de um lado, ou extra, também é mudança.
+            if set(base_prints.get(name) or ['']) != set(branch['failure_fingerprints'].get(name) or ['']):
                 new.append(name)
                 changed.append(name)
             else:
                 existing.append(name)
+    before, after = base['failure_count'], branch['failure_count']
+    if not new and branch['failures'] and before is not None and after is not None and after > before:
+        entry = f'<contagem maior com os mesmos nomes: {after} falha(s) na branch, {before} na base>'
+        new.append(entry)
+        changed.append(entry)
     fixed = [n for n in base['failures'] if n not in branch['failures']]
     return new, changed, existing, fixed
 
@@ -407,6 +527,9 @@ def run_regression(args):
               'infrastructure': problems, 'base': summary(base), 'branch': summary(branch)}
     if new:
         result['flaky_check'] = 'nao_realizado'
+    warnings = list(dict.fromkeys(w for record in (base, branch) for w in record.get('warnings', [])))
+    if warnings:
+        result['warnings'] = warnings
     return result, 3 if problems else 1 if new else 0
 
 

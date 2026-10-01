@@ -1,5 +1,6 @@
 import contextlib
 import io
+import itertools
 import json
 import os
 import subprocess
@@ -7,6 +8,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
@@ -15,6 +17,9 @@ import checks
 SUITE_ARGV = [sys.executable, '-m', 'unittest', 'discover', '-s', 'tests', '-v']
 GIT_ENV = {**os.environ, 'GIT_AUTHOR_NAME': 't', 'GIT_AUTHOR_EMAIL': 't@example.invalid',
            'GIT_COMMITTER_NAME': 't', 'GIT_COMMITTER_EMAIL': 't@example.invalid'}
+
+
+_REWRITES = itertools.count(1)
 
 
 def git(path, *args):
@@ -39,6 +44,10 @@ def make_suite(path, tests, message='suite'):
 
 class ChecksTestCase(unittest.TestCase):
     def setUp(self):
+        # A suíte falsa é reescrita várias vezes: nenhum .pyc pode sobreviver entre as execuções.
+        patcher = mock.patch.dict(os.environ, {'PYTHONDONTWRITEBYTECODE': '1'})
+        patcher.start()
+        self.addCleanup(patcher.stop)
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.base = Path(tmp.name) / 'base'
@@ -120,9 +129,16 @@ class RegressionComparisonTest(ChecksTestCase):
         self.assertEqual(result['new_failures'], [])
 
     def test_fingerprint_ignores_paths_addresses_and_line_numbers(self):
-        a = checks.normalize_message(r'Erro em C:\Users\x\app.py line 10 objeto 0x7f12ab34 em /tmp/abc/def.py')
-        b = checks.normalize_message(r'Erro em D:\outro\app.py line 99 objeto 0x55aa00ff em /var/zzz/ghi.py')
+        a = checks.normalize_message(r'Erro em C:\Users\x\app.py line 10 <Obj at 0x7f12ab34cd56> em /tmp/abc/def.py')
+        b = checks.normalize_message(r'Erro em D:\outro\app.py line 99 <Obj at 0x55aa00ff1122> em /var/zzz/ghi.py')
         self.assertEqual(a, b)
+
+    def test_fingerprint_keeps_distinct_hexadecimal_values(self):
+        self.assertNotEqual(checks.normalize_message('0x10 != 0x20'), checks.normalize_message('0xdead != 0xbeef'))
+        self.assertNotEqual(checks.fingerprint('esperado 0xdead'), checks.fingerprint('esperado 0xbeef'))
+        self.assertEqual(checks.normalize_message('<Obj at 0x1a2b3c>'), checks.normalize_message('<Obj at 0x9f8e7d>'))
+        self.assertEqual(checks.normalize_message('ptr 0x7f12ab34cd56ef'),
+                         checks.normalize_message('ptr 0x55aa00ff112233'))
 
     def test_flaky_check_is_reported_as_not_done_only_with_new_failures(self):
         make_suite(self.base, {'alpha': False})
@@ -132,6 +148,90 @@ class RegressionComparisonTest(ChecksTestCase):
         make_suite(self.root, {'alpha': False, 'fresh': False})
         _, result = self.regression()
         self.assertNotIn('flaky_check', result)
+
+
+class PytestOutputComparisonTest(ChecksTestCase):
+    def two_outputs(self, base_lines, branch_lines):
+        """Suíte que imprime, no estilo pytest, `base_lines` na base e `branch_lines` na branch."""
+        make_suite(self.base, {'alpha': False})
+        make_suite(self.root, {'alpha': False})
+        script = ('import os, sys\n'
+                  f'base = {base_lines!r}\n'
+                  f'branch = {branch_lines!r}\n'
+                  'lines = base if os.path.basename(os.getcwd()) == "base" else branch\n'
+                  'print(chr(10).join(lines))\n'
+                  'sys.exit(1 if any(l.startswith(("FAILED", "ERROR")) for l in lines) else 0)\n')
+        self.write_config({'regression': {'argv': self.script(script), 'timeoutSeconds': 60}})
+        return self.regression()
+
+    def record(self, which):
+        path = self.root / '.frontlights' / 'issues' / '10' / 'checks' / f'regression-{which}.json'
+        return json.loads(path.read_text(encoding='utf-8'))
+
+    def test_parametrized_ids_with_spaces_are_not_truncated(self):
+        code, result = self.two_outputs(
+            ['FAILED tests/t.py::test_x[a b] - assert 1 == 2', '1 failed, 3 passed in 0.1s'],
+            ['FAILED tests/t.py::test_x[a c] - assert 1 == 2', '1 failed, 3 passed in 0.1s'])
+        self.assertEqual(code, 1)
+        self.assertEqual(result['new_failures'], ['tests/t.py::test_x[a c]'])
+        self.assertEqual(result['fixed'], ['tests/t.py::test_x[a b]'])
+
+    def test_parametrized_id_with_spaces_and_no_message_is_extracted_whole(self):
+        code, result = self.two_outputs(
+            ['ERROR tests/t.py::test_x[a b]', '1 error in 0.1s'],
+            ['ERROR tests/t.py::test_x[a b]', '1 error in 0.1s'])
+        self.assertEqual(code, 0)
+        self.assertEqual(result['existing_failures'], ['tests/t.py::test_x[a b]'])
+
+    def test_cause_only_in_the_branch_blocks_as_changed(self):
+        code, result = self.two_outputs(
+            ['FAILED tests/t.py::test_x', '1 failed in 0.1s'],
+            ['FAILED tests/t.py::test_x - ZeroDivisionError: division by zero', '1 failed in 0.1s'])
+        self.assertEqual(code, 1)
+        self.assertEqual(result['changed_failures'], ['tests/t.py::test_x'])
+        self.assertEqual(result['new_failures'], ['tests/t.py::test_x'])
+
+    def test_cause_only_in_the_base_also_counts_as_changed(self):
+        code, result = self.two_outputs(
+            ['FAILED tests/t.py::test_x - ZeroDivisionError', '1 failed in 0.1s'],
+            ['FAILED tests/t.py::test_x', '1 failed in 0.1s'])
+        self.assertEqual(code, 1)
+        self.assertEqual(result['changed_failures'], ['tests/t.py::test_x'])
+
+    def test_both_without_cause_stay_existing(self):
+        code, result = self.two_outputs(
+            ['FAILED tests/t.py::test_x', '1 failed in 0.1s'],
+            ['FAILED tests/t.py::test_x', '1 failed in 0.1s'])
+        self.assertEqual(code, 0)
+        self.assertEqual(result['existing_failures'], ['tests/t.py::test_x'])
+
+    def test_bigger_failure_count_with_the_same_names_blocks(self):
+        code, result = self.two_outputs(
+            ['FAILED tests/t.py::test_x - boom', '1 failed, 3 passed in 0.1s'],
+            ['FAILED tests/t.py::test_x - boom', '3 failed, 1 passed in 0.1s'])
+        self.assertEqual(code, 1)
+        self.assertTrue(result['blocking'])
+        self.assertEqual(len(result['new_failures']), 1)
+        self.assertEqual(result['changed_failures'], result['new_failures'])
+        self.assertIn('3', result['new_failures'][0])
+        self.assertEqual(result['existing_failures'], ['tests/t.py::test_x'])
+
+    def test_smaller_failure_count_with_the_same_names_does_not_block(self):
+        code, result = self.two_outputs(
+            ['FAILED tests/t.py::test_x - boom', '3 failed, 1 passed in 0.1s'],
+            ['FAILED tests/t.py::test_x - boom', '1 failed, 3 passed in 0.1s'])
+        self.assertEqual(code, 0)
+
+    def test_extra_error_with_another_cause_under_the_same_name_is_detected(self):
+        block = lambda kind, cause: [f'{kind}: test_a (m.C.test_a)', '-' * 70, 'Traceback (most recent call last):',
+                                     '  File "x.py", line 1, in f', cause, '']
+        base = block('FAIL', 'AssertionError: x') + block('ERROR', 'AssertionError: x')
+        branch = block('FAIL', 'AssertionError: x') + block('ERROR', 'RuntimeError: teardown')
+        tail = ['=' * 70, 'Ran 2 tests in 0.1s', '', 'FAILED (failures=1, errors=1)']
+        code, result = self.two_outputs(base + tail, branch + tail)
+        self.assertEqual(code, 1)
+        self.assertEqual(result['changed_failures'], ['test_a (m.C.test_a)'])
+        self.assertEqual(len(self.record('branch')['failure_fingerprints']['test_a (m.C.test_a)']), 2)
 
 
 class RecordsTest(ChecksTestCase):
@@ -275,6 +375,9 @@ class ConfigValidationTest(ChecksTestCase):
             with self.subTest(argv=argv):
                 self.assertRefused({'argv': argv}, 'shell')
 
+    def test_argv_with_a_nul_byte_is_refused_not_a_traceback(self):
+        self.assertRefused({'argv': ['python', 'a\0b']}, 'NUL')
+
     def test_legitimate_argv_is_accepted(self):
         for argv in (['python', '-m', 'unittest'], ['python', '>=3'], ['python', '-m', 'pytest', '-q'],
                      ['npm', 'test']):
@@ -389,6 +492,62 @@ class InfrastructureTest(ChecksTestCase):
         self.assertLess(elapsed, 14, 'o prazo precisa valer mesmo com neto vivo (dois lados de 2 s)')
         time.sleep(0.5)
         self.assertEqual([p for p in pids if self.pid_alive(p)], [])
+
+    def hostile_script(self):
+        """A inicia B, B inicia C (dorme 40 s) e sai; A segue vivo. Grava o pid de C no arquivo recebido."""
+        middle = ('import subprocess, sys\n'
+                  'c = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(40)"])\n'
+                  'open(sys.argv[1], "a").write(str(c.pid) + chr(10))\n')
+        middle_path = self.tmp / 'middle.py'
+        middle_path.write_text(middle, encoding='utf-8')
+        top = ('import subprocess, sys, time\n'
+               f'subprocess.Popen([sys.executable, {str(middle_path)!r}, sys.argv[1]]).wait()\n'
+               'time.sleep(60)\n')
+        return top
+
+    @unittest.skipUnless(os.name == 'nt', 'Job Object é específico do Windows')
+    def test_timeout_kills_a_grandchild_whose_parent_already_died(self):
+        self.two_trees()
+        pidfile = self.tmp / 'orphan.pids'
+        self.use_argv(self.script(self.hostile_script(), str(pidfile)), timeout=3)
+        started = time.monotonic()
+        code, result = self.regression()
+        elapsed = time.monotonic() - started
+        pids = [int(x) for x in pidfile.read_text(encoding='utf-8').split()]
+        for pid in pids:
+            self.addCleanup(self.kill_pid, pid)
+        self.assertEqual(len(pids), 2, 'um neto por lado')
+        self.assertInfrastructure(code, result, 'timeout')
+        self.assertLess(elapsed, 20)
+        time.sleep(0.5)
+        self.assertEqual([p for p in pids if self.pid_alive(p)], [])
+
+    @unittest.skipUnless(os.name == 'nt', 'Job Object é específico do Windows')
+    def test_job_object_failure_falls_back_with_a_warning_in_portuguese(self):
+        self.two_trees()
+        self.use_argv(self.script('import time; time.sleep(30)'), timeout=1)
+        with mock.patch.object(checks, 'create_job', side_effect=OSError('sem job')):
+            code, result = self.regression()
+        self.assertInfrastructure(code, result, 'timeout')
+        self.assertTrue(result['warnings'])
+        self.assertIn('Job Object', result['warnings'][0])
+        self.assertNotIn('sem job', json.dumps(result))
+
+    def test_raw_output_file_is_closed_even_on_timeout(self):
+        self.two_trees()
+        self.use_argv(self.script('import time; time.sleep(30)'), timeout=1)
+        opened = []
+        real = tempfile.TemporaryFile
+
+        def spy(*args, **kwargs):
+            handle = real(*args, **kwargs)
+            opened.append(handle)
+            return handle
+
+        with mock.patch.object(checks.tempfile, 'TemporaryFile', spy):
+            self.regression()
+        self.assertEqual(len(opened), 2)
+        self.assertTrue(all(h.closed for h in opened))
 
     def test_suite_reporting_zero_tests_is_infrastructure(self):
         self.two_trees()
