@@ -186,6 +186,41 @@ Na primeira vez, o envio do segredo para aquele endereço precisa da sua aprova�
 sincronização (aprovação, marca, plano e cópias temporárias) fica em `.frontlights/roadmap-sync/`,
 fora do Git. O utilitário é `python scripts/roadmap_sync.py status|approve|fetch|apply|ack|rotate-markers --root <projeto>`.
 
+### Resumo para a diretoria (opcional)
+
+Se o projeto tiver o bloco `roadmapSync.progress` habilitado, logo depois da pergunta do roadmap
+(inclusive quando não havia nada pendente, ou quando você respondeu "não") o `/frontlights`
+pergunta: "Atualizar também o Resumo para a diretoria no RoadS?". Sem o bloco, nada muda e a
+pergunta não aparece. Com a resposta "sim", o Frontlights:
+
+1. pergunta ao RoadS qual período coletar;
+2. roda os coletores que o próprio projeto configurou e mostra a tabela de conferência dos números;
+3. só segue depois da sua confirmação desses números;
+4. redige o rascunho em linguagem simples, a partir dos fatos coletados e dos registros locais;
+5. mostra o rascunho completo e, com a sua aprovação, envia ao RoadS pelo comando de envio do
+   projeto e informa o link para revisar.
+
+Revisar, editar, conferir os números, copiar para o e-mail e marcar como enviado acontece no
+RoadS. O Frontlights não envia e-mail. Reenviar o rascunho atualiza o conteúdo coletado e mantém as
+edições feitas no RoadS.
+
+O bloco fica dentro de `roadmapSync` (veja `examples/config.json`) e reaproveita `endpoint` e
+`secretEnvVar`:
+
+- `enabled` liga o passo; `path` é a rota sob o `endpoint` (só segmentos simples, nunca `..`);
+- `collectors` é a lista de comandos, cada um com `name`, `command` (lista de argumentos, nunca uma
+  linha de shell; `{from}` e `{to}` viram `AAAA-MM-DD`) e `timeoutSeconds` (padrão 300);
+- `pushCommand` é o comando de envio (lista de argumentos; `{draft}` vira o caminho do rascunho),
+  com `pushTimeoutSeconds` opcional;
+- `factsFile` e `usageFile` são opcionais: apontam os arquivos que os coletores gravam, para a
+  skill ler.
+
+Como esse bloco faz o plugin executar comandos lidos de um arquivo de configuração, nada roda e
+nenhuma chamada é feita antes de você aprovar o bloco exato (endereço, variável, rota e cada
+comando). Qualquer mudança nele pede nova aprovação. Os coletores não recebem o segredo; só o
+comando de envio o recebe, pela variável de ambiente. Este repositório não traz coletor nenhum. O
+utilitário é `python scripts/progress_report.py status|approve|window|collect|push --root <projeto>`.
+
 ## Fluxo de trabalho e utilitários
 
 Verificação do host do Remote Control (sem pergunta; orienta `claude rc` quando falta)

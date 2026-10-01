@@ -13,6 +13,16 @@
     "maxSprintItems": 4,
     "issueTargets": {
       "PRODUTO": {"repository": "OWNER/REPOSITORY", "project": {"owner": "OWNER", "number": 1}}
+    },
+    "progress": {
+      "enabled": false,
+      "path": "progress-report",
+      "collectors": [
+        {"name": "usage", "command": ["node", "COLLECTOR_SCRIPT", "--from", "{from}", "--to", "{to}"], "timeoutSeconds": 300}
+      ],
+      "pushCommand": ["node", "PUSH_SCRIPT", "--draft", "{draft}"],
+      "factsFile": null,
+      "usageFile": null
     }
   }
 }
