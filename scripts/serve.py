@@ -13,8 +13,9 @@ Operations (each prints one JSON object on stdout):
 
 Automatic ports: a process declares `"port": "auto"` (the only rule: omitting `port` keeps the #9 behaviour,
 where the port is read from the health URL). Its `argv` elements and `health` may use `{port}`; with "auto" the
-health URL must contain it. For each such process start reserves a free port (the OS offers one, the bind must
-succeed, and it must not be reserved by a live start or process of another issue or worktree), records it
+health URL must carry it in place of the port (`http://127.0.0.1:{port}/`). For each such process start reserves a
+free port (the OS offers one, the bind must succeed, and it must not be reserved by a live start or process of
+another issue or worktree), records it
 exclusively (O_EXCL) in `<git-common-dir>/frontlights-serve/ports/<port>.json` (shared by all worktrees of the
 repository; outside Git: `<root>/.frontlights/serve/ports/`), and gives the process the environment variables
 `PORT` and `FRONTLIGHTS_PORT_<NAME>` (name upper-cased, non-alphanumerics as `_`). A reservation whose coordinator
@@ -40,11 +41,14 @@ deadline on every pass.
 Reservations are shared only among the worktrees of ONE repository (they live in that repository's Git common
 directory): two different repositories, or a project outside Git, do not see each other's reservations, so both may be
 offered the same candidate port until one of the servers binds it (the bind/connect probe then skips it). The start
-output only says whether the reservations are shared (`reservas_compartilhadas`), not with whom.
+output only says whether the reservations are shared (`reservas_compartilhadas`), not with whom. The race between two
+repositories (or a project outside Git) is not prevented: when both are offered the same candidate port, the one that
+loses it fails its start as an infrastructure failure (the process cannot bind the port) and can start again.
 An I/O error while creating or writing a lock, a reservation or a record is an infrastructure refusal with JSON
 (never a traceback), and the issue lock is released; `main` turns any other OSError that escapes into the same
-refusal. A health URL or `port` outside 1 to 65535 (or an invalid `cwd` type) is refused as `uso` while the config is
-read, before anything is spawned.
+refusal. A config error is refused as `uso` before anything is reserved or spawned: a health URL or `port` outside
+1 to 65535 or of the wrong type, credentials in the health URL, an invalid `timeoutSeconds`, a NUL character in the
+`argv`, `health` or `cwd`, and a `cwd` that is not text, is absolute, leaves the worktree or does not exist.
 Limit of the `spawning` grace: between spawning the process and recording its pid in the reservation (the pid is known
 only once Popen returns) the reservation holds for 60 s on the `spawning` mark alone. If the coordinator is killed in
 that window and the server only starts listening after the 60 s, another start may be offered its port; a server that
@@ -94,6 +98,7 @@ PORT_ATTEMPTS = 200
 RESERVE_LOCK_SECONDS = 20
 ORPHAN_SECONDS = 60
 EMPTY_LOCK_SECONDS = 5
+PERSISTENT_ERRORS = 25
 MAX_PID = 2 ** 31 - 1
 REMOVE_ATTEMPTS = 40
 CONNECT_SECONDS = 0.05
@@ -130,6 +135,19 @@ def io_guard(action):
         yield
     except OSError as error:
         raise io_failure(action, error) from error
+
+
+def count_denial(path, error, denied):
+    """Count consecutive denials to create `path` while it does not exist; the last one is an infrastructure failure.
+
+    A file being deleted can answer "denied" for a few milliseconds on Windows; `PERSISTENT_ERRORS` denials in a row
+    with nothing there to compete are a real permission problem, not contention.
+    """
+    if os.path.exists(path):
+        return 0
+    if denied + 1 >= PERSISTENT_ERRORS:
+        raise io_failure(f'criar {Path(path).name}', error) from error
+    return denied + 1
 
 
 def now_iso():
@@ -220,6 +238,10 @@ def load_block(config_file):
                 'Cada processo precisa de um name único e não vazio.')
         names.add(name)
         argv = item.get('argv')
+        texts = [item.get('health'), item.get('cwd')] + (argv if isinstance(argv, list) else [])
+        require(not any(isinstance(text, str) and '\0' in text for text in texts),
+                f'O processo {name} tem um caractere NUL no argv, no health ou no cwd: remova-o do config.', name,
+                USAGE)
         require(isinstance(argv, list) and argv and all(isinstance(part, str) and part for part in argv),
                 f'O processo {name} precisa de argv como lista de strings (sem shell embutido).', name)
         health = item.get('health')
@@ -231,7 +253,12 @@ def load_block(config_file):
                 f'O processo {name} precisa de health como URL http(s).', name, USAGE)
         require('port' not in item or item['port'] == PORT_AUTO
                 or isinstance(item['port'], int) and not isinstance(item['port'], bool),
-                f'O processo {name} tem port inválida: use um inteiro ou "{PORT_AUTO}".', name)
+                f'O processo {name} tem port inválida: use um inteiro ou "{PORT_AUTO}".', name, USAGE)
+        require('@' not in parts.netloc, f'O health do processo {name} não pode ter usuário e senha na URL.', name,
+                USAGE)
+        timeout = item.get('timeoutSeconds', DEFAULT_TIMEOUT)
+        require(isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0,
+                f'O processo {name} tem timeoutSeconds inválido: use um número maior que zero.', name, USAGE)
         require(item.get('cwd') is None or isinstance(item['cwd'], str),
                 f'O cwd do processo {name} precisa ser um texto (caminho relativo à worktree).', name, USAGE)
         # refused here, before anything is spawned: a port outside 1..65535 would otherwise fail after the spawn
@@ -242,9 +269,10 @@ def load_block(config_file):
                     f'O health do processo {name} tem uma porta inválida: use uma porta de 1 a 65535 na URL, ou '
                     f'port "{PORT_AUTO}".', name, USAGE)
         if is_auto(item):  # only these receive FRONTLIGHTS_PORT_<NAME>, so only they can collide
-            require('{port}' in health,
-                    f'O processo {name} usa port "{PORT_AUTO}", então o health precisa conter {{port}}: sem isso a '
-                    'saúde não prova que o processo escutou a porta reservada.', name, USAGE)
+            require(parts.netloc.endswith(':{port}'),
+                    f'O processo {name} usa port "{PORT_AUTO}", então o health precisa ter {{port}} no lugar da '
+                    'porta (por exemplo http://127.0.0.1:{port}/): sem isso a saúde não prova que o processo '
+                    'escutou a porta reservada.', name, USAGE)
             variable = env_name(name)
             require(variable not in variables,
                     f'Os processos {variables.get(variable)} e {name} geram a mesma variável {variable} depois de '
@@ -294,8 +322,8 @@ def process_cwd(root, item):
     base = Path(root).resolve()
     target = (base / item['cwd']).resolve() if item.get('cwd') else base
     require(target == base or base in target.parents,
-            f'O cwd do processo {item["name"]} precisa ficar dentro da worktree da issue.', item['name'])
-    require(target.is_dir(), f'O cwd do processo {item["name"]} não existe.', item['name'])
+            f'O cwd do processo {item["name"]} precisa ficar dentro da worktree da issue.', item['name'], USAGE)
+    require(target.is_dir(), f'O cwd do processo {item["name"]} não existe.', item['name'], USAGE)
     return target
 
 
@@ -335,9 +363,7 @@ def healthy(url):
 
 
 def wait_healthy(child, item):
-    timeout = item.get('timeoutSeconds', DEFAULT_TIMEOUT)
-    require(isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0,
-            f'O processo {item["name"]} tem timeoutSeconds inválido.', item['name'])
+    timeout = item.get('timeoutSeconds', DEFAULT_TIMEOUT)  # validated by load_block, before anything is spawned
     reserved = f' (porta reservada {item["port"]})' if item.get('autoPort') else ''
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -485,8 +511,9 @@ def acquire_lock(root, issue):
     a dead owner; a recent empty one is waited for until the deadline. Any other content that is not a pid stays
     refused. The loop has a single exit path per pass, the deadline check followed by a short sleep: no branch (a
     lock being deleted by its owner on Windows, a replacement that did not remove the file, an empty lock) skips it,
-    so the call always ends within `RESERVE_LOCK_SECONDS`, plus the retries of one removal. An I/O error becomes an
-    infrastructure refusal, and a lock created but not written is removed again.
+    so the call always ends within `RESERVE_LOCK_SECONDS` (the wait for the guard counts in it), plus the retries of
+    one removal. An I/O error becomes an infrastructure refusal, and a lock created but not written is removed again;
+    so does a denial that persists with no lock file there (`count_denial`), instead of waiting for the deadline.
     """
     path = lock_path(root, issue)
     name = relative(Path(root), path)
@@ -495,16 +522,20 @@ def acquire_lock(root, issue):
     unreadable = (f'O arquivo de trava {name} está ilegível, então não dá para saber se outro start ou stop está em '
                   f'andamento. Se nenhum start ou stop da issue {issue} estiver rodando, apague {name} à mão e tente '
                   'de novo.')
+    deadline = time.monotonic() + RESERVE_LOCK_SECONDS
     guard = take_os_lock(path.parent / '.locks.guard',
                          f'Não foi possível obter a trava {name} em {RESERVE_LOCK_SECONDS} s: outro start ou stop '
                          'a mantém. Tente de novo em instantes.')
+    denied = 0
     try:
-        deadline = time.monotonic() + RESERVE_LOCK_SECONDS
         while True:
             try:
                 descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except (FileExistsError, PermissionError):  # PermissionError: Windows, being deleted by its owner
+            except FileExistsError:
                 descriptor = None
+            except PermissionError as error:  # Windows: being deleted by its owner, unless it never goes away
+                descriptor = None
+                denied = count_denial(path, error, denied)
             except OSError as error:
                 raise io_failure('criar a trava', error) from error
             if descriptor is not None:
@@ -531,8 +562,9 @@ def acquire_lock(root, issue):
                         f'Outro start ou stop da issue {issue} está em andamento (pid {owner}). Aguarde-o terminar; '
                         f'se ele já não existe, apague {name} à mão.', category=USAGE)
                 remove_file(path)  # dead owner: under the guard nobody else replaces it meanwhile
-            require(time.monotonic() < deadline, f'Não foi possível obter a trava {name}; tente de novo.',
-                    category=USAGE)
+            require(time.monotonic() < deadline,
+                    f'Não foi possível obter a trava {name}; tente de novo. Se o arquivo continua vazio, com data '
+                    f'no futuro (relógio adiantado), apague {name} à mão.', category=USAGE)
             time.sleep(0.02)
     finally:
         release_os_lock(guard)
@@ -719,18 +751,26 @@ def take_os_lock(path, message):
     The file is created if missing (without O_EXCL) and never moved or deleted, so the lock is always on the same
     file and needs no hard links (FAT/exFAT work). The system releases it when the owner dies, even by kill -9.
     Every failed attempt (busy lock, or a file another process holds open without sharing) reaches the deadline
-    check, which refuses with `message`. The descriptor is closed on every path that does not return it.
+    check, which refuses with `message`. The descriptor is closed on every path that does not return it. An error
+    that keeps opening the file (a folder in its place, a denied permission) is an infrastructure refusal with the
+    reason after `PERSISTENT_ERRORS` tries in a row, not a wait for the deadline; an existing file that is held open
+    by someone else is contention and keeps waiting.
     """
     deadline = time.monotonic() + RESERVE_LOCK_SECONDS
+    failures = 0
     while True:
         descriptor = None
         try:
             descriptor = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, 'O_BINARY', 0))
+            failures = 0
             if try_os_lock(descriptor):
                 taken, descriptor = descriptor, None
                 return taken
-        except OSError:  # Windows: sharing violation while another process has the file open
-            pass
+        except OSError as error:
+            # a regular file that cannot be opened is held by someone else (Windows: no sharing): contention
+            failures = 0 if os.path.isfile(path) else failures + 1
+            if failures >= PERSISTENT_ERRORS:
+                raise io_failure(f'abrir {Path(path).name}', error) from error
         finally:
             if descriptor is not None:
                 os.close(descriptor)
@@ -806,6 +846,7 @@ def reserve_port(root, issue, name):
     and a record created but not written is removed again.
     """
     directory = ports_dir(root)
+    denied = 0
     with reservation_lock(directory):
         for port in candidate_ports():
             path = directory / f'{port}.json'
@@ -820,7 +861,10 @@ def reserve_port(root, issue, name):
                       'identity': process_identity(os.getpid()) or UNKNOWN_IDENTITY, 'reservedAt': now_iso()}
             try:
                 descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except (FileExistsError, PermissionError):
+            except FileExistsError:
+                continue
+            except PermissionError as error:  # Windows: the file is being deleted, unless it never goes away
+                denied = count_denial(path, error, denied)
                 continue
             except OSError as error:
                 raise io_failure('criar a reserva da porta', error) from error
@@ -891,16 +935,16 @@ def start_locked(processes, root, issue):
         require(not any(same_process(entry) for entry in previous['processes']),
                 f'Já há processos em execução para a issue {issue}: rode stop antes de um novo start.',
                 category=USAGE)
+    cwds = [process_cwd(root, item) for item in processes]  # a bad cwd is refused before anything is reserved
     started = []
     try:
         ports = reserve_ports(root, issue, [item['name'] for item in processes if is_auto(item)])
-        for item in processes:
+        for item, cwd in zip(processes, cwds):
             env = None
             if is_auto(item):
                 port = ports[item['name']]
                 env = {'PORT': str(port), env_name(item['name']): str(port)}
                 item = with_port(item, port)
-            cwd = process_cwd(root, item)
             guard_batch(item['argv'], item['name'])
             if env:
                 mark_spawning(root, port)
@@ -1019,7 +1063,8 @@ def stop_locked(root, issue):
     except OSError as error:
         detail = error.strerror or type(error).__name__
         raise Refusal(f'Os processos foram encerrados, mas não foi possível apagar o registro {name} ({detail}). '
-                      'Apague-o à mão ou rode stop de novo.', extra={'processes': stopped}) from error
+                      'Apague-o à mão ou rode stop de novo.',
+                      extra={'processes': stopped, 'reservas_liberadas': release_ports(root, issue)}) from error
     return {'ok': True, 'issue': issue, 'processes': stopped, 'reservas_liberadas': release_ports(root, issue)}
 
 

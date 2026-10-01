@@ -1237,13 +1237,17 @@ serve.release_lock(lock)
 """
 
 
-class IssueLockTest(PortsTestCase):
-    """The per-issue lock taken by start and stop: one owner even when a stale lock is replaced concurrently."""
+class IssueLockCase(PortsTestCase):
+    """Helpers only (no tests), so the lock test classes below do not rerun each other's tests."""
 
     def setUp(self):
         super().setUp()
         self.lock = self.root / '.frontlights' / 'serve' / '11.lock'
         self.lock.parent.mkdir(parents=True)
+
+
+class IssueLockTest(IssueLockCase):
+    """The per-issue lock taken by start and stop: one owner even when a stale lock is replaced concurrently."""
 
     def test_a_stale_lock_replaced_while_another_caller_competes_ends_with_a_single_owner(self):
         self.lock.write_text(str(dead_pid()), encoding='utf-8')
@@ -1304,7 +1308,8 @@ class IssueLockTest(PortsTestCase):
             return real_read(path, *args, **kwargs)
 
         started = time.monotonic()
-        with mock.patch.object(Path, 'read_text', being_deleted),                 mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 1), watchdog():
+        with mock.patch.object(Path, 'read_text', being_deleted), \
+                mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 1), watchdog():
             with self.assertRaises(serve.Refusal) as caught:
                 serve.acquire_lock(self.root, 11)
         self.assertLess(time.monotonic() - started, 6)
@@ -1325,12 +1330,20 @@ class IssueLockTest(PortsTestCase):
         self.assertEqual(real_read(self.lock, encoding='utf-8'), str(os.getpid()))
         serve.release_lock(mine)
 
+    def test_a_lock_with_bytes_that_are_not_utf8_is_refused_as_unreadable_not_a_traceback(self):
+        self.lock.write_bytes(b'\xff\xfe\x00\x80')
+        with self.assertRaises(serve.Refusal) as caught:
+            serve.acquire_lock(self.root, 11)
+        self.assertIn('ilegível', str(caught.exception))
+        self.assertEqual(caught.exception.category, 'uso')
+        self.assertEqual(self.lock.read_bytes(), b'\xff\xfe\x00\x80')
+
     def test_the_guard_file_is_the_only_thing_left_besides_the_records(self):
         serve.release_lock(serve.acquire_lock(self.root, 11))
         self.assertEqual([path.name for path in self.lock.parent.iterdir()], ['.locks.guard'])
 
 
-class LockLoopDeadlineTest(IssueLockTest):
+class LockLoopDeadlineTest(IssueLockCase):
     """Every pass of the issue-lock loop reaches the deadline check, whatever branch it took."""
 
     def test_a_replacement_that_does_not_really_remove_the_lock_still_ends_at_the_deadline(self):
@@ -1354,6 +1367,73 @@ class LockLoopDeadlineTest(IssueLockTest):
         self.assertIn('11.lock', str(caught.exception))
         self.assertLess(len(calls), 1000, 'sem uma espera curta o laço gira à toa')
 
+    def test_the_whole_call_including_the_guard_wait_ends_within_one_deadline(self):
+        self.lock.write_text('', encoding='utf-8')  # recent and empty: waited for until the deadline
+        stamp = time.time() - 1
+        os.utime(self.lock, (stamp, stamp))
+        held = serve.take_os_lock(self.lock.parent / '.locks.guard', 'ocupada')
+        releaser = threading.Timer(1.5, serve.release_os_lock, [held])
+        releaser.start()
+        started = time.monotonic()
+        try:
+            with mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 2), watchdog():
+                with self.assertRaises(serve.Refusal):
+                    serve.acquire_lock(self.root, 11)
+        finally:
+            releaser.join()
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 1.9)
+        self.assertLess(elapsed, 2.8, 'a espera pela trava-guarda e o laço somaram dois prazos')
+
+    def test_a_persistent_denial_to_create_the_lock_fails_fast_as_infrastructure_with_the_reason(self):
+        serve.release_lock(serve.acquire_lock(self.root, 11))  # the guard file exists from now on
+        real_open = os.open
+
+        def denied(path, flags, *args, **kwargs):
+            if os.path.basename(str(path)) == '11.lock' and flags & os.O_EXCL:
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES))
+            return real_open(path, flags, *args, **kwargs)
+
+        started = time.monotonic()
+        with mock.patch.object(os, 'open', denied), mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 4), watchdog():
+            with self.assertRaises(serve.Refusal) as caught:
+                serve.acquire_lock(self.root, 11)
+        self.assertLess(time.monotonic() - started, 3, 'não falhou rápido')
+        self.assertEqual(caught.exception.category, 'infraestrutura')
+        self.assertIn(os.strerror(errno.EACCES), str(caught.exception))
+        self.assertNotIn('Não foi possível obter a trava', str(caught.exception))
+
+    def test_a_denial_while_the_lock_file_exists_is_contention_and_ends_at_the_deadline_as_usage(self):
+        self.lock.write_text(str(os.getpid()), encoding='utf-8')
+        real_open, real_read = os.open, Path.read_text
+
+        def denied(path, flags, *args, **kwargs):
+            if os.path.basename(str(path)) == '11.lock' and flags & os.O_EXCL:
+                raise PermissionError(errno.EACCES, os.strerror(errno.EACCES))
+            return real_open(path, flags, *args, **kwargs)
+
+        def being_deleted(path, *args, **kwargs):
+            if path.name == '11.lock':
+                raise PermissionError('arquivo sendo apagado')
+            return real_read(path, *args, **kwargs)
+
+        with mock.patch.object(os, 'open', denied), mock.patch.object(Path, 'read_text', being_deleted), \
+                mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 1), watchdog():
+            with self.assertRaises(serve.Refusal) as caught:
+                serve.acquire_lock(self.root, 11)
+        self.assertEqual(caught.exception.category, 'uso')
+        self.assertIn('Não foi possível obter a trava', str(caught.exception))
+
+    def test_a_guard_that_is_a_folder_fails_fast_with_the_reason_instead_of_waiting_for_the_deadline(self):
+        (self.lock.parent / '.locks.guard').mkdir()
+        started = time.monotonic()
+        with mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 6), watchdog():
+            with self.assertRaises(serve.Refusal) as caught:
+                serve.acquire_lock(self.root, 11)
+        self.assertLess(time.monotonic() - started, 3, 'esperou o prazo inteiro')
+        self.assertIn('Falha de entrada e saída', str(caught.exception))
+        self.assertEqual(caught.exception.category, 'infraestrutura')
+
     def test_the_watchdog_fails_a_loop_that_ignores_its_deadline_by_assertion_instead_of_hanging(self):
         started = time.monotonic()
         with self.assertRaises(AssertionError), watchdog(1):
@@ -1362,7 +1442,7 @@ class LockLoopDeadlineTest(IssueLockTest):
         self.assertLess(time.monotonic() - started, 5)
 
 
-class EmptyLockTest(IssueLockTest):
+class EmptyLockTest(IssueLockCase):
     """A lock left empty by an owner killed between creating and writing it is not a permanent refusal."""
 
     def age(self, seconds):
@@ -1390,6 +1470,41 @@ class EmptyLockTest(IssueLockTest):
         self.assertIn('11.lock', str(caught.exception))
         self.assertTrue(self.lock.exists())
         self.assertEqual(self.lock.read_text(encoding='utf-8'), '')
+
+    def test_an_old_empty_lock_that_replacement_reports_removed_but_stays_ends_at_the_deadline(self):
+        self.lock.write_text('', encoding='utf-8')
+        self.age(3600)
+        calls = []
+
+        def pretends(path):
+            calls.append(path)
+            if len(calls) > 2000:
+                raise AssertionError('o laço girou sem checar o prazo nem dormir')
+            return True  # says it removed the file; the file stays
+
+        started = time.monotonic()
+        with mock.patch.object(serve, 'remove_file', pretends), \
+                mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 2), watchdog():
+            with self.assertRaises(serve.Refusal) as caught:
+                serve.acquire_lock(self.root, 11)
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 1.9)
+        self.assertLess(elapsed, 6)
+        self.assertIn('11.lock', str(caught.exception))
+        self.assertLess(len(calls), 1000, 'sem uma espera curta o laço gira à toa')
+
+    def test_an_empty_lock_dated_in_the_future_is_refused_with_the_probable_cause(self):
+        self.lock.write_text('', encoding='utf-8')
+        future = time.time() + 7200
+        os.utime(self.lock, (future, future))
+        self.addCleanup(self.lock.unlink)  # or the cleanup `stop` would wait for this lock too
+        with mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 1), watchdog():
+            with self.assertRaises(serve.Refusal) as caught:
+                serve.acquire_lock(self.root, 11)
+        message = str(caught.exception)
+        self.assertTrue(message.startswith('Não foi possível obter a trava'), message)
+        self.assertIn('futuro', message)
+        self.assertEqual(caught.exception.category, 'uso')
 
     def test_a_lock_with_other_text_is_still_refused_as_unreadable(self):
         for content in ('lixo', '12 34', '0'):
@@ -1596,7 +1711,8 @@ class IoFailureTest(GitPortsCase):
                 raise fail_with(errno.EIO)
             return real_replace(source, target)
 
-        with recording, mock.patch.object(os, 'replace', broken),                 mock.patch.object(serve, 'kill_tree', lambda pid: False):
+        with recording, mock.patch.object(os, 'replace', broken), \
+                mock.patch.object(serve, 'kill_tree', lambda pid: False):
             with self.assertRaises(serve.Refusal) as caught:
                 serve.start(self.config, self.root, 11)
         self.assertEqual(caught.exception.category, 'infraestrutura')
@@ -1614,13 +1730,29 @@ class IoFailureTest(GitPortsCase):
                 raise fail_with(errno.EIO)
             return real_unlink(path, *args, **kwargs)
 
+        port = json.loads((self.root / '.frontlights' / 'serve' / '11.json').read_text(encoding='utf-8'))[
+            'processes'][0]['port']
         with mock.patch.object(os, 'unlink', broken):
             with self.assertRaises(serve.Refusal) as caught:
                 serve.stop(self.root, 11)
         self.assertEqual(caught.exception.category, 'infraestrutura')
         self.assertIn('11.json', str(caught.exception))
+        self.assertIn(os.strerror(errno.EIO), str(caught.exception))
+        self.assertEqual([entry['stopped'] for entry in caught.exception.extra['processes']], [True])
+        self.assertEqual(caught.exception.extra['reservas_liberadas'], [port])
+        self.assertEqual(list(self.root.glob('.frontlights/serve/ports/*.json')), [], 'a reserva vazou')
         self.assertFalse((self.root / '.frontlights' / 'serve' / '11.lock').exists(), 'a trava da issue vazou')
         self.assertEqual(self.serve('stop').returncode, 0, self.last.stdout)  # and stop can be retried
+
+    def test_the_reason_of_an_io_error_is_part_of_the_message(self):
+        def disk_full(self, *args, **kwargs):
+            raise fail_with(errno.ENOSPC)
+
+        with mock.patch.object(Path, 'write_text', disk_full):
+            with self.assertRaises(serve.Refusal) as caught:
+                serve.write_json_atomic({'a': 1}, self.root / 'x.json')
+        self.assertIn(os.strerror(errno.ENOSPC), str(caught.exception))
+        self.assertEqual(caught.exception.category, 'infraestrutura')
 
     def test_an_unreadable_reservation_folder_does_not_break_the_release(self):
         def broken(path, pattern):
@@ -1643,14 +1775,6 @@ class IoFailureTest(GitPortsCase):
         self.assertEqual((result['ok'], result['category']), (False, 'infraestrutura'))
         self.assertIn('Falha de entrada e saída', result['error'])
 
-    def test_a_nul_character_in_argv_is_a_refusal_not_a_traceback(self):
-        self.write_config([{'name': 'web', 'argv': [sys.executable, 'a\u0000b'], 'health': 'http://127.0.0.1:1/'}])
-        done = self.serve('start')
-        self.assertEqual(done.returncode, 1, (done.stdout, done.stderr))
-        self.assertNotIn('Traceback', done.stderr)
-        self.assertIn('Não foi possível iniciar o processo web', self.payload(done)['error'])
-        self.assertFalse((self.root / '.frontlights' / 'serve' / '11.lock').exists())
-
 
 # Writes a marker file and stays alive: if it ever runs, the marker proves a spawn.
 MARKER_SERVER = "import pathlib, sys, time; pathlib.Path(sys.argv[1]).write_text('x'); time.sleep(30)"
@@ -1670,6 +1794,8 @@ class ConfigPortRangeTest(PortsTestCase):
         time.sleep(0.5)
         self.assertFalse((self.base / 'marker').exists(), f'{text}: um processo foi criado')
         self.assertFalse((self.root / '.frontlights' / 'serve' / '11.json').exists(), text)
+        self.assertEqual(list(self.root.glob('.frontlights/serve/ports/*.json')), [], f'{text}: porta reservada')
+        self.assertFalse((self.root / '.frontlights' / 'serve' / '11.lock').exists(), f'{text}: trava vazou')
         return result
 
     def process(self, **fields):
@@ -1697,6 +1823,53 @@ class ConfigPortRangeTest(PortsTestCase):
             self.write_config([self.process(**fields)])
             self.assertEqual(len(serve.load_block(self.config)), 1, (health, port))
 
+    def variant(self, auto, **fields):
+        item = self.process(port='auto', health='http://127.0.0.1:{port}/') if auto else self.process()
+        item.update(fields)
+        return item
+
+    def refused_after_a_good_one(self, bad, text):
+        """The bad process comes second: refusing it must happen before the first one is spawned or reserved."""
+        good = self.variant(True, name='first')
+        return self.refused([good, bad], text)
+
+    def test_a_nul_character_in_the_command_health_or_cwd_is_refused_before_any_spawn(self):
+        marker = str(self.base / 'marker')
+        for auto in (False, True):
+            for argv in (['py\u0000thon', '-c', MARKER_SERVER, marker], [sys.executable, 'a\u0000b'],
+                         [sys.executable, '-c', MARKER_SERVER, marker, 'a', 'b\u0000c', 'd']):
+                self.refused_after_a_good_one(self.variant(auto, argv=argv), f'argv {argv!r} auto={auto}')
+            self.refused_after_a_good_one(self.variant(auto, cwd='a\u0000b'), f'cwd auto={auto}')
+            health = 'http://127.0.0.1:{port}/\u0000' if auto else 'http://127.0.0.1:8080/\u0000'
+            self.refused_after_a_good_one(self.variant(auto, health=health), f'health auto={auto}')
+
+    def test_a_timeout_that_is_not_a_positive_number_is_refused_before_any_spawn(self):
+        for value in (-1, 0, 'x', True, float('nan')):
+            self.refused_after_a_good_one(self.variant(False, timeoutSeconds=value), repr(value))
+
+    def test_a_cwd_that_is_absolute_missing_or_outside_the_worktree_is_refused_before_any_spawn(self):
+        for cwd in (str(self.base), 'nao-existe', '..'):
+            self.refused_after_a_good_one(self.variant(False, cwd=cwd), cwd)
+
+    def test_a_health_url_with_credentials_is_refused_before_any_spawn(self):
+        for health in ('http://u:p@127.0.0.1:8080/', 'http://u@127.0.0.1:8080/', 'http://:p@127.0.0.1:8080/'):
+            self.refused_after_a_good_one(self.variant(False, health=health), health)
+            self.refused_after_a_good_one(self.variant(True, health=health.replace('8080', '{port}')), health)
+
+    def test_a_port_that_is_not_an_integer_or_auto_is_refused_as_usage_before_any_spawn(self):
+        for port in (True, 1.5, 'abc', '8080'):
+            self.refused_after_a_good_one(self.variant(False, port=port), repr(port))
+
+    def test_an_auto_health_url_must_carry_the_placeholder_in_its_port(self):
+        for health in ('http://127.0.0.1:3000/{port}', 'http://127.0.0.1/{port}', 'http://127.0.0.1:3000/?p={port}',
+                       'http://{port}.example.test:3000/'):
+            result = self.refused_after_a_good_one(self.variant(True, health=health), health)
+            self.assertIn('{port}', result['error'])
+        for health in ('http://127.0.0.1:{port}/x', 'http://localhost:{port}', 'http://[::1]:{port}/',
+                       'https://127.0.0.1:{port}/a?b=1'):
+            self.write_config([self.variant(True, health=health)])
+            self.assertEqual(len(serve.load_block(self.config)), 1, health)
+
     def test_a_cwd_that_is_not_text_is_refused_before_any_spawn(self):
         for cwd in (5, ['a'], {'a': 1}, True):
             self.refused([self.process(cwd=cwd)], repr(cwd))
@@ -1706,6 +1879,126 @@ class ConfigPortRangeTest(PortsTestCase):
         self.assertEqual(serve.process_port({'health': 'http://127.0.0.1:4321/'}), 4321)
         self.assertEqual(serve.process_port({'health': 'http://h/'}), 80)
         self.assertEqual(serve.process_port({'health': 'https://h/'}), 443)
+
+
+def deny(code=errno.EACCES):
+    return PermissionError(code, os.strerror(code))
+
+
+class PersistentDenialTest(PortsTestCase):
+    """A denial that persists with no competing file is an infrastructure failure, fast and with the reason;
+    contention and a file being deleted keep being retried."""
+
+    def creating(self, outcome):
+        """os.open that fails the exclusive creation of a reservation as `outcome` says (an exception or None)."""
+        real_open, calls = os.open, []
+
+        def hooked(path, flags, *args, **kwargs):
+            if str(path).endswith('.json') and flags & os.O_EXCL:
+                calls.append(path)
+                if outcome(len(calls)) is not None:
+                    raise outcome(len(calls))
+            return real_open(path, flags, *args, **kwargs)
+
+        return mock.patch.object(os, 'open', hooked), calls
+
+    def test_a_reservation_denied_over_and_over_fails_fast_as_infrastructure_with_the_reason(self):
+        patch, calls = self.creating(lambda number: deny())
+        started = time.monotonic()
+        with patch:
+            with self.assertRaises(serve.Refusal) as caught:
+                serve.reserve_port(self.root, 11, 'web')
+        self.assertEqual(caught.exception.category, 'infraestrutura')
+        self.assertIn('Falha de entrada e saída', str(caught.exception))
+        self.assertIn(os.strerror(errno.EACCES), str(caught.exception))
+        self.assertLess(len(calls), 60, 'tentou quase todas as portas candidatas')
+        self.assertLess(time.monotonic() - started, 20)
+
+    def test_a_reservation_denied_only_a_few_times_is_still_made(self):
+        patch, calls = self.creating(lambda number: deny() if number <= 3 else None)
+        with patch:
+            port = serve.reserve_port(self.root, 11, 'web')
+        self.assertTrue((serve.ports_dir(self.root) / f'{port}.json').is_file())
+        self.assertEqual(len(calls), 4)
+
+    def test_a_reservation_that_always_exists_is_contention_not_a_denial(self):
+        patch, calls = self.creating(lambda number: FileExistsError(errno.EEXIST, os.strerror(errno.EEXIST)))
+        with patch, mock.patch.object(serve, 'PORT_ATTEMPTS', 8):
+            with self.assertRaises(serve.Refusal) as caught:
+                serve.reserve_port(self.root, 11, 'web')
+        self.assertIn('Não foi possível reservar uma porta livre', str(caught.exception))
+        self.assertEqual(len(calls), 8)
+
+    def test_a_reservation_denied_while_its_file_exists_is_contention_not_a_denial(self):
+        real_open, calls = os.open, []
+
+        def hooked(path, flags, *args, **kwargs):
+            if str(path).endswith('.json') and flags & os.O_EXCL:
+                calls.append(path)
+                Path(path).write_text('{}', encoding='utf-8')  # the competing file is there
+                raise deny()
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(os, 'open', hooked), mock.patch.object(serve, 'PORT_ATTEMPTS', 8), \
+                mock.patch.object(serve, 'reservation_live', lambda path: False), \
+                mock.patch.object(serve, 'remove_file', lambda path: True):
+            with self.assertRaises(serve.Refusal) as caught:
+                serve.reserve_port(self.root, 11, 'web')
+        self.assertIn('Não foi possível reservar uma porta livre', str(caught.exception))
+        self.assertEqual(len(calls), 8)
+
+    def test_a_reserve_lock_that_is_a_folder_fails_fast_with_the_reason(self):
+        directory = self.root / 'ports'
+        (directory / '.reserve.lock').mkdir(parents=True)
+        started = time.monotonic()
+        with mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 8):
+            with self.assertRaises(serve.Refusal) as caught:
+                with serve.reservation_lock(directory):
+                    pass
+        self.assertLess(time.monotonic() - started, 4, 'esperou o prazo inteiro')
+        self.assertIn('Falha de entrada e saída', str(caught.exception))
+
+
+@unittest.skipUnless(os.name == 'nt', 'ACL real do Windows (icacls)')
+class RealAclDenialTest(PortsTestCase):
+    """The same rules with a real permission denial on a folder (icacls), restored at the end."""
+
+    def deny_writes(self, folder):
+        user = subprocess.run(['whoami'], capture_output=True, text=True, timeout=30).stdout.strip()
+        done = subprocess.run(['icacls', str(folder), '/deny', f'{user}:(WD,AD)'], capture_output=True, text=True,
+                              timeout=60)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.addCleanup(lambda: subprocess.run(['icacls', str(folder), '/remove:d', user], capture_output=True,
+                                               timeout=60))
+
+    def assert_fast_infrastructure(self, started):
+        self.assertEqual(self.last.returncode, 1, (self.last.stdout, self.last.stderr))
+        self.assertNotIn('Traceback', self.last.stderr)
+        result = self.payload(self.last)
+        self.assertEqual(result['category'], 'infraestrutura', result)
+        self.assertIn('Falha de entrada e saída', result['error'])
+        self.assertIn(os.strerror(errno.EACCES), result['error'])
+        self.assertLess(time.monotonic() - started, 25, 'demorou como a espera do prazo inteiro')
+        self.assertFalse((self.root / '.frontlights' / 'serve' / '11.lock').exists(), 'a trava da issue vazou')
+
+    def test_a_reservation_folder_that_denies_writes_fails_the_start_fast_as_infrastructure(self):
+        self.write_config([self.auto('web-api')])
+        ports = self.root / '.frontlights' / 'serve' / 'ports'
+        ports.mkdir(parents=True)
+        (ports / '.reserve.lock').write_bytes(b'')  # the lock file exists: only the reservation itself is denied
+        self.deny_writes(ports)
+        started = time.monotonic()
+        self.serve('start')
+        self.assert_fast_infrastructure(started)
+
+    def test_an_issue_folder_that_denies_writes_fails_the_start_fast_as_infrastructure(self):
+        self.write_config([self.auto('web-api')])
+        folder = self.root / '.frontlights' / 'serve'
+        serve.release_lock(serve.acquire_lock(self.root, 11))  # creates the guard file before the denial
+        self.deny_writes(folder)
+        started = time.monotonic()
+        self.serve('start')
+        self.assert_fast_infrastructure(started)
 
 
 class PidAliveTest(PortsTestCase):
