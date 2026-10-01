@@ -33,23 +33,34 @@ Subcomandos (cada um imprime um objeto JSON em stdout):
               O health da subida ignora o proxy do ambiente.
               Antes de derrubar, o smoke confere que o registro ainda traz os mesmos pids e
               identidades que ele iniciou (outra sessão pode ter feito stop e start: aviso, nada é
-              derrubado). Se o retorno do `serve.start` não permitir essa prova (forma inesperada), o
-              smoke também não derruba nada e avisa para conferir e rodar `serve stop`. Processo que o
-              smoke subiu e não conseguiu derrubar é órfão: `serve_encerrado` false, `warnings` com
-              "Rode `serve stop`" e, se tudo mais passou, infraestrutura `serve_stop_failed`
+              derrubado). Se o retorno do `serve.start` não trouxer pids e identidades (forma inesperada),
+              a prova vem do registro: sem registro antes da subida, o que existe logo depois é do smoke, e
+              a conferência e o stop seguem normais; com registro prévio (mesmo de processos mortos) ou
+              leitura impossível, o smoke não sabe de quem é o serve, não derruba nada, mantém
+              `serve_encerrado` false e avisa que o serve pode seguir no ar (conferir e rodar `serve stop`).
+              Uma recusa do `serve.stop` por trava ocupada (outro start ou stop da issue em andamento) é
+              repetida com pausa (STOP_RETRY_PAUSE) até STOP_RETRY_SECONDS no total, reconferindo o registro
+              a cada tentativa; nenhuma outra falha é repetida e, esgotado o prazo, vale o que segue.
+              Processo que o smoke subiu e não conseguiu derrubar é órfão: `serve_encerrado` false,
+              `warnings` com "Rode `serve stop`" e, se tudo mais passou, infraestrutura `serve_stop_failed`
               (código 3); com caminho falho o código segue 1. Registro parcial (processo declarado
               no config que o `serve start` em andamento ainda não gravou) é `serve_registry_partial`;
               pid fora de 1..2^31-1, não inteiro ou bool é `serve_registry_invalid`. O serve mascara
               o próprio registro (uma senha igual à porta, ao host, ao esquema ou ao nome de um
-              processo oculta esse pedaço): nome e URL ocultados são refeitos a partir do processo
-              declarado no config, e a porta do registro vale quando a URL declarada usa `{port}`.
+              processo oculta esse pedaço): só o nome e a URL de fato ocultados são refeitos, a partir do
+              processo declarado na mesma posição do config (a URL não ocultada do registro vale mais que o
+              config), e a porta do registro vale quando a URL declarada usa `{port}`. Se, havendo algo a
+              refazer, os nomes do registro não baterem com os do config nas mesmas posições (config
+              alterado depois do `serve start`), é `serve_registry_invalid`. `health` vazio no config é
+              erro de configuração (código 2), com a mensagem apontando o campo.
               Limite: um smoke morto à força (kill -9, queda da máquina) não passa pelo `finally` e
               deixa o serve e o registro no ar; o smoke seguinte os usa como serve "de outra sessão"
               e avisa em `warnings` para conferir e rodar `serve stop`.
               A `integration` NÃO sobe nada: exige o `serve start` já feito. Ambos aceitam `--base`
               (hash do diff contra o merge-base) e marcam `simulacao: false`.
               `login` e `password` de `browserTest.users` são ocultados (valor bruto e as formas
-              codificadas em URL, `quote` e `quote_plus`; uma passada, idempotente) de tudo que é
+              codificadas em URL: `quote` e `quote_plus` com e sem `safe`, codificação dupla, hex
+              maiúsculo ou minúsculo; uma passada, idempotente) de tudo que é
               impresso ou gravado; valor com menos de 4 caracteres ou com o texto do marcador faz
               `integration` e `smoke` recusarem o comando (código 2) antes de executar qualquer coisa.
 
@@ -94,6 +105,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -124,6 +136,11 @@ PORT_PLACEHOLDER = '{port}'
 STAND_IN_PORT = '1'  # porta fictícia (válida) no lugar de `{port}` quando só o host da URL importa
 MAX_PID = 2 ** 31 - 1
 SMOKE_TIMEOUT = 10
+# Trava momentânea de outra sessão (start ou stop em andamento) ao derrubar o serve: o stop espera e repete só
+# por essa recusa, dentro de um prazo total; esgotado o prazo, vale o comportamento de falha ao derrubar.
+STOP_RETRY_SECONDS = 10
+STOP_RETRY_PAUSE = 0.2
+LOCK_BUSY = re.compile(r'^(?:Outro start|Não foi possível obter a trava)')
 TARGETS = {'integration': 'backend da branch (local)', 'smoke': 'aplicação da branch (local)'}
 EXIT_CODES = {'passed': 0, 'healthy': 0, 'product_failure': 1, 'refused': 2, 'infrastructure': 3}
 UNITTEST_FAILURE = re.compile(r'^(?:FAIL|ERROR): (.+?)\s*$')
@@ -144,8 +161,18 @@ class Refused(Exception):
 
 
 def secret_forms(value):
-    """O valor e as formas codificadas em URL (`quote` e `quote_plus`) que o `serve` também oculta."""
-    return {value, urllib.parse.quote(value, safe=''), urllib.parse.quote_plus(value)}
+    """O valor e as formas codificadas em URL em que ele costuma aparecer em um caminho, uma query ou um argv.
+
+    `quote` e `quote_plus` (as duas que o `serve` também oculta), com `safe` padrão, `safe=''` e as barras
+    e arrobas preservadas, mais a codificação dupla, cada uma com o hexadecimal em maiúsculas (como o Python
+    escreve) e em minúsculas (`%2b`, como outras bibliotecas escrevem). O valor bruto não ganha variante em
+    minúsculas: só as formas codificadas.
+    """
+    quote, quote_plus = urllib.parse.quote, urllib.parse.quote_plus
+    encoded = {quote(value), quote(value, safe=''), quote(value, safe='/@'), quote_plus(value),
+               quote_plus(value, safe='/'), quote(quote(value, safe=''), safe='')}
+    encoded |= {re.sub(r'%[0-9A-F]{2}', lambda found: found.group().lower(), form) for form in encoded}
+    return {value} | encoded
 
 
 def redact(text):
@@ -153,7 +180,7 @@ def redact(text):
 
     O próprio marcador entra primeiro na expressão e é trocado por ele mesmo: ocultar duas vezes não muda
     nada, mesmo para um segredo que seja pedaço do marcador (`ocul`). Login e senha de teste saem também nas
-    formas codificadas (`%40`, `%20`, `+`), como em um caminho ou em uma URL do argv.
+    formas codificadas (`%40`, `%20`, `+`, `%2f`), como em um caminho ou em uma URL do argv.
     """
     values = {value for name, value in os.environ.items()
               if len(value) >= MIN_SECRET_LENGTH and SECRET_NAME.search(name)}
@@ -781,27 +808,63 @@ def valid_port(port):
     return isinstance(port, int) and not isinstance(port, bool) and 0 < port < 65536
 
 
+def entry_masked(entry):
+    """True se a máscara do serve alcançou o nome ou a autoridade (esquema, host, porta) do processo no registro."""
+    url = entry.get('url')
+    return serve.MASK in str(entry.get('name')) or (isinstance(url, str) and masked_authority(url))
+
+
+def name_fits(name, declared_name):
+    """O nome do registro (liso ou com trechos ocultados) corresponde ao nome declarado na mesma posição do config."""
+    if not isinstance(name, str) or not isinstance(declared_name, str):
+        return False
+    if serve.MASK not in name:
+        return name == declared_name
+    pieces = (re.escape(piece) for piece in name.split(serve.MASK))
+    return re.fullmatch('.+'.join(pieces), declared_name, re.S) is not None
+
+
+def empty_health_refusal(name):
+    """Recusa de configuração (código 2): o campo `health` do processo está vazio no config."""
+    return Refused(f'O campo health do processo {name} em browserTest.processes do config está vazio: declare a '
+                   'URL de verificação do processo (por exemplo http://127.0.0.1:PORTA/health).')
+
+
 def restore_masked(processes, config_path, issue):
     """Refaz nome e URL que a máscara do serve ocultou no registro (senha igual à porta, ao host, ao nome...).
 
-    O serve grava o registro já mascarado e o texto ocultado não volta. O que a máscara tocou é refeito a
-    partir do processo declarado no config: o nome pela posição (o registro segue a ordem do config) e a URL
-    pelo `health` do mesmo nome, com `{port}` trocado pela porta do registro. Sem como refazer: infraestrutura.
+    O serve grava o registro já mascarado e o texto ocultado não volta. Só o que a máscara tocou é refeito, a
+    partir do processo declarado na mesma posição do config (o registro segue a ordem do config): o nome
+    ocultado volta pelo nome declarado e a autoridade ocultada da URL pelo `health`, com `{port}` trocado pela
+    porta do registro. O que a máscara NÃO tocou fica como o serve gravou (a URL do registro vale mais que o
+    config). Como a posição é a única pista, quando há algo a refazer todos os nomes do registro precisam bater
+    com os do config nas mesmas posições (liso: igual; ocultado: casando com o nome declarado); se divergirem,
+    o registro é de outra configuração e vira infraestrutura `serve_registry_invalid`, nunca a URL de outro
+    processo. `health` vazio no config é erro de configuração (`Refused`, código 2).
     """
+    if not any(entry_masked(entry) for entry in processes):
+        return [dict(entry) for entry in processes]
     declared = declared_processes(config_path)
+    for index, entry in enumerate(processes):
+        if not name_fits(entry.get('name'), declared[index].get('name') if index < len(declared) else None):
+            raise Infra('serve_registry_invalid', f'O registro do serve da issue {issue} não corresponde ao config '
+                        'atual: os nomes dos processos não batem com a ordem de browserTest.processes (o serve foi '
+                        'iniciado com outro config?). Como a máscara de segredos ocultou parte do registro, ele só '
+                        'pode ser refeito com o mesmo config; rode `serve stop` e `serve start` de novo.')
     restored = []
     for index, entry in enumerate(processes):
-        entry = dict(entry)
+        entry, item = dict(entry), declared[index]
+        if serve.MASK in str(entry.get('name')):
+            entry['name'] = item['name']
         url = entry.get('url')
-        name_masked = serve.MASK in str(entry.get('name'))
-        if name_masked or (isinstance(url, str) and masked_authority(url)):
-            if name_masked and index < len(declared):
-                entry['name'] = declared[index].get('name')
-            health = next((item.get('health') for item in declared if item.get('name') == entry['name']), None)
+        if isinstance(url, str) and masked_authority(url):
+            health = item.get('health')
             if not isinstance(health, str):
                 raise Infra('serve_registry_invalid', f'O registro do serve da issue {issue} traz nome ou URL '
                             'ocultados pela máscara de segredos (uma senha igual à porta, ao host ou ao nome de um '
                             'processo) e o config não declara o mesmo processo para refazê-los.')
+            if not health.strip():
+                raise empty_health_refusal(entry['name'])
             port = entry.get('port')
             entry['url'] = health.replace(PORT_PLACEHOLDER, str(port) if valid_port(port) else STAND_IN_PORT)
         restored.append(entry)
@@ -1011,6 +1074,8 @@ def require_local_declarations(config_path):
     processes = block.get('processes')
     for item in processes if isinstance(processes, list) else []:
         if isinstance(item, dict) and isinstance(item.get('health'), str):
+            if not item['health'].strip():
+                raise empty_health_refusal(item.get('name'))
             # `{port}` (processo com port "auto") ainda não tem valor: a conferência é só do host
             local_origin({'name': item.get('name'), 'url': item['health'].replace(PORT_PLACEHOLDER, STAND_IN_PORT)},
                          f'o health do processo {item.get("name")} em browserTest.processes')
@@ -1066,6 +1131,14 @@ def started_pids(started):
         return None
 
 
+def registry_pids(root, issue):
+    """(pid, identidade) de cada processo do registro da issue agora; None se ele não existe ou não pode ser lido."""
+    try:
+        return {(entry['pid'], entry.get('identity')) for entry in serve.read_registry(root, issue)['processes']}
+    except Exception:
+        return None
+
+
 def serve_has_live_processes(root, issue):
     """True se o registro da issue lista algum processo vivo; sem registro, ou ilegível, não há o que provar."""
     if not serve.registry_path(root, issue).is_file():
@@ -1086,7 +1159,7 @@ def clean_failed_start(root, issue, flags):
              f'{serve.protect(str(error))} Rode `serve stop` para encerrar o que sobrou.')
 
 
-def start_serve(config, root, issue, flags, ledger):
+def start_serve(config, root, issue, flags, ledger, registry_existed=True):
     """Sobe o serve da issue; falha de subida é infraestrutura e não deixa processos para trás.
 
     A intenção (`serve_iniciado_pelo_smoke`) é registrada ANTES de chamar o serve: uma interrupção em qualquer
@@ -1094,6 +1167,12 @@ def start_serve(config, root, issue, flags, ledger):
     falha, o `serve.start` já derruba o que levantou; sobras (`left` na recusa, ou processo vivo no registro
     depois de qualquer outra exceção, já que antes da subida não havia nenhum) levam a uma tentativa de stop.
     Uma recusa sem `left` não mexe no registro: pode ser o de outra sessão (ex.: "já há processos").
+
+    Quando o retorno do `serve.start` tem forma inesperada, ele não traz os pids e identidades a provar. Se NÃO
+    havia registro antes da subida (`registry_existed` falso) e o `serve.start` terminou sem recusa, o registro
+    que existe logo depois é o dele: o smoke o lê na hora (`registry_pids`) e usa essa leitura como prova, com a
+    mesma conferência de antes de derrubar. Se já havia um registro (mesmo de processos mortos), ou se a leitura
+    falha, nada prova de quem é o registro: nada é derrubado e o aviso diz isso.
     """
     flags['serve_iniciado_pelo_smoke'] = True
     try:
@@ -1110,7 +1189,15 @@ def start_serve(config, root, issue, flags, ledger):
             clean_failed_start(root, issue, flags)
         raise Infra('serve_start_failed', f'O serve não subiu: {serve.protect(str(error))}') from None
     ledger['started'] = started_pids(started)
+    if ledger['started'] is None and not registry_existed:
+        ledger['started'] = registry_pids(root, issue)
     ledger['unproven'] = ledger['started'] is None  # sem pids e identidades não há como provar de quem é o registro
+
+
+def lock_busy(error):
+    """True para a recusa do serve por trava ocupada (outro start ou stop em andamento); nenhuma outra falha."""
+    return (isinstance(error, serve.Refusal) and error.category == serve.USAGE and not error.extra.get('left')
+            and LOCK_BUSY.match(str(error)) is not None)
 
 
 def stop_started_serve(root, issue, flags, ledger):
@@ -1119,21 +1206,34 @@ def stop_started_serve(root, issue, flags, ledger):
     O `serve.stop` é por issue, não por pid: antes de parar, confere que o registro atual traz os mesmos
     pids e identidades que o smoke iniciou. Se outra sessão fez stop e start no meio, não derruba nada e
     avisa. Falha ao derrubar (processos órfãos do próprio smoke) marca `ledger['orphans']`.
+
+    Uma recusa por trava ocupada (outro start ou stop da issue em andamento) é repetida com pausa de
+    STOP_RETRY_PAUSE até STOP_RETRY_SECONDS no total, e a conferência do registro roda de novo a cada
+    tentativa: se a outra sessão terminou o stop, o registro sumiu e vale o aviso de "outra sessão". Nenhuma
+    outra falha é repetida; esgotado o prazo, a recusa vale como falha ao derrubar.
     """
+    deadline = time.monotonic() + STOP_RETRY_SECONDS
+    while stop_attempt(root, issue, flags, ledger, time.monotonic() + STOP_RETRY_PAUSE < deadline):
+        time.sleep(STOP_RETRY_PAUSE)
+
+
+def stop_attempt(root, issue, flags, ledger, retry):
+    """Uma tentativa de derrubar o serve do smoke; True só se a trava estava ocupada e `retry` permite repetir."""
     if not flags['serve_iniciado_pelo_smoke']:
-        return
+        return False
     if not serve.registry_path(root, issue).is_file():
         if ledger['started'] is None:  # interrompido durante a subida: o próprio serve já limpou tudo
             flags['serve_iniciado_pelo_smoke'] = False
         else:
             warn(flags, 'O registro do serve desapareceu antes do encerramento (outra sessão fez `serve stop`?): '
                  'o smoke não derrubou nada.')
-        return
+        return False
     if ledger['unproven']:
-        warn(flags, 'O `serve.start` devolveu uma resposta em forma inesperada, então o smoke não consegue provar '
-             'que o registro atual é o que ele iniciou e não derrubou nada. Confira o serve atual. Rode `serve stop` '
-             'se ele for seu e sobrar processo órfão.')
-        return
+        warn(flags, 'O `serve.start` devolveu uma resposta em forma inesperada e já havia um registro antes da '
+             'subida (ou ele não pôde ser lido), então o smoke não sabe se o serve atual é o que ele iniciou e '
+             'NÃO derrubou nada (serve_encerrado false). Confira o serve atual. Rode `serve stop` se ele for seu: '
+             'ele continua no ar.')
+        return False
     try:
         if ledger['started'] is not None:
             current = {(entry['pid'], entry.get('identity'))
@@ -1141,14 +1241,17 @@ def stop_started_serve(root, issue, flags, ledger):
             if current != ledger['started']:
                 warn(flags, 'O registro do serve da issue mudou depois da subida (outra sessão fez stop e start): '
                      'o smoke NÃO derrubou o serve atual, que não é o que ele iniciou.')
-                return
+                return False
         if not stop_succeeded(serve.stop(root, issue)):
             raise RuntimeError('o serve devolveu processos sem encerrar.')
         flags['serve_encerrado'] = True
     except Exception as error:
+        if retry and lock_busy(error):
+            return True
         ledger['orphans'] = True
         warn(flags, f'O smoke iniciou o serve, mas não conseguiu derrubá-lo: {serve.protect(str(error))} '
              'Rode `serve stop` para encerrar o que sobrou.')
+    return False
 
 
 SHARED_SERVE_WARNING = ('O smoke usou um serve que já estava no ar (do usuário ou de outra sessão) e não o derruba. '
@@ -1178,10 +1281,11 @@ def run_smoke(args):
     def work(root):
         try:
             require_local_declarations(args.config)
+            registry_existed = serve.registry_path(root, args.issue).is_file()
             if serve_is_up(root, args.issue):
                 warn(flags, SHARED_SERVE_WARNING)
             else:
-                start_serve(args.config, root, args.issue, flags, ledger)
+                start_serve(args.config, root, args.issue, flags, ledger, registry_existed)
             origin = locate(root, args.issue, settings['target'], args.config)
             results = []
             for path in settings['paths']:
