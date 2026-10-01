@@ -69,8 +69,8 @@ def protect(text):
     found_secrets = sorted({secret for secret in _SECRETS if secret}, key=len, reverse=True)
     if not found_secrets:
         return text
-    # the mask itself is matched first and replaced by itself, so masking twice changes nothing
-    pattern = '|'.join([re.escape(MASK)] + [re.escape(secret) for secret in found_secrets])
+    # secrets first (longest first), then the mask itself, replaced by itself so masking twice changes nothing
+    pattern = '|'.join([re.escape(secret) for secret in found_secrets] + [re.escape(MASK)])
     return re.sub(pattern, lambda found: MASK, text)
 
 
@@ -120,6 +120,10 @@ def load_block(config_file):
             for key in ('login', 'password'):
                 value = user.get(key)
                 if isinstance(value, str) and value:
+                    require(MASK not in value,
+                            f'O {key} de um usuário em browserTest.users contém o texto {MASK}, que colide com o '
+                            'marcador de máscara usado na saída e nos registros e impediria mascará-lo por inteiro. '
+                            f'Use um {key} de teste sem esse texto.', category=USAGE)
                     require(len(value) >= MIN_SECRET,
                             f'O {key} de um usuário em browserTest.users tem menos de {MIN_SECRET} caracteres: '
                             'um segredo curto não pode ser mascarado com segurança na saída e nos registros. '
