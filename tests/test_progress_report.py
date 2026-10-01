@@ -194,7 +194,8 @@ class StatusTests(ProgressTestCase):
     def test_changing_the_path_the_push_command_or_the_endpoint_needs_a_new_approval(self):
         self.approved()
         for changes in ({'path': 'other-route'}, {'pushCommand': ['node', 'other.js', '{draft}']},
-                        {'collectors': [self.collector(name='renamed')]}, {'factsFile': 'facts.json'}):
+                        {'collectors': [self.collector(name='renamed')]}, {'factsFile': 'facts.json'},
+                        {'draftGuide': 'docs/guide.md'}, {'shotsDir': 'shots'}):
             with self.subTest(changes=changes):
                 self.write_config()
                 self.edit_block(**changes)
@@ -229,6 +230,29 @@ class StatusTests(ProgressTestCase):
         self.assertEqual(result['secretEnvVar'], 'FRONTLIGHTS_API_SECRET')
         self.assertEqual(result['pushCommand'][0], sys.executable)
         self.assertEqual(result['collectorCommands'][0]['name'], 'usage')
+
+    def test_status_prints_the_draft_guide_and_the_shots_directory(self):
+        self.write_config(progress=self.block(draftGuide='docs/progress-draft.md', shotsDir='.frontlights/progress/shots'))
+        result = self.run_op('status')
+        self.assertEqual((result['draftGuide'], result['shotsDir']),
+                         ('docs/progress-draft.md', '.frontlights/progress/shots'))
+        self.write_config()
+        result = self.run_op('status')
+        self.assertEqual((result['draftGuide'], result['shotsDir']), (None, None))
+
+    def test_draft_guide_and_shots_dir_must_be_relative_paths_inside_the_project(self):
+        for field in ('draftGuide', 'shotsDir'):
+            for bad in ('/abs/file', 'C:/x/y', 'C:\\x', 'c:rel', '../up', 'a/../b', '..', '~/x', '~', '', '   ', 'a' * 201,
+                        '\\\\server\\share', 5, 'a\x00b', '\\rooted', 'a\\..\\b', 'a/../../b'):
+                with self.subTest(field=field, bad=bad):
+                    self.write_config(progress=self.block(**{field: bad}))
+                    result = self.run_op('status')
+                    self.assertEqual((result['valid'], result['ready']), (False, False))
+                    self.assertIn(f'progress.{field}', result['message'])
+                    self.assertFalse(self.run_op('approve')['ok'])
+            with self.subTest(field=field, good=True):
+                self.write_config(progress=self.block(**{field: 'a' * 200}))
+                self.assertTrue(self.run_op('status')['valid'])
 
     def test_status_never_touches_the_network(self):
         self.run_op('status')
@@ -600,6 +624,14 @@ class PluginContractTests(unittest.TestCase):
                        'setx FRONTLIGHTS_API_SECRET', 'Concluído', 'Em validação', 'Em andamento', 'Bloqueado', 'Próximo'):
             self.assertIn(needle, text)
 
+    def test_reference_covers_the_guide_the_sprint_sources_and_the_prints_step(self):
+        text = self.read('skills', 'frontlights', 'references', 'progress-report.md')
+        for needle in ('draftGuide', 'shotsDir', 'captions.json', 'roadmap_sync.py', 'status --root', 'current week',
+                       '256 KB', '1280', 'at most 10', 'push --draft <file>', 'sign-in line'):
+            self.assertIn(needle, text)
+        self.assertLess(text.index('**Draft.**'), text.index('**Prints.**'))
+        self.assertLess(text.index('**Prints.**'), text.index('**Show the complete draft.**'))
+
     def test_example_config_has_only_the_generic_disabled_block(self):
         config = json.loads(self.read('examples', 'config.json'))
         progress = config['roadmapSync']['progress']
@@ -607,13 +639,15 @@ class PluginContractTests(unittest.TestCase):
         self.assertEqual(progress['path'], 'progress-report')
         self.assertEqual(progress['collectors'][0]['command'][1:], ['COLLECTOR_SCRIPT', '--from', '{from}', '--to', '{to}'])
         self.assertEqual(progress['pushCommand'][1:], ['PUSH_SCRIPT', '--draft', '{draft}'])
+        self.assertEqual(progress['draftGuide'], 'docs/progress-draft.md')
+        self.assertEqual(progress['shotsDir'], '.frontlights/progress/shots')
 
     def test_manifests_are_bumped_together(self):
         plugin = json.loads(self.read('.claude-plugin', 'plugin.json'))
         market = json.loads(self.read('.claude-plugin', 'marketplace.json'))
         entry = next(p for p in market['plugins'] if p['name'] == plugin['name'])
-        self.assertEqual(plugin['version'], '0.12.0')
-        self.assertEqual(entry['version'], '0.12.0')
+        self.assertEqual(plugin['version'], '0.12.1')
+        self.assertEqual(entry['version'], '0.12.1')
 
     def test_docs_describe_the_approval(self):
         self.assertIn('progress_report.py', self.read('README.md'))

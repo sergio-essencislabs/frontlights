@@ -196,9 +196,19 @@ pergunta não aparece. Com a resposta "sim", o Frontlights:
 1. pergunta ao RoadS qual período coletar;
 2. roda os coletores que o próprio projeto configurou e mostra a tabela de conferência dos números;
 3. só segue depois da sua confirmação desses números;
-4. redige o rascunho em linguagem simples, a partir dos fatos coletados e dos registros locais;
-5. mostra o rascunho completo e, com a sua aprovação, envia ao RoadS pelo comando de envio do
-   projeto e informa o link para revisar.
+4. redige o arquivo de textos em linguagem simples, seguindo o guia que o projeto indica
+   (`draftGuide`) e a partir dos fatos coletados, dos registros locais e, quando a sincronização do
+   roadmap está configurada, do roadmap e da sprint da semana (que alimentam os próximos passos); o
+   próprio projeto monta o rascunho final com fatos, uso, dados de acesso locais e prints;
+5. pergunta se o resumo leva prints e, para cada entrega escolhida, oferece capturar a tela do produto
+   rodando neste computador (só dados de teste, nunca dados reais nem produção, sem a barra do
+   navegador nem a identidade de quem está logado; JPEG ou PNG, até 256 KB e cerca de 1280 px de
+   largura, no máximo 10), grava as imagens em `shotsDir` e reescreve o `captions.json` a cada
+   execução (imagens que não estão nele são ignoradas);
+6. mostra o rascunho completo, com cada print e sua legenda, e, com a sua aprovação, envia ao RoadS
+   com `push --draft <arquivo>`; o comando do projeto escolhe os prints em `shotsDir` e monta a
+   linha de acesso do e-mail a partir dos arquivos locais do projeto, nunca da conversa, e a skill
+   informa o link para revisar.
 
 Revisar, editar, conferir os números, copiar para o e-mail e marcar como enviado acontece no
 RoadS. O Frontlights não envia e-mail. Reenviar o rascunho atualiza o conteúdo coletado e mantém as
@@ -213,7 +223,11 @@ O bloco fica dentro de `roadmapSync` (veja `examples/config.json`) e reaproveita
 - `pushCommand` é o comando de envio (lista de argumentos; `{draft}` vira o caminho do rascunho),
   com `pushTimeoutSeconds` opcional;
 - `factsFile` e `usageFile` são opcionais: apontam os arquivos que os coletores gravam, para a
-  skill ler.
+  skill ler;
+- `draftGuide` e `shotsDir` são opcionais e devem ser caminhos relativos dentro do projeto (sem caminho
+  absoluto, letra de unidade, `..` nem `~` no início; até 200 caracteres): `draftGuide` é o guia em
+  que o projeto descreve o arquivo de textos, e `shotsDir` é a pasta dos prints e do `captions.json`.
+  Os dois entram na aprovação do bloco: mudar qualquer um pede nova aprovação.
 
 Como esse bloco faz o plugin executar comandos lidos de um arquivo de configuração, nada roda e
 nenhuma chamada é feita antes de você aprovar o bloco exato (endereço, variável, rota e cada

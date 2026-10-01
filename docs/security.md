@@ -96,6 +96,10 @@ O resumo para a diretoria (`scripts/progress_report.py`) executa comandos lidos 
   não o recebem. Um comando que o traga nos argumentos é recusado, e o valor é ocultado em toda saída.
 - **Rota:** o endereço da rota precisa ficar dentro do endpoint aprovado; um `path` que escape dele
   é recusado. Os erros nunca repetem o corpo da resposta.
+- **Prints:** a captura roda o produto do próprio usuário neste computador, só com o consentimento
+  dado na etapa dos prints, com dados de teste. `draftGuide` e `shotsDir` são caminhos relativos
+  dentro do projeto (sem caminho absoluto, `..` ou `~`) e fazem parte do bloco aprovado. Nada é
+  enviado antes da aprovação do rascunho completo.
 - **Texto retornado:** o que a rota e os coletores devolvem é dado, nunca instrução. A saída dos
   comandos é limitada em tamanho antes de ser mostrada.
 

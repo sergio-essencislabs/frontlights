@@ -22,7 +22,9 @@
       ],
       "pushCommand": ["node", "PUSH_SCRIPT", "--draft", "{draft}"],
       "factsFile": null,
-      "usageFile": null
+      "usageFile": null,
+      "draftGuide": "docs/progress-draft.md",
+      "shotsDir": ".frontlights/progress/shots"
     }
   }
 }

@@ -85,8 +85,9 @@ do plugin enquanto ele executa trabalho no projeto consumidor. Estrutura recomen
 
 O passo do resumo para a diretoria (`scripts/progress_report.py`) vem logo depois da pergunta do
 roadmap e só existe quando o bloco `roadmapSync.progress` está habilitado. A ordem é: `status`,
-aprovação do bloco, `window`, `collect`, conferência dos números pelo usuário, rascunho mostrado na
-íntegra, aprovação e `push`. Nada é enviado sem a aprovação do rascunho completo.
+aprovação do bloco, `window`, `collect`, conferência dos números pelo usuário, arquivo de textos
+(guia `draftGuide`, roadmap e sprint da semana), prints em `shotsDir` com `captions.json`, rascunho
+mostrado na íntegra, aprovação e `push --draft`. Nada é enviado sem a aprovação do rascunho completo.
 
 A unidade de trabalho é a issue do GitHub, identificada pelo número, para que o
 quadro e os registros locais coincidam. O plugin não cria identificadores

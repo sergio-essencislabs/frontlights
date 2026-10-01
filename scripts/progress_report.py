@@ -20,7 +20,8 @@ Operations (each prints one JSON object on stdout):
             period sent.
   collect   run every configured collector, in order, from the project root, with --from and --to
             substituted into `{from}` and `{to}`. Stops at the first failure.
-  push      run the configured push command with `{draft}` substituted (plus --shot/--caption).
+  push      run the configured push command with `{draft}` substituted (plus --shot/--caption when the
+            config names no `shotsDir`; the project's push command reads `shotsDir` itself).
 
 Why approval: the block makes this plugin run commands taken from a config file, and a cloned
 repository could carry such a file. Nothing runs, and no request is made, until the user has
@@ -94,6 +95,21 @@ def optional_file(value, field):
     return value
 
 
+MAX_RELATIVE_PATH = 200
+
+
+def relative_path(value, field):
+    """Optional path inside the project: relative, no drive, no `..`, no `~`, at most 200 characters."""
+    if value is None:
+        return None
+    require(isinstance(value, str) and value.strip() and '\x00' not in value and len(value) <= MAX_RELATIVE_PATH,
+            f'{field} must be a non-empty relative path of at most {MAX_RELATIVE_PATH} characters')
+    parts = re.split(r'[\\/]', value)
+    require(not value.startswith(('/', '\\', '~')) and not re.match(r'^[A-Za-z]:', value) and '..' not in parts,
+            f'{field} must stay inside the project: no absolute path, no drive letter, no "..", no leading "~"')
+    return value
+
+
 class Progress:
     """The validated `roadmapSync.progress` block and the endpoint/secret it shares with roadmap sync."""
 
@@ -139,6 +155,8 @@ class Progress:
                                        DEFAULT_TIMEOUT)
         self.facts_file = optional_file(block.get('factsFile'), 'roadmapSync.progress.factsFile')
         self.usage_file = optional_file(block.get('usageFile'), 'roadmapSync.progress.usageFile')
+        self.draft_guide = relative_path(block.get('draftGuide'), 'roadmapSync.progress.draftGuide')
+        self.shots_dir = relative_path(block.get('shotsDir'), 'roadmapSync.progress.shotsDir')
         self.state_dir = self.config_path.parent / 'progress-report'
         self.approval_path = self.state_dir / 'approval.json'
         self.name = str(config.get('repository') or self.config_path.parent.parent.name)
@@ -146,7 +164,8 @@ class Progress:
     def block_summary(self):
         return {'endpoint': rs.canonical_endpoint(self.endpoint), 'url': self.url, 'secretEnvVar': self.secret_env,
                 'path': self.path, 'collectors': self.collectors, 'pushCommand': self.push_command,
-                'pushTimeoutSeconds': self.push_timeout, 'factsFile': self.facts_file, 'usageFile': self.usage_file}
+                'pushTimeoutSeconds': self.push_timeout, 'factsFile': self.facts_file, 'usageFile': self.usage_file,
+                'draftGuide': self.draft_guide, 'shotsDir': self.shots_dir}
 
     def block_hash(self):
         text = json.dumps(self.block_summary(), sort_keys=True, separators=(',', ':'), ensure_ascii=True)
@@ -293,7 +312,8 @@ def op_status(root):
                   collectors=[c['name'] for c in progress.collectors],
                   collectorCommands=[{'name': c['name'], 'command': c['command'], 'timeoutSeconds': c['timeoutSeconds']}
                                      for c in progress.collectors],
-                  pushCommand=progress.push_command, factsFile=progress.facts_file, usageFile=progress.usage_file)
+                  pushCommand=progress.push_command, factsFile=progress.facts_file, usageFile=progress.usage_file,
+                  draftGuide=progress.draft_guide, shotsDir=progress.shots_dir)
     result['ready'] = secret == 'present' and approval == 'approved'
     result.update(ok=True, exitCode=0,
                   message='The progress step is ready.' if result['ready'] else 'The progress step is not ready; see the fields above.')
