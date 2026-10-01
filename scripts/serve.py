@@ -33,8 +33,18 @@ busy when it cannot be bound on 127.0.0.1, 0.0.0.0, 127.0.0.2 (when the platform
 ::, or when something already accepts connections there.
 `stop` takes the same per-issue lock as `start` (`<issue>.lock`): while a start of that issue is in progress in the
 same worktree, `stop` is refused instead of releasing the reservations the start is still using. That lock is
-created, judged and (when its owner is dead) replaced under a short operating-system lock on
-`.frontlights/serve/.locks.guard`, so two callers never both replace the same stale lock.
+created, judged and (when its owner is dead, or it is empty and older than `EMPTY_LOCK_SECONDS`, the leftover of an
+owner killed before writing its pid) replaced under a short operating-system lock on
+`.frontlights/serve/.locks.guard`, so two callers never both replace the same stale lock. Its retry loop checks the
+deadline on every pass.
+Reservations are shared only among the worktrees of ONE repository (they live in that repository's Git common
+directory): two different repositories, or a project outside Git, do not see each other's reservations, so both may be
+offered the same candidate port until one of the servers binds it (the bind/connect probe then skips it). The start
+output only says whether the reservations are shared (`reservas_compartilhadas`), not with whom.
+An I/O error while creating or writing a lock, a reservation or a record is an infrastructure refusal with JSON
+(never a traceback), and the issue lock is released; `main` turns any other OSError that escapes into the same
+refusal. A health URL or `port` outside 1 to 65535 (or an invalid `cwd` type) is refused as `uso` while the config is
+read, before anything is spawned.
 Limit of the `spawning` grace: between spawning the process and recording its pid in the reservation (the pid is known
 only once Popen returns) the reservation holds for 60 s on the `spawning` mark alone. If the coordinator is killed in
 that window and the server only starts listening after the 60 s, another start may be offered its port; a server that
@@ -83,6 +93,7 @@ KILL_WAIT_SECONDS = 15
 PORT_ATTEMPTS = 200
 RESERVE_LOCK_SECONDS = 20
 ORPHAN_SECONDS = 60
+EMPTY_LOCK_SECONDS = 5
 MAX_PID = 2 ** 31 - 1
 REMOVE_ATTEMPTS = 40
 CONNECT_SECONDS = 0.05
@@ -103,6 +114,22 @@ class Refusal(Exception):
 def require(condition, message, process=None, category=None):
     if not condition:
         raise Refusal(message, process, category)
+
+
+def io_failure(action, error):
+    """A Refusal (infrastructure) for an I/O error: the user gets a message and JSON, never a traceback."""
+    detail = error.strerror or type(error).__name__
+    return Refusal(f'Falha de entrada e saída ao {action}: {detail}. Confira o espaço em disco, as permissões e '
+                   'se o caminho é mesmo uma pasta ou um arquivo comum; depois tente de novo.')
+
+
+@contextlib.contextmanager
+def io_guard(action):
+    """Turn any OSError raised inside the block into an infrastructure Refusal (see io_failure)."""
+    try:
+        yield
+    except OSError as error:
+        raise io_failure(action, error) from error
 
 
 def now_iso():
@@ -140,22 +167,23 @@ REGISTRY_EXACT = ('identity', 'startedAt')
 def write_json_atomic(value, path):
     """Write the value masked once, as valid JSON, replacing the file atomically."""
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.parent / f'.{path.name}.{secrets.token_hex(8)}.tmp'
-    try:
-        temporary.write_text(json.dumps(scrub(value, REGISTRY_EXACT), indent=2, ensure_ascii=False),
-                             encoding='utf-8')
-        for attempt in range(REMOVE_ATTEMPTS):
-            try:
-                os.replace(temporary, path)
-                break
-            except PermissionError:  # Windows: a reader holds the target open for a moment
-                if attempt == REMOVE_ATTEMPTS - 1:
-                    raise
-                time.sleep(min(0.002 * (attempt + 1), 0.05))
-    finally:
-        if temporary.exists():
-            temporary.unlink()
+    with io_guard(f'gravar {path.name}'):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.parent / f'.{path.name}.{secrets.token_hex(8)}.tmp'
+        try:
+            temporary.write_text(json.dumps(scrub(value, REGISTRY_EXACT), indent=2, ensure_ascii=False),
+                                 encoding='utf-8')
+            for attempt in range(REMOVE_ATTEMPTS):
+                try:
+                    os.replace(temporary, path)
+                    break
+                except PermissionError:  # Windows: a reader holds the target open for a moment
+                    if attempt == REMOVE_ATTEMPTS - 1:
+                        raise
+                    time.sleep(min(0.002 * (attempt + 1), 0.05))
+        finally:
+            if temporary.exists():
+                temporary.unlink()
 
 
 # ---------------------------------------------------------------- configuration
@@ -195,12 +223,24 @@ def load_block(config_file):
         require(isinstance(argv, list) and argv and all(isinstance(part, str) and part for part in argv),
                 f'O processo {name} precisa de argv como lista de strings (sem shell embutido).', name)
         health = item.get('health')
-        parts = urllib.parse.urlsplit(health) if isinstance(health, str) else None
+        try:
+            parts = urllib.parse.urlsplit(health) if isinstance(health, str) else None
+        except ValueError:  # e.g. an unterminated IPv6 literal
+            parts = None
         require(parts and parts.scheme in ('http', 'https') and parts.hostname,
-                f'O processo {name} precisa de health como URL http(s).', name)
+                f'O processo {name} precisa de health como URL http(s).', name, USAGE)
         require('port' not in item or item['port'] == PORT_AUTO
                 or isinstance(item['port'], int) and not isinstance(item['port'], bool),
                 f'O processo {name} tem port inválida: use um inteiro ou "{PORT_AUTO}".', name)
+        require(item.get('cwd') is None or isinstance(item['cwd'], str),
+                f'O cwd do processo {name} precisa ser um texto (caminho relativo à worktree).', name, USAGE)
+        # refused here, before anything is spawned: a port outside 1..65535 would otherwise fail after the spawn
+        require(not isinstance(item.get('port'), int) or valid_port(item['port']),
+                f'O processo {name} tem port fora da faixa de 1 a 65535.', name, USAGE)
+        if not is_auto(item):  # an auto health URL carries {port}, filled in only after the reservation
+            require(url_port(parts) is not None,
+                    f'O health do processo {name} tem uma porta inválida: use uma porta de 1 a 65535 na URL, ou '
+                    f'port "{PORT_AUTO}".', name, USAGE)
         if is_auto(item):  # only these receive FRONTLIGHTS_PORT_<NAME>, so only they can collide
             require('{port}' in health,
                     f'O processo {name} usa port "{PORT_AUTO}", então o health precisa conter {{port}}: sem isso a '
@@ -212,6 +252,21 @@ def load_block(config_file):
                     name, USAGE)
             variables[variable] = name
     return processes
+
+
+def valid_port(value):
+    return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= 65535
+
+
+def url_port(parts):
+    """Port of a parsed http(s) URL (the scheme default when absent), or None when it is not 1..65535."""
+    try:
+        port = parts.port
+    except ValueError:
+        return None
+    if port is None:
+        return 443 if parts.scheme == 'https' else 80
+    return port if valid_port(port) else None
 
 
 def is_auto(item):
@@ -232,8 +287,7 @@ def with_port(item, port):
 def process_port(item):
     if isinstance(item.get('port'), int):
         return item['port']
-    parts = urllib.parse.urlsplit(item['health'])
-    return parts.port or (443 if parts.scheme == 'https' else 80)
+    return url_port(urllib.parse.urlsplit(item['health']))
 
 
 def process_cwd(root, item):
@@ -425,12 +479,19 @@ def acquire_lock(root, issue):
 
     `start` and `stop` of the issue both take it. Creating, judging and replacing it happen under a short
     operating-system lock on `.frontlights/serve/.locks.guard` (never moved nor deleted): two callers can never both
-    replace the same stale lock, and nobody reads a lock that is still being written. Every retry (a lock being
-    deleted by its owner on Windows) reaches the deadline check.
+    replace the same stale lock, and nobody reads a lock that is still being written. A lock that is EMPTY and older
+    than `EMPTY_LOCK_SECONDS` is the leftover of an owner killed between creating and writing it (the creator holds
+    the guard across both steps, so under the guard an empty lock has no live writer): it is replaced like the lock of
+    a dead owner; a recent empty one is waited for until the deadline. Any other content that is not a pid stays
+    refused. The loop has a single exit path per pass, the deadline check followed by a short sleep: no branch (a
+    lock being deleted by its owner on Windows, a replacement that did not remove the file, an empty lock) skips it,
+    so the call always ends within `RESERVE_LOCK_SECONDS`, plus the retries of one removal. An I/O error becomes an
+    infrastructure refusal, and a lock created but not written is removed again.
     """
     path = lock_path(root, issue)
-    path.parent.mkdir(parents=True, exist_ok=True)
     name = relative(Path(root), path)
+    with io_guard('criar a pasta de travas'):
+        path.parent.mkdir(parents=True, exist_ok=True)
     unreadable = (f'O arquivo de trava {name} está ilegível, então não dá para saber se outro start ou stop está em '
                   f'andamento. Se nenhum start ou stop da issue {issue} estiver rodando, apague {name} à mão e tente '
                   'de novo.')
@@ -444,9 +505,15 @@ def acquire_lock(root, issue):
                 descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             except (FileExistsError, PermissionError):  # PermissionError: Windows, being deleted by its owner
                 descriptor = None
+            except OSError as error:
+                raise io_failure('criar a trava', error) from error
             if descriptor is not None:
-                with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
-                    handle.write(str(os.getpid()))
+                try:
+                    with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+                        handle.write(str(os.getpid()))
+                except OSError as error:
+                    remove_file(path)  # never leave an empty lock behind
+                    raise io_failure('gravar a trava', error) from error
                 return path
             try:
                 text = path.read_text(encoding='utf-8')
@@ -454,14 +521,16 @@ def acquire_lock(root, issue):
                 text = None  # released (or being deleted) between the failed create and the read: try again
             except (OSError, ValueError):
                 raise Refusal(unreadable, category=USAGE)
-            if text is not None:
+            if text is not None and not text.strip():
+                if older_than(path, EMPTY_LOCK_SECONDS):
+                    remove_file(path)  # the owner died before writing its pid; under the guard nobody else writes
+            elif text is not None:
                 owner = int(text) if re.fullmatch(r'\s*[0-9]{1,10}\s*', text) else None
                 require(valid_pid(owner), unreadable, category=USAGE)
                 require(not pid_alive(owner),
                         f'Outro start ou stop da issue {issue} está em andamento (pid {owner}). Aguarde-o terminar; '
                         f'se ele já não existe, apague {name} à mão.', category=USAGE)
-                if remove_file(path):  # dead owner: under the guard nobody else replaces it meanwhile
-                    continue
+                remove_file(path)  # dead owner: under the guard nobody else replaces it meanwhile
             require(time.monotonic() < deadline, f'Não foi possível obter a trava {name}; tente de novo.',
                     category=USAGE)
             time.sleep(0.02)
@@ -508,9 +577,10 @@ def ports_dir(root):
 def candidate_ports():
     """Ports offered by the operating system (bind to port 0), one per attempt."""
     for _ in range(PORT_ATTEMPTS):
-        with socket.socket() as sock:
-            sock.bind(('127.0.0.1', 0))
-            port = sock.getsockname()[1]
+        with io_guard('pedir uma porta ao sistema'):
+            with socket.socket() as sock:
+                sock.bind(('127.0.0.1', 0))
+                port = sock.getsockname()[1]
         yield port  # offered only after the probe socket is closed, so bindable() can test it
 
 
@@ -683,7 +753,8 @@ def reservation_lock(directory):
     Reentrant: a start that reserves several ports holds it once and never waits for itself.
     """
     directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=True)
+    with io_guard('criar a pasta de reservas de portas'):
+        directory.mkdir(parents=True, exist_ok=True)
     key = str(directory)
     with _LOCAL_LOCK:
         if _HELD.get(key):
@@ -729,7 +800,11 @@ def reservation_live(path):
 
 
 def reserve_port(root, issue, name):
-    """Reserve a free port for the process: record it exclusively and return it (the reservation path too)."""
+    """Reserve a free port for the process: record it exclusively and return it (the reservation path too).
+
+    An I/O error (the system offers no candidate port, the record cannot be written) is an infrastructure refusal,
+    and a record created but not written is removed again.
+    """
     directory = ports_dir(root)
     with reservation_lock(directory):
         for port in candidate_ports():
@@ -747,8 +822,14 @@ def reserve_port(root, issue, name):
                 descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             except (FileExistsError, PermissionError):
                 continue
-            with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
-                handle.write(json.dumps(scrub(record, REGISTRY_EXACT), indent=2, ensure_ascii=False))
+            except OSError as error:
+                raise io_failure('criar a reserva da porta', error) from error
+            try:
+                with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+                    handle.write(json.dumps(scrub(record, REGISTRY_EXACT), indent=2, ensure_ascii=False))
+            except OSError as error:
+                remove_file(path)  # never leave an empty reservation behind
+                raise io_failure('gravar a reserva da porta', error) from error
             return port
     raise Refusal(f'Não foi possível reservar uma porta livre para o processo {name}.')
 
@@ -765,7 +846,11 @@ def release_ports(root, issue, keep=()):
     here = str(Path(root).resolve())
     kept = {str(port) for port in keep}
     released = []
-    for path in directory.glob('*.json') if directory.is_dir() else ():
+    try:
+        paths = sorted(directory.glob('*.json')) if directory.is_dir() else []
+    except OSError:  # an unreadable folder: nothing is reported as released; the reservations of a dead start are
+        paths = []  # reclaimed as orphans by the next reserve
+    for path in paths:
         record = read_reservation(path)
         if record and record.get('issue') == issue and record.get('root') == here and path.stem not in kept:
             if remove_file(path) and path.stem.isdigit():
@@ -821,7 +906,7 @@ def start_locked(processes, root, issue):
                 mark_spawning(root, port)
             try:
                 child = spawn(item['argv'], cwd, env)
-            except OSError:
+            except (OSError, ValueError):  # ValueError: e.g. a NUL character in argv
                 raise Refusal(f'Não foi possível iniciar o processo {item["name"]}.', item['name'])
             started.append({'name': item['name'], 'pid': child.pid, 'port': process_port(item),
                             'url': item['health'], 'startedAt': now_iso(),
@@ -844,7 +929,7 @@ def start_locked(processes, root, issue):
                 write_registry(root, issue, left)  # keep only what survived, so stop can retry
             else:
                 registry_path(root, issue).unlink(missing_ok=True)
-        except OSError:
+        except (OSError, Refusal):  # best effort: the original failure is what the user must see
             pass
         release_ports(root, issue, keep=[entry['port'] for entry in left])
         if left and isinstance(failure, Refusal):
@@ -929,7 +1014,12 @@ def stop_locked(root, issue):
     if left:
         raise Refusal('Nem todos os processos foram encerrados; o registro foi mantido para nova tentativa.',
                       extra={'left': left, 'processes': stopped})
-    registry_path(root, issue).unlink()
+    try:
+        registry_path(root, issue).unlink()
+    except OSError as error:
+        detail = error.strerror or type(error).__name__
+        raise Refusal(f'Os processos foram encerrados, mas não foi possível apagar o registro {name} ({detail}). '
+                      'Apague-o à mão ou rode stop de novo.', extra={'processes': stopped}) from error
     return {'ok': True, 'issue': issue, 'processes': stopped, 'reservas_liberadas': release_ports(root, issue)}
 
 
@@ -953,7 +1043,9 @@ def main(argv=None):
     try:
         result = run(args.operation, args.config, args.root, args.issue)
         code = 0
-    except Refusal as refusal:
+    except (Refusal, OSError) as failure:
+        # the safety net: an I/O error that escaped every specific handler is still a refusal with JSON
+        refusal = failure if isinstance(failure, Refusal) else io_failure('executar a operação', failure)
         result = {'ok': False, 'error': str(refusal), 'category': refusal.category}
         if refusal.process:
             result['failedProcess'] = refusal.process
