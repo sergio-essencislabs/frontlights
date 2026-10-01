@@ -22,13 +22,23 @@ and process are both dead is an orphan and is reused, except for a grace of 60 s
 marking the reservation `spawning` and before recording the child pid. `stop` and a failed start release the issue's
 reservations.
 A process that ignores its port fails the start as an infrastructure failure, naming the process and the port.
-All the ports of one start are reserved under one acquisition of a short lock (`.reserve.lock`, O_EXCL, reentrant for
-the same start). A lock or reservation file that cannot be read is treated as being written by its owner (alive)
-while it is recent, and as an orphan once it is older than 60 s; a lock lasts milliseconds, so one older than 120 s
-is an orphan even if its pid is alive (it may have been reused). A stale lock is moved aside atomically and checked
-before it is deleted, so a lock recreated by a live start is never removed. A port counts as busy when it cannot be
-bound on 127.0.0.1, 0.0.0.0, 127.0.0.2 (when the platform has it) or (when IPv6 works) ::1 and ::, or when
-something already accepts connections there.
+All the ports of one start are reserved under one acquisition of a short lock on `.reserve.lock`, reentrant for the
+same start. It is an operating-system lock (Windows `msvcrt.locking` on one byte, POSIX `fcntl.flock`) taken on a file
+that is created if missing and never moved nor deleted, so there is no window in which the lock is absent; the system
+releases it by itself when the owner dies (even by kill -9), hence no stale-lock or pid logic. It is retried until
+`RESERVE_LOCK_SECONDS` and then refused, in every path of the loop. It does not depend on hard links, so it works on
+FAT/exFAT. A reservation file that cannot be read (or whose pid is not an integer from 1 to 2**31-1) is treated as
+being written by its owner (alive) while it is recent, and as an orphan once it is older than 60 s. A port counts as
+busy when it cannot be bound on 127.0.0.1, 0.0.0.0, 127.0.0.2 (when the platform has it) or (when IPv6 works) ::1 and
+::, or when something already accepts connections there.
+`stop` takes the same per-issue lock as `start` (`<issue>.lock`): while a start of that issue is in progress in the
+same worktree, `stop` is refused instead of releasing the reservations the start is still using. That lock is
+created, judged and (when its owner is dead) replaced under a short operating-system lock on
+`.frontlights/serve/.locks.guard`, so two callers never both replace the same stale lock.
+Limit of the `spawning` grace: between spawning the process and recording its pid in the reservation (the pid is known
+only once Popen returns) the reservation holds for 60 s on the `spawning` mark alone. If the coordinator is killed in
+that window and the server only starts listening after the 60 s, another start may be offered its port; a server that
+listens sooner is seen by the bind/connect probe.
 The variable name is the process name upper-cased with non-alphanumerics as `_`, so two `auto` processes named
 `web-api` and `web_api` would get the same `FRONTLIGHTS_PORT_WEB_API`: such a config is refused (category `uso`).
 Processes with a fixed port or without `port` do not receive the variable, so their names may collide.
@@ -44,6 +54,7 @@ config are never read into the record and are redacted from every string this he
 import argparse
 import contextlib
 import datetime as dt
+import http.client
 import json
 import os
 from pathlib import Path
@@ -72,7 +83,7 @@ KILL_WAIT_SECONDS = 15
 PORT_ATTEMPTS = 200
 RESERVE_LOCK_SECONDS = 20
 ORPHAN_SECONDS = 60
-LOCK_STALE_SECONDS = 120
+MAX_PID = 2 ** 31 - 1
 REMOVE_ATTEMPTS = 40
 CONNECT_SECONDS = 0.05
 
@@ -265,7 +276,7 @@ def healthy(url):
             return 200 <= answer.status < 400
     except urllib.error.HTTPError as error:
         return 300 <= error.code < 400
-    except (urllib.error.URLError, OSError, ValueError):
+    except (urllib.error.URLError, http.client.HTTPException, OSError, ValueError):
         return False
 
 
@@ -321,7 +332,14 @@ def kill_tree(pid):
     return not pid_alive(pid)
 
 
+def valid_pid(value):
+    """True for an integer (not a bool) from 1 to 2**31-1: the only values a real pid can have."""
+    return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= MAX_PID
+
+
 def pid_alive(pid):
+    if not valid_pid(pid):
+        return False
     if os.name == 'nt':
         import ctypes
         kernel = ctypes.windll.kernel32
@@ -403,43 +421,56 @@ def relative(root, path):
 
 
 def acquire_lock(root, issue):
-    """Create <issue>.lock exclusively; a lock of a dead owner is replaced, an unreadable one refused."""
+    """Create <issue>.lock exclusively; a lock of a dead owner is replaced, an unreadable one refused.
+
+    `start` and `stop` of the issue both take it. Creating, judging and replacing it happen under a short
+    operating-system lock on `.frontlights/serve/.locks.guard` (never moved nor deleted): two callers can never both
+    replace the same stale lock, and nobody reads a lock that is still being written. Every retry (a lock being
+    deleted by its owner on Windows) reaches the deadline check.
+    """
     path = lock_path(root, issue)
     path.parent.mkdir(parents=True, exist_ok=True)
     name = relative(Path(root), path)
-    for _ in range(3):
-        try:
-            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
+    unreadable = (f'O arquivo de trava {name} está ilegível, então não dá para saber se outro start ou stop está em '
+                  f'andamento. Se nenhum start ou stop da issue {issue} estiver rodando, apague {name} à mão e tente '
+                  'de novo.')
+    guard = take_os_lock(path.parent / '.locks.guard',
+                         f'Não foi possível obter a trava {name} em {RESERVE_LOCK_SECONDS} s: outro start ou stop '
+                         'a mantém. Tente de novo em instantes.')
+    try:
+        deadline = time.monotonic() + RESERVE_LOCK_SECONDS
+        while True:
+            try:
+                descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except (FileExistsError, PermissionError):  # PermissionError: Windows, being deleted by its owner
+                descriptor = None
+            if descriptor is not None:
+                with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+                    handle.write(str(os.getpid()))
+                return path
             try:
                 text = path.read_text(encoding='utf-8')
-                owner = int(text.strip())
-            except FileNotFoundError:
-                continue  # released between the failed create and the read: try again
+            except (FileNotFoundError, PermissionError):
+                text = None  # released (or being deleted) between the failed create and the read: try again
             except (OSError, ValueError):
-                raise Refusal(f'O arquivo de trava {name} está ilegível, então não dá para saber se outro start '
-                              f'está em andamento. Se nenhum start da issue {issue} estiver rodando, apague '
-                              f'{name} à mão e rode start de novo.', category=USAGE)
-            require(not pid_alive(owner),
-                    f'Outro start da issue {issue} está em andamento (pid {owner}). Aguarde-o terminar; se ele '
-                    f'já não existe, apague {name} à mão.', category=USAGE)
-            try:
-                if path.read_text(encoding='utf-8') == text:  # still the stale lock we just judged
-                    path.unlink()
-            except OSError:
-                pass
-            continue
-        with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
-            handle.write(str(os.getpid()))
-        return path
-    raise Refusal(f'Não foi possível obter a trava {name}; tente de novo.', category=USAGE)
+                raise Refusal(unreadable, category=USAGE)
+            if text is not None:
+                owner = int(text) if re.fullmatch(r'\s*[0-9]{1,10}\s*', text) else None
+                require(valid_pid(owner), unreadable, category=USAGE)
+                require(not pid_alive(owner),
+                        f'Outro start ou stop da issue {issue} está em andamento (pid {owner}). Aguarde-o terminar; '
+                        f'se ele já não existe, apague {name} à mão.', category=USAGE)
+                if remove_file(path):  # dead owner: under the guard nobody else replaces it meanwhile
+                    continue
+            require(time.monotonic() < deadline, f'Não foi possível obter a trava {name}; tente de novo.',
+                    category=USAGE)
+            time.sleep(0.02)
+    finally:
+        release_os_lock(guard)
 
 
 def release_lock(path):
-    try:
-        Path(path).unlink()
-    except OSError:
-        pass
+    remove_file(path)
 
 
 def write_registry(root, issue, entries):
@@ -574,81 +605,82 @@ def older_than_orphan(path):
     return older_than(path, ORPHAN_SECONDS)
 
 
-def discard_if_unchanged(path, text):
-    """Delete the stale file `path` judged to hold `text`, without ever deleting a file that replaced it.
-
-    The file is first moved (atomic rename) to a name nobody else uses, and its content is checked there. If it
-    is still the stale one it is deleted; if a live start recreated it in the meantime, the file taken by mistake is
-    given back under its own name (os.link never overwrites) and nothing is deleted.
-    """
-    path = Path(path)
-    aside = path.with_name(f'{path.name}.{secrets.token_hex(6)}.stale')
-    for attempt in range(REMOVE_ATTEMPTS):
-        try:
-            os.replace(path, aside)
-            break
-        except FileNotFoundError:
-            return
-        except OSError:  # Windows: a reader holds the file open for a moment
-            if attempt == REMOVE_ATTEMPTS - 1:
-                return
-            time.sleep(min(0.002 * (attempt + 1), 0.05))
-    try:
-        unchanged = read_brief(aside) == text
-    except OSError:
-        unchanged = False
-    if not unchanged:
-        try:
-            os.link(aside, path)
-        except OSError:
-            pass  # another start already holds a newer lock; the one taken aside is gone with this call
-    remove_file(aside)
-
-
 _LOCAL_LOCK = threading.RLock()
 _HELD = {}
 
 
-def take_reserve_file(directory):
-    """Create `.reserve.lock` exclusively (waiting for a live owner) and return its path."""
-    path = directory / '.reserve.lock'
+def try_os_lock(descriptor):
+    """Try once to take the exclusive operating-system lock on the file; True when taken."""
+    if os.name == 'nt':
+        import msvcrt
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        try:
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+    import fcntl
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
+
+
+def release_os_lock(descriptor):
+    """Unlock and close; closing alone would also release it, so a failed unlock is not an error."""
+    try:
+        if os.name == 'nt':
+            import msvcrt
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def take_os_lock(path, message):
+    """Take the exclusive operating-system lock on `path` (retrying until the deadline) and return its descriptor.
+
+    The file is created if missing (without O_EXCL) and never moved or deleted, so the lock is always on the same
+    file and needs no hard links (FAT/exFAT work). The system releases it when the owner dies, even by kill -9.
+    Every failed attempt (busy lock, or a file another process holds open without sharing) reaches the deadline
+    check, which refuses with `message`. The descriptor is closed on every path that does not return it.
+    """
     deadline = time.monotonic() + RESERVE_LOCK_SECONDS
     while True:
+        descriptor = None
         try:
-            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except (FileExistsError, PermissionError):  # PermissionError: Windows, the file is being deleted
-            try:
-                text = read_brief(path)
-                owner = int(text.strip())
-            except FileNotFoundError:
-                continue
-            except (OSError, ValueError):
-                owner, text = None, None  # still being written by its owner, or the owner crashed
-                with contextlib.suppress(OSError):
-                    text = read_brief(path)
-            if owner is not None and (not pid_alive(owner) or older_than(path, LOCK_STALE_SECONDS)):
-                # dead owner, or a lock held for minutes (it lasts milliseconds): the pid may have been reused
-                discard_if_unchanged(path, text)
-                continue
-            if owner is None and older_than_orphan(path):
-                discard_if_unchanged(path, text)  # empty or garbage for over a minute: its writer crashed
-                continue
-            require(time.monotonic() < deadline,
-                    'Não foi possível obter a trava de reserva de portas (outra reserva demorou demais). '
-                    f'Se nenhum start estiver rodando, apague {path.name} da pasta de reservas.')
-            time.sleep(0.02)
-            continue
-        with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
-            handle.write(str(os.getpid()))
-        return path
+            descriptor = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, 'O_BINARY', 0))
+            if try_os_lock(descriptor):
+                taken, descriptor = descriptor, None
+                return taken
+        except OSError:  # Windows: sharing violation while another process has the file open
+            pass
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        require(time.monotonic() < deadline, message)
+        time.sleep(0.02)
+
+
+def take_reserve_file(directory):
+    """Take the operating-system lock on `.reserve.lock` of the reservation folder and return its descriptor."""
+    return take_os_lock(directory / '.reserve.lock',
+                        f'Não foi possível obter a trava de reserva de portas em {RESERVE_LOCK_SECONDS} s: outra '
+                        'reserva a mantém. O sistema libera a trava sozinho quando o dono termina; tente de novo em '
+                        'instantes.')
 
 
 @contextlib.contextmanager
 def reservation_lock(directory):
     """Short exclusive lock so choosing and recording ports is one step across processes and threads.
 
-    Reentrant: a start that reserves several ports holds it once and never waits for itself. Releasing it must
-    work: when the file cannot be removed the failure is raised, never swallowed.
+    Reentrant: a start that reserves several ports holds it once and never waits for itself.
     """
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
@@ -661,21 +693,19 @@ def reservation_lock(directory):
             finally:
                 _HELD[key] -= 1
             return
-        path = take_reserve_file(directory)
+        descriptor = take_reserve_file(directory)
         _HELD[key] = 1
         try:
             yield
         finally:
             _HELD.pop(key, None)
-            if not remove_file(path):
-                raise Refusal(f'Não foi possível liberar a trava de reserva de portas ({path.name}): o arquivo '
-                              'continua em uso. Apague-o à mão da pasta de reservas antes de um novo start.')
+            release_os_lock(descriptor)
 
 
 def read_reservation(path):
     try:
         record = json.loads(read_brief(path))
-        return record if isinstance(record, dict) and isinstance(record.get('pid'), int) else None
+        return record if isinstance(record, dict) and valid_pid(record.get('pid')) else None
     except (OSError, ValueError):
         return None
 
@@ -690,7 +720,7 @@ def reservation_live(path):
     if record is None:
         return not older_than_orphan(path)
     child = record.get('child')
-    if same_process(record) or (isinstance(child, dict) and isinstance(child.get('pid'), int)
+    if same_process(record) or (isinstance(child, dict) and valid_pid(child.get('pid'))
                                 and same_process(child)):
         return True
     # a coordinator that died between spawning the process and recording its pid leaves a process nobody tracks:
@@ -835,7 +865,7 @@ def read_registry(root, issue):
         record = json.loads(path.read_text(encoding='utf-8'))
         require(isinstance(record.get('processes'), list), 'registro inválido')
         for entry in record['processes']:
-            require(isinstance(entry.get('pid'), int), 'registro inválido')
+            require(valid_pid(entry.get('pid')), 'registro inválido')
     except (OSError, ValueError, AttributeError, Refusal):
         raise Refusal(f'O registro da issue {issue} ({name}) está ilegível ou inválido, então start, status e '
                       f'stop não conseguem usá-lo. Confira se há processos da issue em execução, encerre-os '
@@ -852,6 +882,15 @@ def status(root, issue):
 
 
 def stop(root, issue):
+    """Stop the issue's processes under the same lock as start: a start in progress makes stop refuse."""
+    lock = acquire_lock(root, issue)
+    try:
+        return stop_locked(root, issue)
+    finally:
+        release_lock(lock)
+
+
+def stop_locked(root, issue):
     try:
         record = read_registry(root, issue)
     except Refusal as refusal:

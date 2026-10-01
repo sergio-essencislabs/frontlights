@@ -327,7 +327,7 @@ class RealConcurrencyTest(GitPortsCase):
     STARTS = 8
     ROUNDS = 3
 
-    def test_eight_simultaneous_starts_with_two_auto_processes_each_all_succeed_with_distinct_ports(self):
+    def test_simultaneous_starts_with_two_auto_processes_each_all_succeed_with_distinct_ports(self):
         self.make_repo()
         self.write_config([self.auto('web-api'), self.auto('worker', argv_port=False)])
         trees = [self.make_worktree(f'wt{number}') for number in range(self.STARTS)]
@@ -337,7 +337,7 @@ class RealConcurrencyTest(GitPortsCase):
                 issue = 100 + number
                 self.touched.append((tree, issue))
                 runs.append(self.serve_in_background(issue, root=tree))
-            outputs = [run.communicate(timeout=120) for run in runs]
+            outputs = [run.communicate(timeout=240) for run in runs]
             codes = [run.returncode for run in runs]
             self.assertEqual(codes, [0] * self.STARTS, f'rodada {round_number}: {outputs}')
             entries = [entry for out, _ in outputs for entry in json.loads(out)['processes']]
@@ -349,65 +349,204 @@ class RealConcurrencyTest(GitPortsCase):
             for number, tree in enumerate(trees):
                 self.assertEqual(self.serve('stop', 100 + number, root=tree).returncode, 0, self.last.stdout)
             self.assertEqual(list(self.shared.glob('*.json')), [])
-            self.assertFalse((self.shared / '.reserve.lock').exists(), 'a trava vazou')
-
-    def test_the_lock_is_reentrant_for_the_same_start(self):
-        directory = self.root / 'ports'
-        with mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 1):
-            with serve.reservation_lock(directory):
-                with serve.reservation_lock(directory):
-                    pass
-        self.assertFalse((directory / '.reserve.lock').exists())
-
-    def test_the_lock_is_not_released_silently_when_the_file_cannot_be_removed(self):
-        directory = self.root / 'ports'
-        real_unlink = os.unlink
-
-        def refuse(path, *args, **kwargs):
-            if os.path.basename(str(path)) == '.reserve.lock':
-                raise PermissionError('em uso')
-            return real_unlink(path, *args, **kwargs)
-
-        with mock.patch.object(os, 'unlink', refuse), mock.patch.object(os, 'remove', refuse), \
-                mock.patch.object(serve.time, 'sleep', lambda seconds: None):
-            with self.assertRaises(serve.Refusal) as caught:
-                with serve.reservation_lock(directory):
-                    pass
-        self.assertIn('trava', str(caught.exception))
-        (directory / '.reserve.lock').unlink()
+            with serve.reservation_lock(self.shared):  # a leaked lock would refuse here after the deadline
+                pass
+            self.assertEqual([path.name for path in self.shared.iterdir()], ['.reserve.lock'], 'sobrou lixo')
 
 
-class LockCase(PortsTestCase):
+class RealConcurrency12Test(RealConcurrencyTest):
+    STARTS = 12
+    ROUNDS = 1
+
+
+class RealConcurrency16Test(RealConcurrencyTest):
+    STARTS = 16
+    ROUNDS = 1
+
+
+HOLDER = r"""import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+import serve
+
+with serve.reservation_lock(Path(sys.argv[2])):
+    print('held', flush=True)
+    time.sleep(float(sys.argv[3]))
+"""
+
+# Takes the lock `loops` times, each time claiming a marker file with O_EXCL: a failed claim is a violation.
+WORKER = r"""import contextlib
+import os
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+import serve
+
+directory, marker, log = Path(sys.argv[2]), sys.argv[3], sys.argv[4]
+start_at, loops = float(sys.argv[5]), int(sys.argv[6])
+while time.time() < start_at:
+    time.sleep(0.0005)
+for _ in range(loops):
+    with serve.reservation_lock(directory):
+        try:
+            descriptor = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            os.write(os.open(log, os.O_CREAT | os.O_APPEND | os.O_WRONLY), b'V')
+        else:
+            os.close(descriptor)
+            time.sleep(0.002)
+            with contextlib.suppress(OSError):
+                os.unlink(marker)
+            os.write(os.open(log, os.O_CREAT | os.O_APPEND | os.O_WRONLY), b'K')
+"""
+
+# Windows only: opens the file with sharing mode 0 (no read, write or delete sharing) and holds it.
+EXCLUSIVE_OPEN = r"""import ctypes
+import sys
+import time
+
+kernel = ctypes.windll.kernel32
+kernel.CreateFileW.restype = ctypes.c_void_p
+handle = kernel.CreateFileW(sys.argv[1], 0x80000000 | 0x40000000, 0, None, 3, 0x80, None)
+if handle in (None, ctypes.c_void_p(-1).value):
+    sys.exit(3)
+print('open', flush=True)
+time.sleep(float(sys.argv[2]))
+"""
+
+
+class ReserveLockTest(PortsTestCase):
+    """The reservation lock is an operating-system lock on a file that is never moved or deleted."""
+
     def setUp(self):
         super().setUp()
-        self.ports = self.root / '.frontlights' / 'serve' / 'ports'
-        self.ports.mkdir(parents=True)
-        self.lock = self.ports / '.reserve.lock'
+        self.ports = self.base / 'ports'
 
+    def hold(self, seconds):
+        holder = subprocess.Popen([sys.executable, '-c', HOLDER, str(SCRIPT.parent), str(self.ports), str(seconds)],
+                                  stdout=subprocess.PIPE, text=True)
+        self.addCleanup(holder.communicate)
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline().strip(), 'held')
+        return holder
 
-class LockRecoveryTest(LockCase):
-
-    def test_a_stale_lock_of_a_dead_pid_is_cleaned(self):
-        self.lock.write_text(str(dead_pid()), encoding='utf-8')
-        with mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 3):
-            self.assertIsInstance(serve.reserve_port(self.root, 11, 'web'), int)
-        self.assertFalse(self.lock.exists())
-
-    def test_an_empty_or_garbage_old_lock_is_an_orphan_and_is_cleaned(self):
-        for content in ('', 'lixo-sem-numero'):
-            self.lock.write_text(content, encoding='utf-8')
-            old(self.lock)
-            with mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 3):
-                self.assertIsInstance(serve.reserve_port(self.root, 11, 'web'), int, content)
-            self.assertFalse(self.lock.exists())
-
-    def test_an_empty_recent_lock_is_still_being_written_so_it_is_waited_for(self):
-        self.lock.write_text('', encoding='utf-8')
+    def test_the_lock_is_reentrant_for_the_same_start(self):
         with mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 1):
+            with serve.reservation_lock(self.ports):
+                with serve.reservation_lock(self.ports):
+                    pass
+            with serve.reservation_lock(self.ports):  # released for real: it can be taken again
+                pass
+
+    def test_the_lock_is_released_and_the_descriptor_closed_when_the_body_fails(self):
+        seen = []
+        real = serve.take_reserve_file
+
+        def spying(directory):
+            descriptor = real(directory)
+            seen.append(descriptor)
+            return descriptor
+
+        with mock.patch.object(serve, 'take_reserve_file', spying), \
+                mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 1):
+            with self.assertRaises(RuntimeError):
+                with serve.reservation_lock(self.ports):
+                    raise RuntimeError('falha no corpo')
+            with serve.reservation_lock(self.ports):
+                pass
+        self.assertEqual(len(seen), 2)
+        for descriptor in seen:
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
+
+    def test_the_lock_file_is_never_deleted_and_nothing_else_is_left_in_the_folder(self):
+        with serve.reservation_lock(self.ports):
+            pass
+        self.assertEqual([path.name for path in self.ports.iterdir()], ['.reserve.lock'])
+
+    def test_whatever_a_legacy_lock_file_holds_it_is_just_taken(self):
+        self.ports.mkdir(parents=True)
+        lock = self.ports / '.reserve.lock'
+        for content, age in ((str(dead_pid()), 0), (str(os.getpid()), 3600), ('lixo', 0), ('', 3600)):
+            lock.write_text(content, encoding='utf-8')
+            if age:
+                old(lock, age)
+            started = time.monotonic()
+            with mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 5):
+                with serve.reservation_lock(self.ports):
+                    pass
+            self.assertLess(time.monotonic() - started, 2, content)
+
+    def test_the_owner_killed_in_the_middle_of_the_critical_section_frees_the_lock_at_once(self):
+        holder = self.hold(120)
+        holder.kill()  # TerminateProcess / SIGKILL: no cleanup code runs in the owner
+        holder.wait()
+        started = time.monotonic()
+        with mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 20):
+            with serve.reservation_lock(self.ports):
+                pass
+        self.assertLess(time.monotonic() - started, 5, 'esperou o prazo em vez de obter a trava ao morrer o dono')
+
+    def test_a_lock_held_by_another_process_past_the_deadline_is_refused_in_about_that_time(self):
+        self.hold(120)
+        started = time.monotonic()
+        with mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 1.5):
             with self.assertRaises(serve.Refusal) as caught:
-                serve.reserve_port(self.root, 11, 'web')
+                with serve.reservation_lock(self.ports):
+                    self.fail('obteve a trava de outro processo')
+        elapsed = time.monotonic() - started
+        self.assertGreaterEqual(elapsed, 1.4)
+        self.assertLess(elapsed, 6)
+        self.assertIn('trava de reserva de portas', str(caught.exception))
+        self.assertIn('1.5', str(caught.exception))
+
+    @unittest.skipUnless(os.name == 'nt', 'abertura sem compartilhamento só existe no Windows')
+    def test_a_lock_file_open_without_sharing_by_another_process_is_refused_within_the_deadline(self):
+        self.ports.mkdir(parents=True)
+        lock = self.ports / '.reserve.lock'
+        lock.write_text('', encoding='utf-8')
+        old(lock, 3600)
+        holder = subprocess.Popen([sys.executable, '-c', EXCLUSIVE_OPEN, str(lock), '60'], stdout=subprocess.PIPE,
+                                  text=True)
+        self.addCleanup(holder.communicate)
+        self.addCleanup(holder.kill)
+        self.assertEqual(holder.stdout.readline().strip(), 'open')
+        started = time.monotonic()
+        with mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 1.5):
+            with self.assertRaises(serve.Refusal) as caught:
+                with serve.reservation_lock(self.ports):
+                    self.fail('obteve a trava de um arquivo aberto sem compartilhamento')
+        self.assertLess(time.monotonic() - started, 6, 'o laço ignorou o prazo')
         self.assertIn('trava de reserva', str(caught.exception))
-        self.assertTrue(self.lock.exists())
+
+    def test_many_processes_never_share_the_critical_section_with_fresh_stale_or_missing_lock_files(self):
+        rounds, workers, loops = 25, 6, 6
+        self.ports.mkdir(parents=True)
+        lock = self.ports / '.reserve.lock'
+        marker = self.base / 'marker'
+        log = self.base / 'log'
+        for number in range(rounds):
+            lock.unlink(missing_ok=True)
+            marker.unlink(missing_ok=True)
+            log.unlink(missing_ok=True)
+            if number % 3 == 0:  # a leftover from the old mechanism, dead owner, long ago
+                lock.write_text(str(dead_pid()), encoding='utf-8')
+                old(lock, 3600)
+            elif number % 3 == 1:  # a lock file with a fresh live pid in it
+                lock.write_text(str(os.getpid()), encoding='utf-8')
+            start_at = time.time() + 2.5
+            runs = [subprocess.Popen([sys.executable, '-c', WORKER, str(SCRIPT.parent), str(self.ports), str(marker),
+                                      str(log), str(start_at), str(loops)], stderr=subprocess.PIPE, text=True)
+                    for _ in range(workers)]
+            errors = [run.communicate(timeout=120)[1] for run in runs]
+            self.assertEqual([run.returncode for run in runs], [0] * workers, errors)
+            outcome = log.read_bytes()
+            self.assertEqual(outcome.count(b'V'), 0, f'rodada {number}: seção crítica violada {outcome!r}')
+            self.assertEqual(outcome.count(b'K'), workers * loops, f'rodada {number}')
 
 
 class ReservationRulesTest(GitPortsCase):
@@ -660,54 +799,6 @@ class NameCollisionScopeTest(PortsTestCase):
         self.assertEqual(self.payload(done)['category'], 'uso')
 
 
-class StaleLockAgeTest(LockCase):
-    def test_an_old_lock_of_a_live_unrelated_pid_is_an_orphan_and_is_cleaned(self):
-        self.lock.write_text(str(os.getpid()), encoding='utf-8')
-        old(self.lock, 3600)
-        with mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 3):
-            self.assertIsInstance(serve.reserve_port(self.root, 11, 'web'), int)
-        self.assertFalse(self.lock.exists())
-
-    def test_a_recent_lock_of_a_live_pid_is_still_waited_for(self):
-        self.lock.write_text(str(os.getpid()), encoding='utf-8')
-        with mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 1):
-            with self.assertRaises(serve.Refusal):
-                serve.reserve_port(self.root, 11, 'web')
-        self.assertEqual(self.lock.read_text(encoding='utf-8'), str(os.getpid()))
-
-
-class RecreatedLockTest(LockCase):
-    """A lock recreated by a live start between the staleness judgement and the removal must survive."""
-
-    def run_with_recreation(self, after_read):
-        holder = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
-        self.addCleanup(holder.kill)
-        self.lock.write_text(str(dead_pid()), encoding='utf-8')
-        real = serve.read_brief
-        reads = []
-
-        def hooked(path, *args, **kwargs):
-            text = real(path, *args, **kwargs)
-            if os.path.basename(str(path)).startswith('.reserve.lock'):
-                reads.append(path)
-                if len(reads) == after_read:
-                    self.lock.write_text(str(holder.pid), encoding='utf-8')
-            return text
-
-        with mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 1), mock.patch.object(serve, 'read_brief', hooked):
-            with self.assertRaises(serve.Refusal) as caught:
-                serve.reserve_port(self.root, 11, 'web')
-        self.assertIn('trava de reserva', str(caught.exception))
-        self.assertEqual(self.lock.read_text(encoding='utf-8'), str(holder.pid), 'a trava recriada foi apagada')
-        self.assertEqual([path.name for path in self.ports.iterdir()], ['.reserve.lock'], 'sobrou arquivo de lixo')
-
-    def test_a_lock_recreated_right_after_the_second_check_is_not_removed(self):
-        self.run_with_recreation(2)
-
-    def test_a_lock_recreated_right_after_the_first_judgement_is_not_removed(self):
-        self.run_with_recreation(1)
-
-
 class SpawnWindowTest(PortsTestCase):
     def test_a_start_that_dies_between_spawn_and_recording_the_child_keeps_the_port_for_a_while(self):
         self.write_config([self.auto('web-api')])
@@ -908,6 +999,302 @@ class SingleAcquisitionTest(PortsTestCase):
             ports = serve.reserve_ports(self.root, 11, ['web', 'worker'])
         self.assertEqual(len(set(ports.values())), 2)
         self.assertEqual(len(taken), 1)
+
+
+BAD_PIDS = (2 ** 40, 10 ** 30, -1, -2 ** 40, 0, True, False, '123', 1.5, None, [1])
+
+
+class InvalidPidTest(PortsTestCase):
+    """A pid outside 1..2**31-1 (or not an integer) is unreadable data, never a crash."""
+
+    def setUp(self):
+        super().setUp()
+        self.ports = self.root / '.frontlights' / 'serve' / 'ports'
+        self.ports.mkdir(parents=True)
+
+    def reservation(self, **fields):
+        port = free_port()
+        path = self.ports / f'{port}.json'
+        path.write_text(json.dumps(dict({'issue': 5, 'process': 'p', 'root': 'x'}, **fields)), encoding='utf-8')
+        return port, path
+
+    def test_a_reservation_with_an_invalid_pid_is_unreadable_so_recent_is_live_and_old_is_an_orphan(self):
+        for value in BAD_PIDS:
+            port, path = self.reservation(pid=value)
+            self.assertIsNone(serve.read_reservation(path), repr(value))
+            self.assertTrue(serve.reservation_live(path), repr(value))
+            free = free_port()
+            with mock.patch.object(serve, 'candidate_ports', lambda: iter([port, free])):
+                self.assertEqual(serve.reserve_port(self.root, 11, 'web'), free, repr(value))
+            (self.ports / f'{free}.json').unlink()
+            old(path)
+            self.assertFalse(serve.reservation_live(path), repr(value))
+            with mock.patch.object(serve, 'candidate_ports', lambda: iter([port])):
+                self.assertEqual(serve.reserve_port(self.root, 11, 'web'), port, repr(value))
+            path.unlink()
+
+    def test_a_reservation_whose_child_has_an_invalid_pid_ignores_the_child(self):
+        for value in BAD_PIDS:
+            _, path = self.reservation(pid=dead_pid(), child={'pid': value, 'identity': 'x'})
+            self.assertFalse(serve.reservation_live(path), repr(value))
+
+    def test_the_valid_range_accepts_the_edges(self):
+        self.assertTrue(serve.valid_pid(1))
+        self.assertTrue(serve.valid_pid(2 ** 31 - 1))
+        for value in BAD_PIDS + (2 ** 31,):
+            self.assertFalse(serve.valid_pid(value), repr(value))
+
+    def test_a_registry_with_an_invalid_pid_is_refused_as_unreadable(self):
+        path = self.root / '.frontlights' / 'serve' / '11.json'
+        for value in BAD_PIDS:
+            path.write_text(json.dumps({'issue': 11, 'processes': [{'name': 'p', 'pid': value}]}), encoding='utf-8')
+            with self.assertRaises(serve.Refusal) as caught:
+                serve.read_registry(self.root, 11)
+            self.assertIn('ilegível', str(caught.exception), repr(value))
+
+    def test_an_issue_lock_with_an_invalid_pid_is_refused_as_unreadable_without_a_traceback(self):
+        self.write_config([self.auto('web-api')])
+        lock = self.root / '.frontlights' / 'serve' / '11.lock'
+        for text in ('1099511627776', '1' + '0' * 30, '-5', '0', '2147483648'):
+            lock.write_text(text, encoding='utf-8')
+            done = self.serve('start')
+            self.assertEqual(done.returncode, 1, (text, done.stdout, done.stderr))
+            self.assertNotIn('Traceback', done.stderr, text)
+            result = self.payload(done)
+            self.assertIn('ilegível', result['error'], text)
+            self.assertIn('11.lock', result['error'], text)
+
+
+SLOW_START = r"""import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+import serve
+
+config, root, flags = sys.argv[2], sys.argv[3], Path(sys.argv[4])
+real = serve.spawn
+
+
+def slow(*args, **kwargs):
+    (flags / 'before-spawn').write_text('x')
+    while not (flags / 'go').exists():
+        time.sleep(0.05)
+    return real(*args, **kwargs)
+
+
+serve.spawn = slow
+sys.exit(serve.main(['start', '--config', config, '--root', root, '--issue', '11']))
+"""
+
+
+class StopDuringStartTest(PortsTestCase):
+    def test_stop_during_a_slow_start_of_the_same_issue_is_refused_and_keeps_the_live_reservation(self):
+        self.write_config([self.auto('web-api')])
+        flags = self.base / 'flags'
+        flags.mkdir()
+        ports = self.root / '.frontlights' / 'serve' / 'ports'
+        start = subprocess.Popen([sys.executable, '-c', SLOW_START, str(SCRIPT.parent), str(self.config),
+                                  str(self.root), str(flags)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 text=True, encoding='utf-8')
+        self.addCleanup(start.communicate)
+        self.addCleanup(start.kill)
+        self.assertTrue(wait_until(lambda: (flags / 'before-spawn').exists(), 30), 'o start não chegou ao spawn')
+        reserved = [path.name for path in ports.glob('*.json')]
+        self.assertEqual(len(reserved), 1, reserved)
+        done = self.serve('stop')
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn('em andamento', self.payload(done)['error'])
+        self.assertEqual([path.name for path in ports.glob('*.json')], reserved, 'o stop apagou a reserva viva')
+        (flags / 'go').write_text('x')
+        out, err = start.communicate(timeout=120)
+        self.assertEqual(start.returncode, 0, out + err)
+        entry = json.loads(out)['processes'][0]
+        self.assertEqual([path.name for path in ports.glob('*.json')], [f'{entry["port"]}.json'])
+        self.assertEqual(fetch(entry['url']).split('|')[0], str(entry['port']))
+        done = self.serve('stop')
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertEqual(self.payload(done)['reservas_liberadas'], [entry['port']])
+        self.assertFalse((self.root / '.frontlights' / 'serve' / '11.lock').exists(), 'a trava da issue vazou')
+
+    def test_stop_of_another_issue_is_not_blocked_by_a_start_in_progress(self):
+        self.write_config([self.auto('web-api')])
+        flags = self.base / 'flags'
+        flags.mkdir()
+        start = subprocess.Popen([sys.executable, '-c', SLOW_START, str(SCRIPT.parent), str(self.config),
+                                  str(self.root), str(flags)], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 text=True, encoding='utf-8')
+        self.addCleanup(start.communicate)
+        self.addCleanup(start.kill)
+        self.assertTrue(wait_until(lambda: (flags / 'before-spawn').exists(), 30))
+        done = self.serve('stop', issue=12)
+        self.assertNotIn('em andamento', done.stdout)
+        (flags / 'go').write_text('x')
+        out, err = start.communicate(timeout=120)
+        self.assertEqual(start.returncode, 0, out + err)
+
+
+class FakeHttpServer:
+    """Accepts connections and answers each with fixed raw bytes, then closes."""
+
+    def __init__(self, payload):
+        self.payload = payload
+        self.listener = socket.socket()
+        self.listener.bind(('127.0.0.1', 0))
+        self.listener.listen()
+        self.port = self.listener.getsockname()[1]
+        self.thread = threading.Thread(target=self.serve, daemon=True)
+        self.thread.start()
+
+    def serve(self):
+        while True:
+            try:
+                connection, _ = self.listener.accept()
+            except OSError:
+                return
+            with connection:
+                try:
+                    connection.settimeout(1)
+                    connection.recv(4096)
+                    connection.sendall(self.payload)
+                except OSError:
+                    pass
+
+    def close(self):
+        self.listener.close()
+
+
+class MalformedAnswerTest(PortsTestCase):
+    PAYLOADS = (b'LIXO SEM STATUS\r\n\r\n', b'HTTP/1.1 200 OK\r\n' + b'X' * 70000, b'\x00\x01\x02\xff',
+                b'HTTP/1.1 999999 X\r\n\r\n')
+
+    def test_a_server_that_answers_garbage_is_not_healthy_and_never_raises(self):
+        for payload in self.PAYLOADS:
+            server = FakeHttpServer(payload)
+            self.addCleanup(server.close)
+            self.assertFalse(serve.healthy(f'http://127.0.0.1:{server.port}/'), payload[:20])
+
+    def test_wait_healthy_turns_a_garbage_answer_into_a_refusal_not_a_traceback(self):
+        server = FakeHttpServer(self.PAYLOADS[0])
+        self.addCleanup(server.close)
+        child = types.SimpleNamespace(poll=lambda: None, returncode=None)
+        item = {'name': 'web', 'health': f'http://127.0.0.1:{server.port}/', 'timeoutSeconds': 1}
+        with self.assertRaises(serve.Refusal) as caught:
+            serve.wait_healthy(child, item)
+        self.assertIn('não ficou saudável', str(caught.exception))
+        self.assertEqual(caught.exception.process, 'web')
+
+
+# Tries to take the issue lock of issue 11 and, when it wins, holds it for argv[3] seconds.
+COMPETITOR = r"""import sys
+import time
+
+sys.path.insert(0, sys.argv[1])
+import serve
+
+sys.stdout.reconfigure(encoding='utf-8')
+try:
+    lock = serve.acquire_lock(sys.argv[2], 11)
+except serve.Refusal as refusal:
+    print('refused ' + str(refusal), flush=True)
+    sys.exit(0)
+print('won', flush=True)
+time.sleep(float(sys.argv[3]))
+serve.release_lock(lock)
+"""
+
+
+class IssueLockTest(PortsTestCase):
+    """The per-issue lock taken by start and stop: one owner even when a stale lock is replaced concurrently."""
+
+    def setUp(self):
+        super().setUp()
+        self.lock = self.root / '.frontlights' / 'serve' / '11.lock'
+        self.lock.parent.mkdir(parents=True)
+
+    def test_a_stale_lock_replaced_while_another_caller_competes_ends_with_a_single_owner(self):
+        self.lock.write_text(str(dead_pid()), encoding='utf-8')
+        real_unlink = os.unlink
+        lines = []
+        competitors = []
+
+        def hooked(path, *args, **kwargs):
+            if os.path.basename(str(path)) == '11.lock' and not competitors:
+                # right before the stale lock is removed, another start/stop of the issue competes for it
+                competitor = subprocess.Popen([sys.executable, '-c', COMPETITOR, str(SCRIPT.parent), str(self.root),
+                                               '4'], stdout=subprocess.PIPE, text=True, encoding='utf-8')
+                competitors.append(competitor)
+                reader = threading.Thread(target=lambda: lines.append(competitor.stdout.readline().strip()),
+                                          daemon=True)
+                reader.start()
+                reader.join(3)  # time enough for it to win, if nothing stops it
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(os, 'unlink', hooked):
+            mine = serve.acquire_lock(self.root, 11)
+        self.addCleanup(competitors[0].kill)
+        try:
+            self.assertEqual(lines, [], 'o concorrente também virou dono da trava da issue')
+            self.assertEqual(self.lock.read_text(encoding='utf-8'), str(os.getpid()))
+            self.assertTrue(wait_until(lambda: lines, 30), 'o concorrente não respondeu')
+            self.assertTrue(lines[0].startswith('refused'), lines)
+            self.assertIn('em andamento', lines[0])
+        finally:
+            serve.release_lock(mine)
+        competitors[0].communicate(timeout=30)
+        self.assertFalse(self.lock.exists())
+
+    def test_a_lock_being_deleted_by_its_owner_is_retried_not_a_traceback(self):
+        real_open = os.open
+        refusals = []
+
+        def deleting(path, flags, *args, **kwargs):
+            if os.path.basename(str(path)) == '11.lock' and flags & os.O_EXCL and len(refusals) < 3:
+                refusals.append(path)
+                raise PermissionError('arquivo sendo apagado')
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(os, 'open', deleting):
+            mine = serve.acquire_lock(self.root, 11)
+        self.assertEqual(len(refusals), 3)
+        self.assertEqual(self.lock.read_text(encoding='utf-8'), str(os.getpid()))
+        serve.release_lock(mine)
+        self.assertFalse(self.lock.exists())
+
+    def test_a_lock_that_stays_undeletable_is_refused_within_the_deadline(self):
+        self.lock.write_text(str(os.getpid()), encoding='utf-8')
+        real_read = Path.read_text
+
+        def being_deleted(path, *args, **kwargs):
+            if path.name == '11.lock':
+                raise PermissionError('arquivo sendo apagado')
+            return real_read(path, *args, **kwargs)
+
+        started = time.monotonic()
+        with mock.patch.object(Path, 'read_text', being_deleted), mock.patch.object(serve, 'RESERVE_LOCK_SECONDS', 1):
+            with self.assertRaises(serve.Refusal) as caught:
+                serve.acquire_lock(self.root, 11)
+        self.assertLess(time.monotonic() - started, 6)
+        self.assertIn('11.lock', str(caught.exception))
+
+    def test_a_lock_read_while_its_owner_deletes_it_is_retried_not_called_unreadable(self):
+        self.lock.write_text(str(os.getpid()), encoding='utf-8')
+        real_read = Path.read_text
+
+        def deleted_meanwhile(path, *args, **kwargs):
+            if path.name == '11.lock':
+                os.unlink(path)  # the owner finished and removed it; Windows answers the read with access denied
+                raise PermissionError('arquivo sendo apagado')
+            return real_read(path, *args, **kwargs)
+
+        with mock.patch.object(Path, 'read_text', deleted_meanwhile):
+            mine = serve.acquire_lock(self.root, 11)
+        self.assertEqual(real_read(self.lock, encoding='utf-8'), str(os.getpid()))
+        serve.release_lock(mine)
+
+    def test_the_guard_file_is_the_only_thing_left_besides_the_records(self):
+        serve.release_lock(serve.acquire_lock(self.root, 11))
+        self.assertEqual([path.name for path in self.lock.parent.iterdir()], ['.locks.guard'])
 
 
 if __name__ == '__main__':
