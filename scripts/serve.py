@@ -34,6 +34,9 @@ import urllib.request
 POLL_SECONDS = 0.2
 DEFAULT_TIMEOUT = 60
 INFRASTRUCTURE = 'infraestrutura'
+USAGE = 'uso'
+UNKNOWN_IDENTITY = 'desconhecida'
+BATCH_UNSAFE = '&|^%<>!"'
 
 _SECRETS = []
 
@@ -41,14 +44,15 @@ _SECRETS = []
 class Refusal(Exception):
     """A deliberate refusal: the message is safe to show the user."""
 
-    def __init__(self, message, process=None):
+    def __init__(self, message, process=None, category=None):
         super().__init__(message)
         self.process = process
+        self.category = category or INFRASTRUCTURE
 
 
-def require(condition, message, process=None):
+def require(condition, message, process=None, category=None):
     if not condition:
-        raise Refusal(message, process)
+        raise Refusal(message, process, category)
 
 
 def now_iso():
@@ -62,12 +66,23 @@ def protect(text):
     return text
 
 
+def scrub(value):
+    """Apply protect to every string of a JSON-like value (keys included)."""
+    if isinstance(value, str):
+        return protect(value)
+    if isinstance(value, list):
+        return [scrub(item) for item in value]
+    if isinstance(value, dict):
+        return {scrub(key): scrub(item) for key, item in value.items()}
+    return value
+
+
 def write_json_atomic(value, path):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.parent / f'.{path.name}.{secrets.token_hex(8)}.tmp'
     try:
-        temporary.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding='utf-8')
+        temporary.write_text(json.dumps(scrub(value), indent=2, ensure_ascii=False), encoding='utf-8')
         os.replace(temporary, path)
     finally:
         if temporary.exists():
@@ -87,7 +102,8 @@ def load_block(config_file):
         if isinstance(user, dict):
             for key in ('login', 'password'):
                 if isinstance(user.get(key), str):
-                    _SECRETS.append(user[key])
+                    _SECRETS.extend([user[key], urllib.parse.quote(user[key], safe=''),
+                                     urllib.parse.quote_plus(user[key])])
     processes = block.get('processes')
     require(isinstance(processes, list) and processes, 'browserTest.processes precisa ser uma lista não vazia.')
     names = set()
@@ -173,6 +189,17 @@ def wait_healthy(child, item):
     raise Refusal(f'O processo {item["name"]} não ficou saudável em {timeout} s.', item['name'])
 
 
+def guard_batch(argv, name):
+    """On Windows a .cmd/.bat runs through cmd.exe, which would interpret shell metacharacters."""
+    if os.name != 'nt':
+        return
+    executable = shutil.which(argv[0]) or ''
+    if executable.lower().endswith(('.cmd', '.bat')):
+        require(not any(char in part for part in argv[1:] for char in BATCH_UNSAFE),
+                f'O processo {name} usa um .cmd/.bat (via cmd.exe): o argv não pode ter '
+                f'metacaracteres de shell ({BATCH_UNSAFE}).', name)
+
+
 def kill_tree(pid):
     if os.name == 'nt':
         subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'], capture_output=True, timeout=60)
@@ -194,7 +221,8 @@ def pid_alive(pid):
             return False
         try:
             code = ctypes.c_ulong()
-            return bool(kernel.GetExitCodeProcess(ctypes.c_void_p(handle), ctypes.byref(code)))                 and code.value == 259  # STILL_ACTIVE
+            ok = kernel.GetExitCodeProcess(ctypes.c_void_p(handle), ctypes.byref(code))
+            return bool(ok) and code.value == 259  # STILL_ACTIVE
         finally:
             kernel.CloseHandle(ctypes.c_void_p(handle))
     try:
@@ -206,6 +234,50 @@ def pid_alive(pid):
     return True
 
 
+def process_identity(pid):
+    """Creation time of a process as a string, or None when the platform cannot tell."""
+    if os.name == 'nt':
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.windll.kernel32
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not handle:
+            return None
+        try:
+            created, spent, kernel_time, user_time = (wintypes.FILETIME() for _ in range(4))
+            if not kernel.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(spent),
+                                          ctypes.byref(kernel_time), ctypes.byref(user_time)):
+                return None
+            return str((created.dwHighDateTime << 32) | created.dwLowDateTime)
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        fields = Path(f'/proc/{pid}/stat').read_text().rpartition(')')[2].split()
+        return fields[19]  # field 22: start time in clock ticks since boot
+    except (OSError, IndexError):
+        pass
+    try:
+        done = subprocess.run(['ps', '-o', 'lstart=', '-p', str(pid)], capture_output=True, text=True,
+                              timeout=10, env=dict(os.environ, LC_ALL='C'))
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout.strip() or None
+
+
+def same_process(entry):
+    """True when the recorded pid is alive and (as far as known) is still the recorded process."""
+    if not pid_alive(entry['pid']):
+        return False
+    recorded, current = entry.get('identity'), process_identity(entry['pid'])
+    if recorded in (None, UNKNOWN_IDENTITY) or current is None:
+        return True  # cannot tell: assume alive for refusing a start; never used to kill
+    return recorded == current
+
+
 # ---------------------------------------------------------------- operations
 
 def registry_path(root, issue):
@@ -214,20 +286,34 @@ def registry_path(root, issue):
 
 def start(config_file, root, issue):
     processes = load_block(config_file)
+    if registry_path(root, issue).is_file():
+        previous = read_registry(root, issue)
+        require(not any(same_process(entry) for entry in previous['processes']),
+                f'Já há processos em execução para a issue {issue}: rode stop antes de um novo start.',
+                category=USAGE)
     started = []
     try:
         for item in processes:
             cwd = process_cwd(root, item)
+            guard_batch(item['argv'], item['name'])
             try:
                 child = spawn(item['argv'], cwd)
             except OSError:
                 raise Refusal(f'Não foi possível iniciar o processo {item["name"]}.', item['name'])
             started.append({'name': item['name'], 'pid': child.pid, 'port': process_port(item),
-                            'url': item['health'], 'startedAt': now_iso()})
+                            'url': item['health'], 'startedAt': now_iso(),
+                            'identity': process_identity(child.pid) or UNKNOWN_IDENTITY})
             wait_healthy(child, item)
-    except BaseException:
+    except BaseException as failure:
+        left = []
         for entry in reversed(started):
-            kill_tree(entry['pid'])
+            try:
+                kill_tree(entry['pid'])
+            except Exception:
+                left.append(f'{entry["name"]} (pid {entry["pid"]})')
+        if left and isinstance(failure, Refusal):
+            raise Refusal(f'{failure} Não foi possível derrubar: {", ".join(left)}.',
+                          failure.process, failure.category)
         raise
     write_json_atomic({'issue': issue, 'root': str(Path(root).resolve()), 'processes': started},
                       registry_path(root, issue))
@@ -249,7 +335,7 @@ def read_registry(root, issue):
 
 def status(root, issue):
     record = read_registry(root, issue)
-    processes = [dict(entry, alive=pid_alive(entry['pid'])) for entry in record['processes']]
+    processes = [scrub(dict(entry, alive=same_process(entry))) for entry in record['processes']]
     return {'ok': True, 'issue': issue, 'running': all(entry['alive'] for entry in processes),
             'processes': processes}
 
@@ -257,12 +343,27 @@ def status(root, issue):
 def stop(root, issue):
     record = read_registry(root, issue)
     stopped = []
+    for entry in record['processes']:  # check every identity first, so a refusal kills nothing
+        if pid_alive(entry['pid']):
+            recorded, current = entry.get('identity'), process_identity(entry['pid'])
+            require(recorded not in (None, UNKNOWN_IDENTITY) and current is not None,
+                    f'Identidade desconhecida do processo {entry.get("name")} (pid {entry["pid"]}): '
+                    'não foi encerrado para não derrubar um processo alheio; confira e encerre manualmente.')
     for entry in record['processes']:
-        kill_tree(entry['pid'])
-        deadline = time.monotonic() + 15
-        while pid_alive(entry['pid']) and time.monotonic() < deadline:
-            time.sleep(POLL_SECONDS)
-        stopped.append({'name': entry.get('name'), 'pid': entry['pid'], 'stopped': not pid_alive(entry['pid'])})
+        item = {'name': entry.get('name'), 'pid': entry['pid']}
+        if not pid_alive(entry['pid']):
+            stopped.append(dict(item, stopped=True))
+        elif process_identity(entry['pid']) != entry.get('identity'):
+            # the pid now belongs to another process: the recorded one is already gone
+            stopped.append(dict(item, stopped=True, reused=True))
+        else:
+            # Limit: only the recorded root pid is confirmed dead; grandchildren rely on taskkill /T
+            # (Windows) or the process group (POSIX), since the standard library cannot list them.
+            kill_tree(entry['pid'])
+            deadline = time.monotonic() + 15
+            while pid_alive(entry['pid']) and time.monotonic() < deadline:
+                time.sleep(POLL_SECONDS)
+            stopped.append(dict(item, stopped=not pid_alive(entry['pid'])))
     require(all(item['stopped'] for item in stopped),
             'Nem todos os processos foram encerrados; o registro foi mantido para nova tentativa.')
     registry_path(root, issue).unlink()
@@ -290,11 +391,11 @@ def main(argv=None):
         result = run(args.operation, args.config, args.root, args.issue)
         code = 0
     except Refusal as refusal:
-        result = {'ok': False, 'error': protect(str(refusal)), 'category': INFRASTRUCTURE}
+        result = {'ok': False, 'error': protect(str(refusal)), 'category': refusal.category}
         if refusal.process:
             result['failedProcess'] = refusal.process
         code = 1
-    print(protect(json.dumps(result, ensure_ascii=False)))
+    print(protect(json.dumps(scrub(result), ensure_ascii=False)))
     return code
 
 
