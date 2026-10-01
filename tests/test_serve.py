@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import os
 import socket
@@ -96,10 +98,10 @@ class ServeTestCase(unittest.TestCase):
         self.config = Path(self.tmp.name) / 'config.json'
         self.addCleanup(self.serve, 'stop')
 
-    def write_config(self, processes):
+    def write_config(self, processes, login=LOGIN, password=PASSWORD, path=None):
         block = {'processes': processes, 'baseUrl': 'http://127.0.0.1:1',
-                 'users': [{'login': LOGIN, 'password': PASSWORD}]}
-        self.config.write_text(json.dumps({'repository': 'OWNER/REPOSITORY', 'roads': None,
+                 'users': [{'login': login, 'password': password}]}
+        (path or self.config).write_text(json.dumps({'repository': 'OWNER/REPOSITORY', 'roads': None,
                                            'browserTest': block}), encoding='utf-8')
 
     def web(self, name, port=None, **extra):
@@ -115,6 +117,11 @@ class ServeTestCase(unittest.TestCase):
                               capture_output=True, text=True, encoding='utf-8', timeout=120)
         self.last = done
         return done
+
+    def serve_in_background(self, config, issue=9):
+        return subprocess.Popen([sys.executable, str(SCRIPT), 'start', '--config', str(config),
+                                 '--root', str(self.root), '--issue', str(issue)],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
 
     def payload(self, done):
         return json.loads(done.stdout)
@@ -404,6 +411,167 @@ class SecretTest(ServeTestCase):
         self.assertIn('"ok"', everything)
         self.assertNotIn(PASSWORD, everything)
         self.assertNotIn(LOGIN, everything)
+
+
+class SecretMaskingTest(ServeTestCase):
+    def test_a_login_or_password_shorter_than_four_characters_is_refused_before_starting_anything(self):
+        entry = self.web('web')
+        for login, password in (('abc', PASSWORD), (LOGIN, 'xy'), ('a', 'e')):
+            with self.subTest(login=login, password=password):
+                self.write_config([entry], login=login, password=password)
+                done = self.serve('start')
+                self.assertEqual(done.returncode, 1, done.stdout)
+                result = self.payload(done)
+                self.assertEqual(result['category'], 'uso')
+                self.assertIn('mascar', result['error'])
+                self.assertFalse(self.registry().exists())
+                self.assertFalse(reachable(entry['health']), 'um processo subiu apesar da recusa')
+                self.serve('stop')
+
+    def test_a_secret_that_is_a_substring_of_a_key_keeps_the_structure_and_the_registry_readable(self):
+        for secret in ('name', 'port', 'dact', 'redacted'):
+            with self.subTest(secret=secret):
+                entry = self.web('web')
+                self.write_config([entry], login='usuario1@exemplo.test', password=secret)
+                done = self.serve('start')
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                started = self.payload(done)
+                self.assertEqual(set(started['processes'][0]),
+                                 {'name', 'pid', 'port', 'url', 'startedAt', 'identity'})
+                registry = json.loads(self.registry().read_text(encoding='utf-8'))
+                self.assertIn('name', registry['processes'][0])
+                status = self.serve('status')
+                self.assertEqual(status.returncode, 0, status.stdout)
+                self.assertTrue(self.payload(status)['running'])
+                self.assertLess(len(status.stdout), 1500, 'a saída cresceu além do esperado')
+                done = self.serve('stop')
+                self.assertEqual(done.returncode, 0, done.stdout)
+                self.assertTrue(wait_until(lambda: not reachable(entry['health'])))
+
+    def test_masking_is_one_pass_and_never_grows_the_text(self):
+        serve._SECRETS[:] = ['dact', 'e', 'name']
+        self.addCleanup(serve._SECRETS.clear)
+        once = serve.protect('name=dact e')
+        self.assertEqual(serve.protect(once), once)
+        self.assertEqual(serve.scrub({'name': 'dact'}), {'name': '[redacted]'})
+
+    def test_percent_encoded_forms_of_login_and_password_stay_out_of_registry_and_output(self):
+        login, password = 'ana@exemplo.test', 'p@ss w+rd'
+        port = free_port()
+        script = Path(self.tmp.name) / 'any_args_server.py'
+        script.write_text(ANY_ARGS_SERVER, encoding='utf-8')
+        health = f'http://127.0.0.1:{port}/?u=ana%40exemplo.test&p=p%40ss+w%2Brd&q=p%40ss%20w%2Brd'
+        self.write_config([{'name': 'web', 'port': port, 'timeoutSeconds': 20, 'health': health,
+                            'argv': [sys.executable, str(script), str(port)]}], login=login, password=password)
+        done = self.serve('start')
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        outputs = [done.stdout, done.stderr, self.registry().read_text(encoding='utf-8')]
+        done = self.serve('status')
+        outputs += [done.stdout, done.stderr]
+        everything = NEWLINE.join(outputs)
+        for form in ('ana%40exemplo.test', 'p%40ss+w%2Brd', 'p%40ss%20w%2Brd'):
+            self.assertNotIn(form, everything)
+        self.assertIn('redacted', everything)
+
+
+class LockTest(ServeTestCase):
+    def lock(self):
+        return self.root / '.frontlights' / 'serve' / '9.lock'
+
+    def test_two_concurrent_starts_for_the_same_issue_leave_exactly_one_winner_and_no_orphan(self):
+        first, second = self.web('web'), self.web('api')
+        other_config = Path(self.tmp.name) / 'other.json'
+        self.write_config([first])
+        self.write_config([second], path=other_config)
+        runs = [self.serve_in_background(self.config), self.serve_in_background(other_config)]
+        outputs = [run.communicate(timeout=120) for run in runs]
+        self.assertEqual(sorted(run.returncode for run in runs), [0, 1], outputs)
+        winner = first if runs[0].returncode == 0 else second
+        loser = second if winner is first else first
+        record = json.loads(self.registry().read_text(encoding='utf-8'))
+        self.assertEqual([entry['port'] for entry in record['processes']], [winner['port']])
+        self.assertTrue(reachable(winner['health']))
+        self.assertFalse(reachable(loser['health']), 'o start recusado deixou um processo órfão')
+        self.assertFalse(self.lock().exists())
+
+    def test_a_stale_lock_of_a_dead_owner_is_replaced_and_removed_at_the_end(self):
+        gone = subprocess.Popen([sys.executable, '-c', 'pass'])
+        gone.wait()
+        self.lock().parent.mkdir(parents=True)
+        self.lock().write_text(str(gone.pid), encoding='utf-8')
+        self.write_config([self.web('web')])
+        done = self.serve('start')
+        self.assertEqual(done.returncode, 0, done.stdout)
+        self.assertFalse(self.lock().exists())
+
+    def test_an_unreadable_lock_refuses_and_names_the_file_to_delete(self):
+        self.lock().parent.mkdir(parents=True)
+        self.lock().write_text('lixo', encoding='utf-8')
+        entry = self.web('web')
+        self.write_config([entry])
+        done = self.serve('start')
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn('9.lock', self.payload(done)['error'])
+        self.assertIn('apague', self.payload(done)['error'])
+        self.assertFalse(reachable(entry['health']))
+        self.assertTrue(self.lock().exists())
+
+    def test_the_registry_is_written_as_each_process_starts(self):
+        slow = self.web('slow', health='http://127.0.0.1:%d/' % free_port(), timeoutSeconds=30)
+        self.write_config([self.web('web'), slow])
+        run = self.serve_in_background(self.config)
+        self.addCleanup(run.communicate)
+        self.addCleanup(run.kill)
+        self.assertTrue(wait_until(lambda: self.registry().is_file()), 'o registro não apareceu durante o start')
+        self.assertEqual(self.serve('status').returncode, 0)
+        run.kill()
+        run.communicate()
+        self.assertEqual(self.serve('stop').returncode, 0, self.last.stdout)
+
+    def test_a_corrupt_registry_message_names_the_file_to_delete(self):
+        self.write_config([self.web('web')])
+        self.registry().parent.mkdir(parents=True, exist_ok=True)
+        self.registry().write_text('{quebrado', encoding='utf-8')
+        for command in ('status', 'start'):
+            done = self.serve(command)
+            self.assertEqual(done.returncode, 1)
+            self.assertIn('9.json', self.payload(done)['error'])
+            self.assertIn('apague', self.payload(done)['error'])
+
+
+class KillVerificationTest(ServeTestCase):
+    def test_stop_reports_what_did_not_die_when_the_kill_returns_without_killing(self):
+        survivor = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)'])
+        self.addCleanup(survivor.wait)
+        self.addCleanup(survivor.kill)
+        self.assertTrue(wait_until(lambda: serve.pid_alive(survivor.pid)))
+        self.registry().parent.mkdir(parents=True)
+        self.registry().write_text(json.dumps({'issue': 9, 'root': str(self.root), 'processes': [
+            {'name': 'web', 'pid': survivor.pid, 'port': 1, 'url': 'http://127.0.0.1:1/',
+             'identity': serve.process_identity(survivor.pid)}]}), encoding='utf-8')
+        out = io.StringIO()
+        with mock.patch.object(serve, '_kill_signal', lambda pid: None), \
+                mock.patch.object(serve, 'KILL_WAIT_SECONDS', 0.3), contextlib.redirect_stdout(out):
+            code = serve.main(['stop', '--config', str(self.config), '--root', str(self.root), '--issue', '9'])
+        result = json.loads(out.getvalue())
+        self.assertEqual(code, 1)
+        self.assertFalse(result['ok'])
+        self.assertEqual([item['pid'] for item in result['left']], [survivor.pid])
+        self.assertFalse(result['processes'][0]['stopped'])
+        self.assertTrue(self.registry().exists())
+
+    def test_a_failed_rollback_kill_is_reported_in_left_and_keeps_the_record_for_stop(self):
+        good = self.web('web')
+        broken = self.web('worker', health='http://127.0.0.1:%d/' % free_port(), timeoutSeconds=1)
+        self.write_config([good, broken])
+        with mock.patch.object(serve, '_kill_signal', lambda pid: None), \
+                mock.patch.object(serve, 'KILL_WAIT_SECONDS', 0.3):
+            with self.assertRaises(serve.Refusal) as caught:
+                serve.start(str(self.config), str(self.root), 9)
+        self.assertEqual(len(caught.exception.extra['left']), 2)
+        self.assertTrue(self.registry().exists())
+        self.assertEqual(self.serve('stop').returncode, 0, self.last.stdout)
+        self.assertTrue(wait_until(lambda: not reachable(good['health'])))
 
 
 if __name__ == '__main__':

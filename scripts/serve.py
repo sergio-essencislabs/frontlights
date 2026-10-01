@@ -22,6 +22,7 @@ import datetime as dt
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
 import subprocess
@@ -37,6 +38,9 @@ INFRASTRUCTURE = 'infraestrutura'
 USAGE = 'uso'
 UNKNOWN_IDENTITY = 'desconhecida'
 BATCH_UNSAFE = '&|^%<>!"'
+MIN_SECRET = 4
+MASK = '[redacted]'
+KILL_WAIT_SECONDS = 15
 
 _SECRETS = []
 
@@ -44,10 +48,11 @@ _SECRETS = []
 class Refusal(Exception):
     """A deliberate refusal: the message is safe to show the user."""
 
-    def __init__(self, message, process=None, category=None):
+    def __init__(self, message, process=None, category=None, extra=None):
         super().__init__(message)
         self.process = process
         self.category = category or INFRASTRUCTURE
+        self.extra = extra or {}
 
 
 def require(condition, message, process=None, category=None):
@@ -60,29 +65,40 @@ def now_iso():
 
 
 def protect(text):
-    for secret in _SECRETS:
-        if secret:
-            text = text.replace(secret, '[redacted]')
-    return text
+    """Mask every known secret in one regex pass, longest first (never feeds on its own mask)."""
+    found_secrets = sorted({secret for secret in _SECRETS if secret}, key=len, reverse=True)
+    if not found_secrets:
+        return text
+    # the mask itself is matched first and replaced by itself, so masking twice changes nothing
+    pattern = '|'.join([re.escape(MASK)] + [re.escape(secret) for secret in found_secrets])
+    return re.sub(pattern, lambda found: MASK, text)
 
 
-def scrub(value):
-    """Apply protect to every string of a JSON-like value (keys included)."""
+def scrub(value, skip=()):
+    """Mask the string VALUES of a JSON-like value; keys and structure stay untouched.
+
+    `skip` lists dict keys whose values are technical data (e.g. process identity) that must stay exact.
+    """
     if isinstance(value, str):
         return protect(value)
     if isinstance(value, list):
-        return [scrub(item) for item in value]
+        return [scrub(item, skip) for item in value]
     if isinstance(value, dict):
-        return {scrub(key): scrub(item) for key, item in value.items()}
+        return {key: item if key in skip else scrub(item, skip) for key, item in value.items()}
     return value
 
 
+REGISTRY_EXACT = ('identity', 'startedAt')
+
+
 def write_json_atomic(value, path):
+    """Write the value masked once, as valid JSON, replacing the file atomically."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.parent / f'.{path.name}.{secrets.token_hex(8)}.tmp'
     try:
-        temporary.write_text(json.dumps(scrub(value), indent=2, ensure_ascii=False), encoding='utf-8')
+        temporary.write_text(json.dumps(scrub(value, REGISTRY_EXACT), indent=2, ensure_ascii=False),
+                             encoding='utf-8')
         os.replace(temporary, path)
     finally:
         if temporary.exists():
@@ -98,12 +114,17 @@ def load_block(config_file):
         raise Refusal('Não foi possível ler o config informado em --config.')
     block = config.get('browserTest') if isinstance(config, dict) else None
     require(isinstance(block, dict), 'O config não tem o bloco browserTest.')
+    _SECRETS.clear()
     for user in block.get('users') or []:
         if isinstance(user, dict):
             for key in ('login', 'password'):
-                if isinstance(user.get(key), str):
-                    _SECRETS.extend([user[key], urllib.parse.quote(user[key], safe=''),
-                                     urllib.parse.quote_plus(user[key])])
+                value = user.get(key)
+                if isinstance(value, str) and value:
+                    require(len(value) >= MIN_SECRET,
+                            f'O {key} de um usuário em browserTest.users tem menos de {MIN_SECRET} caracteres: '
+                            'um segredo curto não pode ser mascarado com segurança na saída e nos registros. '
+                            f'Use um {key} de teste com {MIN_SECRET} ou mais caracteres.', category=USAGE)
+                    _SECRETS.extend([value, urllib.parse.quote(value, safe=''), urllib.parse.quote_plus(value)])
     processes = block.get('processes')
     require(isinstance(processes, list) and processes, 'browserTest.processes precisa ser uma lista não vazia.')
     names = set()
@@ -200,7 +221,7 @@ def guard_batch(argv, name):
                 f'metacaracteres de shell ({BATCH_UNSAFE}).', name)
 
 
-def kill_tree(pid):
+def _kill_signal(pid):
     if os.name == 'nt':
         subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'], capture_output=True, timeout=60)
     else:
@@ -209,6 +230,18 @@ def kill_tree(pid):
             os.killpg(pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
+
+
+def kill_tree(pid):
+    """Kill the process tree of pid and report whether the root is really gone afterwards.
+
+    The exit status of taskkill/killpg is not trusted: pid_alive decides. Returns True when dead.
+    """
+    _kill_signal(pid)
+    deadline = time.monotonic() + KILL_WAIT_SECONDS
+    while pid_alive(pid) and time.monotonic() < deadline:
+        time.sleep(POLL_SECONDS)
+    return not pid_alive(pid)
 
 
 def pid_alive(pid):
@@ -284,8 +317,69 @@ def registry_path(root, issue):
     return Path(root) / '.frontlights' / 'serve' / f'{issue}.json'
 
 
+def lock_path(root, issue):
+    return Path(root) / '.frontlights' / 'serve' / f'{issue}.lock'
+
+
+def relative(root, path):
+    return path.relative_to(root).as_posix()
+
+
+def acquire_lock(root, issue):
+    """Create <issue>.lock exclusively; a lock of a dead owner is replaced, an unreadable one refused."""
+    path = lock_path(root, issue)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    name = relative(Path(root), path)
+    for _ in range(3):
+        try:
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            try:
+                text = path.read_text(encoding='utf-8')
+                owner = int(text.strip())
+            except FileNotFoundError:
+                continue  # released between the failed create and the read: try again
+            except (OSError, ValueError):
+                raise Refusal(f'O arquivo de trava {name} está ilegível, então não dá para saber se outro start '
+                              f'está em andamento. Se nenhum start da issue {issue} estiver rodando, apague '
+                              f'{name} à mão e rode start de novo.', category=USAGE)
+            require(not pid_alive(owner),
+                    f'Outro start da issue {issue} está em andamento (pid {owner}). Aguarde-o terminar; se ele '
+                    f'já não existe, apague {name} à mão.', category=USAGE)
+            try:
+                if path.read_text(encoding='utf-8') == text:  # still the stale lock we just judged
+                    path.unlink()
+            except OSError:
+                pass
+            continue
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+            handle.write(str(os.getpid()))
+        return path
+    raise Refusal(f'Não foi possível obter a trava {name}; tente de novo.', category=USAGE)
+
+
+def release_lock(path):
+    try:
+        Path(path).unlink()
+    except OSError:
+        pass
+
+
+def write_registry(root, issue, entries):
+    write_json_atomic({'issue': issue, 'root': str(Path(root).resolve()), 'processes': entries},
+                      registry_path(root, issue))
+
+
 def start(config_file, root, issue):
     processes = load_block(config_file)
+    lock = acquire_lock(root, issue)
+    try:
+        return start_locked(processes, root, issue)
+    finally:
+        release_lock(lock)
+
+
+def start_locked(processes, root, issue):
     if registry_path(root, issue).is_file():
         previous = read_registry(root, issue)
         require(not any(same_process(entry) for entry in previous['processes']),
@@ -303,25 +397,36 @@ def start(config_file, root, issue):
             started.append({'name': item['name'], 'pid': child.pid, 'port': process_port(item),
                             'url': item['health'], 'startedAt': now_iso(),
                             'identity': process_identity(child.pid) or UNKNOWN_IDENTITY})
+            write_registry(root, issue, started)  # a crash from here on leaves something stop can tear down
             wait_healthy(child, item)
     except BaseException as failure:
         left = []
         for entry in reversed(started):
             try:
-                kill_tree(entry['pid'])
+                dead = kill_tree(entry['pid'])
             except Exception:
-                left.append(f'{entry["name"]} (pid {entry["pid"]})')
+                dead = False
+            if not dead:
+                left.append(entry)
+        try:
+            if left:
+                write_registry(root, issue, left)  # keep only what survived, so stop can retry
+            else:
+                registry_path(root, issue).unlink(missing_ok=True)
+        except OSError:
+            pass
         if left and isinstance(failure, Refusal):
-            raise Refusal(f'{failure} Não foi possível derrubar: {", ".join(left)}.',
-                          failure.process, failure.category)
+            names = ', '.join(f'{entry["name"]} (pid {entry["pid"]})' for entry in left)
+            raise Refusal(f'{failure} Não foi possível derrubar: {names}; rode stop para tentar de novo.',
+                          failure.process, failure.category,
+                          {'left': [{'name': entry['name'], 'pid': entry['pid']} for entry in left]})
         raise
-    write_json_atomic({'issue': issue, 'root': str(Path(root).resolve()), 'processes': started},
-                      registry_path(root, issue))
     return {'ok': True, 'issue': issue, 'processes': started}
 
 
 def read_registry(root, issue):
     path = registry_path(root, issue)
+    name = relative(Path(root), path)
     require(path.is_file(), f'Não há registro de processos para a issue {issue} nesta worktree.')
     try:
         record = json.loads(path.read_text(encoding='utf-8'))
@@ -329,26 +434,32 @@ def read_registry(root, issue):
         for entry in record['processes']:
             require(isinstance(entry.get('pid'), int), 'registro inválido')
     except (OSError, ValueError, AttributeError, Refusal):
-        raise Refusal(f'O registro da issue {issue} está ilegível ou inválido.')
+        raise Refusal(f'O registro da issue {issue} ({name}) está ilegível ou inválido, então start, status e '
+                      f'stop não conseguem usá-lo. Confira se há processos da issue em execução, encerre-os '
+                      f'à mão e apague {name}.')
     return record
 
 
 def status(root, issue):
     record = read_registry(root, issue)
-    processes = [scrub(dict(entry, alive=same_process(entry))) for entry in record['processes']]
+    # main masks the output: a secret that sits in a health URL query shows up as [redacted] here too
+    processes = [dict(entry, alive=same_process(entry)) for entry in record['processes']]
     return {'ok': True, 'issue': issue, 'running': all(entry['alive'] for entry in processes),
             'processes': processes}
 
 
 def stop(root, issue):
     record = read_registry(root, issue)
-    stopped = []
+    name = relative(Path(root), registry_path(root, issue))
+    stopped, left = [], []
     for entry in record['processes']:  # check every identity first, so a refusal kills nothing
         if pid_alive(entry['pid']):
             recorded, current = entry.get('identity'), process_identity(entry['pid'])
             require(recorded not in (None, UNKNOWN_IDENTITY) and current is not None,
                     f'Identidade desconhecida do processo {entry.get("name")} (pid {entry["pid"]}): '
-                    'não foi encerrado para não derrubar um processo alheio; confira e encerre manualmente.')
+                    'o registro não prova que o pid ainda é o processo iniciado, então ele não foi encerrado '
+                    'para não derrubar um processo alheio. Confira e encerre manualmente; depois apague '
+                    f'{name} à mão.')
     for entry in record['processes']:
         item = {'name': entry.get('name'), 'pid': entry['pid']}
         if not pid_alive(entry['pid']):
@@ -359,13 +470,16 @@ def stop(root, issue):
         else:
             # Limit: only the recorded root pid is confirmed dead; grandchildren rely on taskkill /T
             # (Windows) or the process group (POSIX), since the standard library cannot list them.
-            kill_tree(entry['pid'])
-            deadline = time.monotonic() + 15
-            while pid_alive(entry['pid']) and time.monotonic() < deadline:
-                time.sleep(POLL_SECONDS)
-            stopped.append(dict(item, stopped=not pid_alive(entry['pid'])))
-    require(all(item['stopped'] for item in stopped),
-            'Nem todos os processos foram encerrados; o registro foi mantido para nova tentativa.')
+            try:
+                dead = kill_tree(entry['pid'])
+            except Exception:
+                dead = False
+            stopped.append(dict(item, stopped=dead))
+            if not dead:
+                left.append(item)
+    if left:
+        raise Refusal('Nem todos os processos foram encerrados; o registro foi mantido para nova tentativa.',
+                      extra={'left': left, 'processes': stopped})
     registry_path(root, issue).unlink()
     return {'ok': True, 'issue': issue, 'processes': stopped}
 
@@ -391,11 +505,12 @@ def main(argv=None):
         result = run(args.operation, args.config, args.root, args.issue)
         code = 0
     except Refusal as refusal:
-        result = {'ok': False, 'error': protect(str(refusal)), 'category': refusal.category}
+        result = {'ok': False, 'error': str(refusal), 'category': refusal.category}
         if refusal.process:
             result['failedProcess'] = refusal.process
+        result.update(refusal.extra)
         code = 1
-    print(protect(json.dumps(scrub(result), ensure_ascii=False)))
+    print(json.dumps(scrub(result), ensure_ascii=False))  # the single masking pass of the output
     return code
 
 
