@@ -37,8 +37,12 @@ python "${CLAUDE_PLUGIN_ROOT}/scripts/serve.py" stop --config <config> --root <w
 `serve start` brings up every process of `browserTest.processes` in the issue's
 worktree, waits for each health URL and records pids in
 `.frontlights/serve/<n>.json`; `serve stop` kills the process trees and releases
-the ports. Exit `0` done, `1` refused or failed; the JSON `category` says `uso`
-(config error, nothing started) or `infraestrutura` (the environment failed).
+the ports. Exit `0` done, `1` refused or failed; the JSON `category` says:
+
+- `uso`: invalid config or a busy lock;
+- `infraestrutura`: everything else, an unreadable or missing config included.
+
+Either way, ask (see below).
 
 Ports. A process with `"port": "auto"` gets a free port reserved per process in the
 repository's Git common directory, shared by every worktree, and receives it in
@@ -57,9 +61,12 @@ which processes are still up when the user chose to keep them.
 ## Checks: `checks`
 
 ```powershell
-python "${CLAUDE_PLUGIN_ROOT}/scripts/checks.py" regression --config <config> --root <worktree> --base <base-checkout> --issue <n>
-python "${CLAUDE_PLUGIN_ROOT}/scripts/checks.py" integration --config <config> --root <worktree> --issue <n> --base <base-checkout>
-python "${CLAUDE_PLUGIN_ROOT}/scripts/checks.py" smoke --config <config> --root <worktree> --issue <n> --base <base-checkout>
+python "${CLAUDE_PLUGIN_ROOT}/scripts/checks.py" regression --config <config> --root <worktree> `
+  --base <base-checkout> --issue <n>
+python "${CLAUDE_PLUGIN_ROOT}/scripts/checks.py" integration --config <config> --root <worktree> `
+  --issue <n> --base <base-checkout>
+python "${CLAUDE_PLUGIN_ROOT}/scripts/checks.py" smoke --config <config> --root <worktree> `
+  --issue <n> --base <base-checkout>
 ```
 
 - `checks regression` runs the suite on the base and then on the branch; only a
@@ -71,8 +78,8 @@ python "${CLAUDE_PLUGIN_ROOT}/scripts/checks.py" smoke --config <config> --root 
   left: tell the user and offer to run `serve stop`.
 
 Exit codes: `0` passed, `1` product failure, `2` config or usage refused (nothing
-ran), `3` infrastructure. Records go to `.frontlights/issues/<n>/checks/` and carry
-`simulacao: false`. A login or password of `browserTest.users` shorter than four
+ran), `3` infrastructure. Records go to `.frontlights/issues/<n>/checks/`; those
+of `integration` and `smoke` carry `simulacao: false`. A login or password of `browserTest.users` shorter than four
 characters makes `integration` and `smoke` refuse; both values are masked in every
 output and record.
 

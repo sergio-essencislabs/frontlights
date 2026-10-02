@@ -4,9 +4,11 @@ Reads the text files (reference, issue template, SKILL.md, development.md) and c
 flag, exit code and output field the reference cites with what `scripts/serve.py` and `scripts/checks.py`
 actually expose, so the text cannot drift from the helpers.
 """
+import json
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -19,6 +21,12 @@ SKILL = ROOT / 'skills' / 'frontlights'
 REFERENCE = SKILL / 'references' / 'browser-testing.md'
 POINTER = 'references/browser-testing.md'
 LOCAL_HOSTS = {'127.0.0.1', 'localhost', '[::1]'}
+NAMED_HOSTS = {'127.0.0.1', 'localhost', 'exemplo.test'}
+FILE_EXTENSIONS = {'md', 'json', 'py'}
+CONFIG_KEYS = ('browsertest.', 'checks.')
+CREDENTIAL = re.compile(r'\b(?:senha|password|passwd|login|usu[aá]rio|user)\b(?:\s*([:=])\s*|\s+)([^\s,;)`]+)',
+                        re.I)
+HOST = re.compile(r'(?<![\w.-])(?:[\w-]+(?:\.[\w-]+)+(?::\d+)?|[\w-]+:\d+\b)')
 
 
 def read(path):
@@ -74,9 +82,22 @@ class BrowserFlowManifestTests(unittest.TestCase):
     def test_every_failure_is_a_question_and_infrastructure_is_separate_from_product(self):
         failures = self.reference.split('## Every failure is a question')[1].split('\n## ')[0]
         self.assertIn('AskUserQuestion', failures)
-        self.assertIn('infrastructure failure', failures)
-        self.assertIn('product failure', failures)
         self.assertIn('Never decide alone', failures)
+        # each kind of the classification cites the checks code and serve category that really mean it
+        expected = {'infrastructure failure': ('infrastructure', serve.INFRASTRUCTURE),
+                    'product failure': ('product_failure', None),
+                    'config refusal': ('refused', serve.USAGE)}
+        bullets = {}
+        for bullet in re.split(r'\n- ', failures)[1:]:
+            kind = re.match(r'\*\*([a-z ]+)\*\*:', bullet)
+            if kind:
+                bullets[kind.group(1)] = ' '.join(bullet.split())
+        self.assertEqual(set(bullets), set(expected))
+        for kind, (key, category) in expected.items():
+            with self.subTest(kind=kind):
+                self.assertEqual(re.findall(r'`checks` code `(\d)`', bullets[kind]), [str(checks.EXIT_CODES[key])])
+                self.assertEqual(re.findall(r'`serve` category `(\w+)`', bullets[kind]),
+                                 [category] if category else [])
 
     def test_cross_account_check_uses_both_accounts_and_says_when_account_2_enters(self):
         section = self.reference.split('## Cross-account permissions')[1].split('\n## ')[0]
@@ -96,15 +117,30 @@ class BrowserFlowManifestTests(unittest.TestCase):
     def test_no_browser_or_network_is_reported_and_never_counts_as_passed(self):
         self.assertIn('never counts as passed', self.reference)
 
-    def test_reference_holds_no_login_password_or_real_url(self):
-        for match in re.finditer(r'\bhttps?://([^/\s`"\')]+)', self.reference):
-            host = match.group(1).rsplit(':', 1)[0] if not match.group(1).startswith('[') \
-                else match.group(1).split(']')[0] + ']'
-            with self.subTest(url=match.group(0)):
-                self.assertIn(host, LOCAL_HOSTS)
-        self.assertIsNone(re.search(r'[\w.+-]+@[\w-]+\.[\w.]+', self.reference), 'e-mail ou login no texto')
-        self.assertIsNone(re.search(r'"(login|password)"\s*:\s*"', self.reference), 'valor de login ou senha')
-        self.assertIsNone(re.search(r'\bwww\.|\.com\b|\.com\.br\b', self.reference), 'domínio real no texto')
+    def test_reference_and_template_hold_no_login_password_or_real_url(self):
+        for name, text in (('reference', self.reference), ('issue.md', read(ROOT / 'templates' / 'issue.md'))):
+            for match in re.finditer(r'\bhttps?://([^/\s`"\')]+)', text):
+                host = match.group(1).rsplit(':', 1)[0] if not match.group(1).startswith('[') \
+                    else match.group(1).split(']')[0] + ']'
+                with self.subTest(file=name, url=match.group(0)):
+                    self.assertIn(host, LOCAL_HOSTS)
+            self.assertIsNone(re.search(r'[\w.+-]+@[\w-]+\.[\w.]+', text), f'e-mail ou login em {name}')
+            self.assertIsNone(re.search(r'\bwww\.|\.com\b|\.com\.br\b', text), f'domínio real em {name}')
+            # a value after `senha:`/`login=` (or after a space, when it looks like a secret) must be a placeholder
+            for match in CREDENTIAL.finditer(text):
+                value = match.group(2)
+                placeholder = re.fullmatch(r'<[^>]*>?|\{[^}]*\}?', value)
+                secret_like = match.group(1) or re.search(r'[\d@#$%!*&^+=]', value)
+                with self.subTest(file=name, credential=match.group(0)):
+                    self.assertFalse(secret_like and not placeholder, f'login ou senha em {name}')
+            # a dotted name or host:port is a local host, a file name or a config key, never a real host
+            for match in HOST.finditer(text):
+                token = match.group(0).lower()
+                host, _, port = token.partition(':')
+                allowed = host in NAMED_HOSTS or not port and (token.rsplit('.', 1)[1] in FILE_EXTENSIONS
+                                                               or token.startswith(CONFIG_KEYS))
+                with self.subTest(file=name, host=token):
+                    self.assertTrue(allowed, f'host real em {name}')
 
     def test_cited_subcommands_and_flags_exist_in_the_scripts(self):
         serve_help = help_text('scripts/serve.py')
@@ -127,18 +163,37 @@ class BrowserFlowManifestTests(unittest.TestCase):
             with self.subTest(flag=flag):
                 self.assertIn(flag, known)
 
-    def test_cited_exit_codes_and_categories_match_the_scripts(self):
-        labels = {'passed': 'passed', 'product_failure': 'product failure',
-                  'refused': 'config or usage refused', 'infrastructure': 'infrastructure'}
-        for key, label in labels.items():
-            with self.subTest(key=key):
-                self.assertIn(f'`{checks.EXIT_CODES[key]}` {label}', self.reference)
-        cited = {int(code) for code in re.findall(r'`(\d)` (?:passed|product failure|config or usage refused|'
-                                                   r'infrastructure)', self.reference)}
-        self.assertEqual(cited, set(checks.EXIT_CODES.values()))
-        for category in (serve.USAGE, serve.INFRASTRUCTURE):
-            with self.subTest(category=category):
-                self.assertIn(f'`{category}`', self.reference)
+    def test_cited_checks_exit_codes_match_the_script(self):
+        keys = {'passed': 'passed', 'product failure': 'product_failure',
+                'config or usage refused': 'refused', 'infrastructure': 'infrastructure'}
+        section = ' '.join(self.reference.split('## Checks: `checks`')[1].split('\n## ')[0].split())
+        sentence = section.split('Exit codes:')[1].split('.')[0]
+        cited = re.findall(r'`(\d)` ([a-z ]+?)(?= \(|,|$)', sentence)
+        self.assertEqual(sorted(label for _, label in cited), sorted(keys))
+        for code, label in cited:
+            with self.subTest(label=label):
+                self.assertEqual(int(code), checks.EXIT_CODES[keys[label]])
+
+    def test_cited_serve_exit_codes_and_categories_match_the_script(self):
+        section = self.reference.split('## Environment: `serve`')[1].split('\n## ')[0]
+        exits = ' '.join(section.split()).split('Exit ')[1].split(';')[0]
+        self.assertEqual(set(re.findall(r'`(\d)`', exits)), {'0', '1'})
+        meaning = dict(re.findall(r'^- `(\w+)`: (.+)$', section, re.M))
+        self.assertEqual(set(meaning), {serve.USAGE, serve.INFRASTRUCTURE})
+        self.assertIn('invalid config', meaning[serve.USAGE])
+        self.assertIn('missing config', meaning[serve.INFRASTRUCTURE])
+        # the script itself: an invalid config is `uso`, a missing one `infraestrutura`, both exit 1
+        with tempfile.TemporaryDirectory() as folder:
+            invalid = Path(folder) / 'invalid.json'
+            invalid.write_text(json.dumps({'browserTest': {'processes': [
+                {'name': 'web', 'argv': ['web'], 'health': 'not-a-url'}]}}), encoding='utf-8')
+            for config, category in ((invalid, serve.USAGE), (Path(folder) / 'missing.json', serve.INFRASTRUCTURE)):
+                done = subprocess.run([sys.executable, 'scripts/serve.py', 'start', '--config', str(config),
+                                       '--root', folder, '--issue', '1'], cwd=ROOT, capture_output=True,
+                                      encoding='utf-8', errors='replace')
+                with self.subTest(config=config.name):
+                    self.assertEqual(done.returncode, 1)
+                    self.assertEqual(json.loads(done.stdout)['category'], category)
 
     def test_cited_output_fields_exist_in_the_scripts(self):
         sources = read(ROOT / 'scripts' / 'serve.py') + read(ROOT / 'scripts' / 'checks.py') \
