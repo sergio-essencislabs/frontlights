@@ -22,11 +22,47 @@ REFERENCE = SKILL / 'references' / 'browser-testing.md'
 POINTER = 'references/browser-testing.md'
 LOCAL_HOSTS = {'127.0.0.1', 'localhost', '[::1]'}
 NAMED_HOSTS = {'127.0.0.1', 'localhost', 'exemplo.test'}
-FILE_EXTENSIONS = {'md', 'json', 'py'}
-CONFIG_KEYS = ('browsertest.', 'checks.')
-CREDENTIAL = re.compile(r'\b(?:senha|password|passwd|login|usu[aá]rio|user)\b(?:\s*([:=])\s*|\s+)([^\s,;)`]+)',
-                        re.I)
+FILE_EXTENSIONS = {'js', 'ts', 'mjs', 'cjs', 'json', 'md', 'py', 'yml', 'yaml', 'toml', 'txt'}
+CONFIG_KEYS = ('browsertest.', 'checks.', 'os.', 'sys.', 'subprocess.')
+# the word may be quoted or bold (`"login":`, `**senha**:`) and the value may open with a quote or backtick
+CREDENTIAL = re.compile(r'\b(?:senha|password|passwd|login|usu[aá]rio|user)\b["*`]*(?:\s*([:=])\s*|\s+)["`]?'
+                        r'([^\s,;)`"]+)', re.I)
+VERSION = re.compile(r'\d+(?:\.\d+){0,2}(?::\d+)?|[a-z](?:\.[a-z])+')  # 3.12, 0.13.0, 3000:3000, e.g, i.e
 HOST = re.compile(r'(?<![\w.-])(?:[\w-]+(?:\.[\w-]+)+(?::\d+)?|[\w-]+:\d+\b)')
+
+
+def url_hosts_are_local(text):
+    for match in re.finditer(r'\bhttps?://([^/\s`"\')]+)', text):
+        host = match.group(1).rsplit(':', 1)[0] if not match.group(1).startswith('[') \
+            else match.group(1).split(']')[0] + ']'
+        if host not in LOCAL_HOSTS:
+            return False
+    return True
+
+
+def credential_leaks(text):
+    """A value after `senha:`/`login=` (or after a space, when it looks like a secret) must be a placeholder."""
+    leaks = []
+    for match in CREDENTIAL.finditer(text):
+        value = match.group(2)
+        placeholder = re.fullmatch(r'<[^>]*>?|\{[^}]*\}?', value)
+        secret_like = match.group(1) or re.search(r'[\d@#$%!*&^+=]', value)
+        if secret_like and not placeholder:
+            leaks.append(match.group(0))
+    return leaks
+
+
+def host_leaks(text):
+    """A dotted name or host:port is a local host, a file name or a config key, never a real host."""
+    leaks = []
+    for match in HOST.finditer(text):
+        token = match.group(0).lower()
+        host, _, port = token.partition(':')
+        allowed = host in NAMED_HOSTS or VERSION.fullmatch(token) or not port and (
+            token.rsplit('.', 1)[1] in FILE_EXTENSIONS or token.startswith(CONFIG_KEYS))
+        if not allowed:
+            leaks.append(token)
+    return leaks
 
 
 def read(path):
@@ -119,28 +155,34 @@ class BrowserFlowManifestTests(unittest.TestCase):
 
     def test_reference_and_template_hold_no_login_password_or_real_url(self):
         for name, text in (('reference', self.reference), ('issue.md', read(ROOT / 'templates' / 'issue.md'))):
-            for match in re.finditer(r'\bhttps?://([^/\s`"\')]+)', text):
-                host = match.group(1).rsplit(':', 1)[0] if not match.group(1).startswith('[') \
-                    else match.group(1).split(']')[0] + ']'
-                with self.subTest(file=name, url=match.group(0)):
-                    self.assertIn(host, LOCAL_HOSTS)
+            self.assertTrue(url_hosts_are_local(text), f'URL externa em {name}')
             self.assertIsNone(re.search(r'[\w.+-]+@[\w-]+\.[\w.]+', text), f'e-mail ou login em {name}')
             self.assertIsNone(re.search(r'\bwww\.|\.com\b|\.com\.br\b', text), f'domínio real em {name}')
-            # a value after `senha:`/`login=` (or after a space, when it looks like a secret) must be a placeholder
-            for match in CREDENTIAL.finditer(text):
-                value = match.group(2)
-                placeholder = re.fullmatch(r'<[^>]*>?|\{[^}]*\}?', value)
-                secret_like = match.group(1) or re.search(r'[\d@#$%!*&^+=]', value)
-                with self.subTest(file=name, credential=match.group(0)):
-                    self.assertFalse(secret_like and not placeholder, f'login ou senha em {name}')
-            # a dotted name or host:port is a local host, a file name or a config key, never a real host
-            for match in HOST.finditer(text):
-                token = match.group(0).lower()
-                host, _, port = token.partition(':')
-                allowed = host in NAMED_HOSTS or not port and (token.rsplit('.', 1)[1] in FILE_EXTENSIONS
-                                                               or token.startswith(CONFIG_KEYS))
-                with self.subTest(file=name, host=token):
-                    self.assertTrue(allowed, f'host real em {name}')
+            self.assertEqual(credential_leaks(text), [], f'login ou senha em {name}')
+            self.assertEqual(host_leaks(text), [], f'host real em {name}')
+
+    def test_credential_scan_catches_json_backtick_and_bold_forms(self):
+        for leak in ('{"login": "conta1", "password": "Teste@123"}', 'password: `Teste@123`',
+                     '**login**: conta1', 'senha: Teste@123', 'login=conta1', 'password Teste@123'):
+            with self.subTest(leak=leak):
+                self.assertTrue(credential_leaks(leak))
+        for clean in ('login: `<conta 1>`', 'password: {senha}', '"login": "<login>"', 'the login and password',
+                      '**senha**: `<senha da conta 2>`'):
+            with self.subTest(clean=clean):
+                self.assertEqual(credential_leaks(clean), [])
+
+    def test_host_scan_refuses_real_hosts_but_not_versions_abbreviations_or_file_names(self):
+        for leak in ('https://app.cliente-real.io/login', '10.20.0.5', 'minha-empresa.com.br', 'portal.acme.dev',
+                     'http://u:p@127.0.0.1/', 'http://[fd00::5]:8080/', 'srvhomolog:8443',
+                     'staging.empresa.net:8080', 'homolog.cliente.net'):
+            with self.subTest(leak=leak):
+                self.assertTrue(host_leaks(leak) or not url_hosts_are_local(leak))
+        for clean in ('e.g. this', 'i.e. that', 'Python 3.12', 'version 0.13.0', 'wait 2.5 s', 'os.path',
+                      'subprocess.run', 'node.js', 'vite.config.js', 'tsconfig.base.json', 'playwright.config.ts',
+                      'ports 3000:3000', 'http://127.0.0.1:5173/', 'localhost:8080', 'browserTest.users'):
+            with self.subTest(clean=clean):
+                self.assertEqual(host_leaks(clean), [])
+                self.assertTrue(url_hosts_are_local(clean))
 
     def test_cited_subcommands_and_flags_exist_in_the_scripts(self):
         serve_help = help_text('scripts/serve.py')
