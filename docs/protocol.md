@@ -90,7 +90,8 @@ O teste de navegador roda no fim de uma issue cujo plano tem a seção `## Naveg
 ligados`, só com o que ela liga e nesta ordem: `checks regression`, `serve start`,
 `checks integration`, navegador e permissões entre contas, `checks smoke`, `serve stop`.
 As reservas de `"port": "auto"` ficam na pasta comum do Git (`frontlights-serve/ports/`),
-compartilhada pelas worktrees. Os códigos de `checks` são 0 passou, 1 falha de produto, 2
+compartilhada pelas worktrees; fora do Git, em `.frontlights/serve/ports/`, e repositórios
+diferentes não veem as reservas uns dos outros. Os códigos de `checks` são 0 passou, 1 falha de produto, 2
 config recusada e 3 infraestrutura. Toda falha vira pergunta por `AskUserQuestion`; sem
 navegador ou rede, o teste é registrado como não executado e não conta como aprovado. Os
 registros nunca trazem login nem senha: a conta aparece como `conta 1` ou `conta 2`. Um commit

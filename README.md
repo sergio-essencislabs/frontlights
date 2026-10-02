@@ -246,7 +246,8 @@ própria branch, roda as verificações e entra no app com as contas de teste. O
   sobe, consulta ou derruba os processos de `browserTest.processes` (lista de argumentos, sem
   shell), espera o `health` de cada um e grava os pids em `.frontlights/serve/<n>.json`;
 - `"port": "auto"` reserva uma porta livre por processo na pasta comum do Git, vista por todas
-  as worktrees, e a entrega em `PORT`, `FRONTLIGHTS_PORT_<NOME>` e `{port}` no argv; o `health`
+  as worktrees (fora do Git, em `.frontlights/serve/ports/`, e repositórios diferentes não veem
+  as reservas uns dos outros), e a entrega em `PORT`, `FRONTLIGHTS_PORT_<NOME>` e `{port}` no argv; o `health`
   precisa ter `{port}` no lugar da porta (`http://127.0.0.1:{port}/health`). Um projeto cujo
   servidor fixa a própria porta usa `port` fixo, e aí só uma issue por vez pode subi-lo;
 - `python scripts/checks.py regression|integration|smoke --config <config> --root <worktree> --issue <n>`
@@ -254,13 +255,16 @@ própria branch, roda as verificações e entra no app com as contas de teste. O
   `--base <checkout-da-base>`), o comando de integração contra o backend da branch e os
   caminhos de smoke. Códigos: 0 passou, 1 falha de produto, 2 config recusada (nada rodou),
   3 infraestrutura;
-- só hosts locais (`127.0.0.1`, `localhost`, `::1`) são aceitos; nunca aponte um teste para
-  homologação ou produção.
+- o `checks` recusa host fora de `127.0.0.1`, `localhost` e `::1` antes de requisitar (no `smoke`,
+  `health` e `baseUrl`; no `integration`, o backend); o `serve` não confere o host do `health`,
+  então mantenha `health` e `baseUrl` em host local e nunca aponte um teste para homologação ou
+  produção.
 
 `browserTest.users` traz a conta 1 e, para o teste de permissões entre contas, a conta 2, com
 login e senha **em texto** no `.frontlights/config.json` do projeto de destino, fora do Git. É
 um risco aceito só para contas de teste: nunca use uma conta real ou de produção. Login e senha
-são mascarados em toda saída e registro, e um valor com menos de 4 caracteres é recusado. Sem
+são mascarados em toda saída e registro, e um valor com menos de 4 caracteres é recusado pelo
+`serve` e por `checks integration` e `checks smoke` (o `checks regression` não recusa). Sem
 navegador ou rede, o teste é relatado como não executado e nunca conta como aprovado. O app de
 exemplo em `examples/browser-app/` mostra o fluxo de ponta a ponta.
 
