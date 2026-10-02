@@ -130,8 +130,9 @@ um ponto de retomada local não concede essa permissão.
 
 O formato de `plan.json` segue `examples/plan.json`. O campo opcional `parent` de uma
 issue é o id de outra issue do mesmo plano (a issue de origem já publicada entra no
-plano com o próprio número), o que permite conferir o vínculo sem rede; o pai pode
-trazer `existing_sub_issues`, lido de `subIssuesSummary.total`. Sem `parent`, nada muda.
+plano com o próprio número), o que permite conferir o vínculo sem rede. O limite de
+100 filhas conta só as do plano; antes de publicar, confira `subIssuesSummary.total` do
+pai no GitHub para não passar de 100. Sem `parent`, nada muda.
 Os valores técnicos `ready` (pronta), `running` (em execução), `blocked` (bloqueada), `verified` (verificada) e
 `proposed` (proposta) representam observações locais do estado oficial. Salve também
 o horário da consulta ao GitHub. Uma issue concluída só libera dependentes quando

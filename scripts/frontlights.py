@@ -138,10 +138,6 @@ def validate_plan(plan, project=None):
             require(number(issue['parent']),
                     f'{issue["id"]}: parent precisa ser o id (inteiro positivo) de uma issue deste plano')
             require(issue['parent'] != issue['id'], f'{issue["id"]}: parent não pode ser a própria issue')
-        if 'existing_sub_issues' in issue:
-            count = issue['existing_sub_issues']
-            require(type(count) is int and 0 <= count <= SUB_ISSUES_MAX,
-                    f'{issue["id"]}: existing_sub_issues precisa ser um inteiro de 0 a {SUB_ISSUES_MAX}')
         if project is not None:
             board_fields(project, issue)
         if issue.get('url'):
@@ -173,8 +169,9 @@ SUB_ISSUES_DEPTH = 8   # GitHub: levels of nesting below a top-level issue
 def sub_issues(issues):
     """Parent links must stay inside the plan and within GitHub's sub-issue limits.
 
-    `parent` names another issue of this same plan, so the check needs no network;
-    children the parent already has on GitHub come in as its `existing_sub_issues`.
+    `parent` names another issue of this same plan, so the check needs no network.
+    Only the plan's children are counted; the children a parent already has on
+    GitHub are checked before publishing (`subIssuesSummary.total`).
     """
     by_id = {i['id']: i for i in issues}
     children = {}
@@ -185,9 +182,8 @@ def sub_issues(issues):
         require(parent in by_id, f'{i["id"]}: parent {parent} não está no plano; inclua a issue de origem no plano')
         children[parent] = children.get(parent, 0) + 1
     for parent, count in children.items():
-        total = by_id[parent].get('existing_sub_issues', 0) + count
-        require(total <= SUB_ISSUES_MAX,
-                f'{parent}: {total} filhas passam do limite de {SUB_ISSUES_MAX} sub-issues por pai do GitHub')
+        require(count <= SUB_ISSUES_MAX,
+                f'{parent}: {count} filhas passam do limite de {SUB_ISSUES_MAX} sub-issues por pai do GitHub')
     for i in issues:
         seen, node, depth = {i['id']}, i, 0
         while node.get('parent') is not None:

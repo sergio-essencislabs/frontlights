@@ -104,9 +104,10 @@ is not an implementation authorization for the new work.
 Record each sub-issue in `plan.json` with `parent` set to the id of the source issue,
 which must be in the same plan (a published issue keeps its GitHub number as id), so
 `validate-plan` checks the link without network. A sub-issue takes no
-`project_fields`. Give the parent `existing_sub_issues` with the `subIssuesSummary.total`
-read from GitHub, so the check counts the children it already has (GitHub allows 100
-per parent). When the parent is itself a sub-issue, include its ancestors too, so
+`project_fields`. The check counts only the plan's children (GitHub allows 100 per
+parent), so before publishing read the parent's `subIssuesSummary.total` with `gh issue
+view <parent> --json subIssuesSummary` and keep that total plus the new children at
+100 or fewer. When the parent is itself a sub-issue, include its ancestors too, so
 the depth check (8 levels below a top-level issue) sees the whole chain.
 
 Publish a sub-issue in this order, pausing a few seconds between creations to stay

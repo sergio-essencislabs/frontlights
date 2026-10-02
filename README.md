@@ -153,9 +153,10 @@ só para escopo novo ou problema que atravessa várias issues, issue de topo (su
 ligada ao pai (`gh issue create --parent <n>`), herda responsável, tipo e rótulos dele e
 não ganha cartão no quadro: o cartão do pai mostra o progresso das filhas. No `plan.json`,
 a sub-issue leva `parent` com o id da issue de origem, que precisa estar no mesmo plano,
-e dispensa `project_fields`; o pai pode trazer `existing_sub_issues` com as filhas que já
-tem no GitHub. O `validate-plan` recusa `parent` igual ao próprio id, pai fora do plano,
-mais de 100 filhas por pai e mais de 8 níveis de aninhamento. O pai só é dado como
+e dispensa `project_fields`. O `validate-plan` recusa `parent` igual ao próprio id, pai
+fora do plano, mais de 100 filhas por pai no plano e mais de 8 níveis de aninhamento;
+as filhas que o pai já tem no GitHub (`subIssuesSummary.total`) são conferidas antes de
+publicar, sem passar de 100. O pai só é dado como
 concluído com as filhas fechadas; um achado depois do merge ou do fechamento do pai vira
 sub-issue dele, e o Frontlights avisa que o pai precisa ser reaberto, sem reabri-lo.
 

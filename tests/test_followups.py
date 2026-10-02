@@ -99,17 +99,17 @@ class SubIssuePlanTests(unittest.TestCase):
                 self.assertRefused(validate(plan(top(1), issue(2, parent=bad))), 'parent')
 
     def test_more_than_one_hundred_children_per_parent_is_refused(self):
-        # O plano tem no máximo 24 issues: as filhas que o pai já tem no GitHub
-        # entram pela contagem `existing_sub_issues` do próprio pai.
-        self.assertValid(validate(plan(top(1, existing_sub_issues=98), issue(2, parent=1), issue(3, parent=1))))
-        error = self.assertRefused(
-            validate(plan(top(1, existing_sub_issues=99), issue(2, parent=1), issue(3, parent=1))), '100')
-        self.assertIn('filhas', error)
-
-    def test_existing_sub_issues_must_be_a_count(self):
-        for bad in (-1, '3', 1.5, True, 101):
-            with self.subTest(bad=bad):
-                self.assertRefused(validate(plan(top(1, existing_sub_issues=bad))), 'existing_sub_issues')
+        # O plano aceita no máximo 24 issues, então a CLI não chega a 101 filhas:
+        # o limite é exercido direto em `sub_issues`, que o `validate-plan` chama.
+        sys.path.insert(0, str(SCRIPT.parent))
+        import frontlights
+        self.assertEqual(frontlights.SUB_ISSUES_MAX, 100)
+        family = lambda n: [{'id': 1}] + [{'id': k, 'parent': 1} for k in range(2, n + 2)]
+        frontlights.sub_issues(family(100))
+        with self.assertRaises(ValueError) as refused:
+            frontlights.sub_issues(family(101))
+        self.assertIn('101 filhas', str(refused.exception))
+        self.assertIn('100', str(refused.exception))
 
     def test_nesting_deeper_than_eight_levels_is_refused(self):
         chain = [top(1)] + [issue(n, parent=n - 1) for n in range(2, 10)]
