@@ -1,0 +1,20 @@
+{
+  "repository": "OWNER/REPOSITORY",
+  "roads": null,
+  "browserTest": {
+    "baseUrl": "http://127.0.0.1:{port}/",
+    "users": [
+      {"login": "usuario1@exemplo.test", "password": "senha-ficticia"}
+    ],
+    "processes": [
+      {
+        "name": "app",
+        "argv": ["python", "app.py", "{port}"],
+        "cwd": "examples/browser-app",
+        "port": "auto",
+        "health": "http://127.0.0.1:{port}/health",
+        "timeoutSeconds": 30
+      }
+    ]
+  }
+}
