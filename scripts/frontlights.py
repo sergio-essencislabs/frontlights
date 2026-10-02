@@ -89,7 +89,14 @@ def board(project, repo=...):
 
 
 def board_fields(project, issue):
-    """Board values for one issue: defaults plus the per-issue choices, with nothing left open."""
+    """Board values for one issue: defaults plus the per-issue choices, with nothing left open.
+
+    A sub-issue (`parent` set) joins the board only through its parent: it takes no values.
+    """
+    if issue.get('parent') is not None:
+        require('project_fields' not in issue,
+                f'{issue["id"]}: sub-issue não leva project_fields; entra no quadro só pelo pai')
+        return {}
     chosen = issue.get('project_fields', {})
     require(isinstance(chosen, dict) and all(nonempty(k) and nonempty(v) for k, v in chosen.items()),
             f'{issue["id"]}: project_fields must map field names to non-empty values')
@@ -127,6 +134,10 @@ def validate_plan(plan, project=None):
         require(isinstance(deps, list) and all(number(x) for x in deps) and len(deps) == len(set(deps)),
                 'dependencies must be unique integer ids')
         require(issue.get('status') in {'ready', 'running', 'blocked', 'verified', 'proposed'}, 'invalid status')
+        if issue.get('parent') is not None:
+            require(number(issue['parent']),
+                    f'{issue["id"]}: parent precisa ser o id (inteiro positivo) de uma issue deste plano')
+            require(issue['parent'] != issue['id'], f'{issue["id"]}: parent não pode ser a própria issue')
         if project is not None:
             board_fields(project, issue)
         if issue.get('url'):
@@ -147,7 +158,40 @@ def validate_plan(plan, project=None):
         visited.add(node)
     for node in graph:
         visit(node)
+    sub_issues(issues)
     return plan
+
+
+SUB_ISSUES_MAX = 100   # GitHub: sub-issues per parent
+SUB_ISSUES_DEPTH = 8   # GitHub: levels of nesting below a top-level issue
+
+
+def sub_issues(issues):
+    """Parent links must stay inside the plan and within GitHub's sub-issue limits.
+
+    `parent` names another issue of this same plan, so the check needs no network.
+    Only the plan's children are counted; the children a parent already has on
+    GitHub are checked before publishing (`subIssuesSummary.total`).
+    """
+    by_id = {i['id']: i for i in issues}
+    children = {}
+    for i in issues:
+        parent = i.get('parent')
+        if parent is None:
+            continue
+        require(parent in by_id, f'{i["id"]}: parent {parent} não está no plano; inclua a issue de origem no plano')
+        children[parent] = children.get(parent, 0) + 1
+    for parent, count in children.items():
+        require(count <= SUB_ISSUES_MAX,
+                f'{parent}: {count} filhas passam do limite de {SUB_ISSUES_MAX} sub-issues por pai do GitHub')
+    for i in issues:
+        seen, node, depth = {i['id']}, i, 0
+        while node.get('parent') is not None:
+            require(node['parent'] not in seen, f'{i["id"]}: ciclo em parent')
+            seen.add(node['parent'])
+            node, depth = by_id[node['parent']], depth + 1
+        require(depth <= SUB_ISSUES_DEPTH,
+                f'{i["id"]}: {depth} níveis de sub-issue passam do limite de {SUB_ISSUES_DEPTH} do GitHub')
 
 
 def schedule(plan, limit):
@@ -366,10 +410,43 @@ def verification_candidates(root):
     return []
 
 
-def inspect(config, root):
+def validate_test_blocks(config, path):
+    """Refuse the browserTest and checks blocks with the config-only rules of serve.py and checks.py.
+
+    Absent or null blocks: nothing is read. The validators read `path`, the file `config` was loaded from (no
+    copy of the test password is written anywhere). The refusal text gets the checks mask (test login and
+    password, also percent-encoded), so it never echoes a secret.
+    """
+    browser, block = config.get('browserTest'), config.get('checks')
+    if browser is None and block is None:
+        return
+    require(path is not None, 'browserTest/checks: o inspect precisa do caminho do config para validar os blocos')
+    import checks
+    import serve
+    checks.load_user_secrets(path)
+    try:
+        if browser is not None:
+            checks.require_maskable_user_secrets(path)
+            serve.load_block(path)
+            checks.require_local_declarations(path)
+        if block is not None:
+            if not isinstance(block, dict):
+                raise checks.Refused('checks precisa ser um objeto com regression, integration ou smoke.')
+            for name in ('regression', 'integration'):
+                if name in block:
+                    checks.command_settings(path, name)
+            if 'smoke' in block:
+                checks.smoke_settings(path)
+            checks.optional_name(block.get('backend'), 'checks.backend')
+    except (serve.Refusal, checks.Refused, checks.Infra) as refusal:
+        raise ValueError(checks.redact(str(refusal))) from None
+
+
+def inspect(config, root, config_path=None):
     # A missing key is a typo, not a local project: only an explicit null disables GitHub.
     require('repository' in config and repository_or_local(config['repository']),
             'repository must be owner/name, or null for a local project')
+    validate_test_blocks(config, config_path)
     repo = config['repository']
     result = {'repository': repo, 'fetched_at': dt.datetime.now(dt.timezone.utc).isoformat(),
               'sources': {}, 'verification_commands': {},
@@ -704,7 +781,7 @@ def main():
         elif args.command == 'context':
             result = {'action': context_action(args.used, args.reserve)}
         elif args.command == 'inspect':
-            result = inspect(load(args.config), args.root)
+            result = inspect(load(args.config), args.root, args.config)
         elif args.command == 'evidence':
             result = git_evidence(args.root)
         elif args.command == 'monitoring':

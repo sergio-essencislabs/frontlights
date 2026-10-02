@@ -119,8 +119,9 @@ O endereço acima é ilustrativo; não representa uma API garantida do RoadS.
 ### Quadro de projeto do GitHub
 
 Quando as issues do repositório são controladas num quadro (GitHub Projects), configure
-`project`. Com ele definido, **toda** issue criada pelo Frontlights entra no quadro, com
-responsável, tipo e campos preenchidos, e é relida para conferir:
+`project`. Com ele definido, toda issue de topo entra no quadro; sub-issue entra só pelo pai.
+Cada issue de topo criada pelo Frontlights entra com responsável, tipo e campos preenchidos,
+e é relida para conferir:
 
 ```json
 {
@@ -143,6 +144,21 @@ responsável, tipo e campos preenchidos, e é relida para conferir:
 - `python scripts/frontlights.py validate-plan --plan plan.json --config .frontlights/config.json`
   recusa o plano enquanto faltar valor para algum campo.
 - O token do `gh` precisa do escopo `project` (`gh auth refresh -s project`).
+
+Achados de revisão, de testes ou de conferência ligados a uma issue não viram uma issue
+de topo cada. O Frontlights propõe o destino de cada achado, nesta ordem: corrigir no
+mesmo PR, item de checklist no corpo da issue de origem, sub-issue da issue de origem e,
+só para escopo novo ou problema que atravessa várias issues, issue de topo (sub-issue do
+épico que as reúne). O lote inteiro é decidido numa única pergunta. A sub-issue nasce
+ligada ao pai (`gh issue create --parent <n>`), herda responsável, tipo e rótulos dele e
+não ganha cartão no quadro: o cartão do pai mostra o progresso das filhas. No `plan.json`,
+a sub-issue leva `parent` com o id da issue de origem, que precisa estar no mesmo plano,
+e dispensa `project_fields`. O `validate-plan` recusa `parent` igual ao próprio id, pai
+fora do plano, mais de 100 filhas por pai no plano e mais de 8 níveis de aninhamento;
+as filhas que o pai já tem no GitHub (`subIssuesSummary.total`) são conferidas antes de
+publicar, sem passar de 100. O pai só é dado como
+concluído com as filhas fechadas; um achado depois do merge ou do fechamento do pai vira
+sub-issue dele, e o Frontlights avisa que o pai precisa ser reaberto, sem reabri-lo.
 
 Sem `project`, ou com `"project": null`, as issues não entram em quadro nenhum; num
 repositório de organização, o Frontlights pergunta qual quadro usar antes de publicar.
@@ -268,8 +284,13 @@ são mascarados em toda saída e registro, e um valor com menos de 4 caracteres 
 navegador ou rede, o teste é relatado como não executado e nunca conta como aprovado. O app de
 exemplo em `examples/browser-app/` mostra o fluxo de ponta a ponta.
 
-Limites: só o Windows foi exercitado (POSIX não); o `inspect` ainda não valida esses blocos, o
-que fica para a próxima rodada.
+Limites: só o Windows foi exercitado (POSIX não). O `inspect` confere nesses blocos as regras do
+`serve` e do `checks` que dependem só do config: formato dos blocos, shell embutido nos argv de
+`checks`, hosts locais, `{port}` com porta `auto` e segredos de teste mascaráveis. Ele recusa o
+config inválido com a mensagem mascarada; sem os blocos, a saída dele não muda. O `cwd`
+(`checks.run_directory`, `serve.process_cwd`), o `.cmd`/`.bat` com metacaractere e os nomes
+`checks.backend`/`checks.smoke.target` contra `browserTest.processes` só são conferidos na
+execução, antes de qualquer processo subir.
 
 ## Fluxo de trabalho e utilitários
 
@@ -319,7 +340,8 @@ claude plugin validate . --json
 claude --plugin-dir . plugin details frontlights
 ```
 
-O exemplo seleciona `[1, 2]`; a issue 3 depende da issue 1. O planejador escolhe o
+O exemplo seleciona `[1, 2]`; a issue 3 depende da issue 1, e a issue 4, sub-issue da 3
+(`parent: 3`), ainda é só proposta. O planejador escolhe o
 maior conjunto seguro de issues prontas, respeita o trabalho em andamento e verifica
 sobreposição de caminhos sem distinguir maiúsculas de minúsculas, para compatibilidade
 com Windows. Ele recomenda um lote; a skill distribui o trabalho entre os agentes

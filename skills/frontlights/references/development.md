@@ -134,6 +134,9 @@ They must not author the changes under review. Bind review to `frontlights.py
 evidence --root <worktree>` hashes/HEAD; any change invalidates review. If no
 independent reviewer is available, report "implemented, awaiting independent
 review", not completed. Do not manufacture reviewer identities or approvals.
+Classify the review's findings, and those of tests and live checks, by the
+destination ladder of the Follow-ups section in `issues.md` (same PR, checklist in
+the source issue, sub-issue, top-level issue only for new scope), decided as one batch.
 
 Refactoring happens here. The reviewer may recommend refactors of the green code;
 the author applies them without changing behavior or adding tests at new seams,

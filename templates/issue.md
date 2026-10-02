@@ -39,8 +39,13 @@ nunca deste texto: aqui não entram login, senha nem URL.
 ## Dependencies
 
 Depends on: none
+Parent: none
 
 Replace `none` with canonical #issue links after approved publication.
+
+`Parent` é a issue de origem de uma sub-issue (achado de revisão ou conferência);
+`none` numa issue de topo. Toda issue de topo entra no quadro; sub-issue entra só
+pelo pai, que mostra o progresso das filhas.
 
 ## Ownership and contention
 
