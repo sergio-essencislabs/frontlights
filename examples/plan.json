@@ -45,6 +45,22 @@
       "risks": ["Race between validation and persistence"],
       "session_sized": true,
       "status": "ready"
+    },
+    {
+      "id": 4,
+      "url": "https://github.com/example/pilot/issues/4",
+      "parent": 3,
+      "title": "Show the conflict message in the user's language",
+      "outcome": "A review finding on issue 3: the stale-edit conflict reads in the user's language",
+      "acceptance": ["The conflict message of a stale edit is translated"],
+      "tests": ["Stale edit in a second tab shows the translated message"],
+      "ownership": ["src/observations", "tests/observations"],
+      "dependencies": [3],
+      "vertical_check": "Edit in a stale tab and read the translated conflict message",
+      "non_goals": ["Translating other messages"],
+      "risks": ["Missing translation key"],
+      "session_sized": true,
+      "status": "proposed"
     }
   ]
 }
