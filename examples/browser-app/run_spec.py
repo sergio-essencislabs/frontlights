@@ -8,7 +8,8 @@ A URL vem do `serve start` (a porta reservada do processo `app`). A conta é o p
 Imprime um objeto JSON em stdout com `resultado`:
   passou         toda a spec rodou e passou (nenhum teste pulado, falho ou instável; `.only` é proibido) e o
                  Playwright saiu com 0;
-  falhou         algum teste falhou ou o Playwright saiu com código diferente de zero;
+  falhou         algum teste falhou ou foi marcado como esperado falhar (test.fail), ou o Playwright saiu com
+                 código diferente de zero;
   nao_executado  a spec não pôde rodar ou não rodou inteira: --base-url fora de 127.0.0.1, localhost ou ::1 (a
                  conta nem é entregue), sem Node, sem @playwright/test, sem navegador baixado, app fora do ar
                  (ou sem rede), tempo esgotado, relatório ilegível, teste pulado ou nenhum teste executado.
@@ -133,21 +134,30 @@ def outcome(result, reason=None, **extra):
     return dict({'resultado': result, 'aprovado': result == 'passou', 'motivo': reason}, **extra)
 
 
-def error_messages(report, mask):
-    found = []
-
+def tests_of(report):
+    """Todos os testes do relatório JSON do Playwright, das suites aninhadas às specs."""
     def walk(suite):
         for spec in suite.get('specs', []):
-            for test in spec.get('tests', []):
-                for attempt in test.get('results', []):
-                    message = (attempt.get('error') or {}).get('message')
-                    if message:
-                        found.append(mask(ANSI.sub('', message))[:1000])
+            yield from spec.get('tests', [])
         for child in suite.get('suites', []):
-            walk(child)
-
+            yield from walk(child)
     for suite in report.get('suites', []):
-        walk(suite)
+        yield from walk(suite)
+
+
+def kind(test):
+    """passaram, falharam, pulados ou instaveis, pelo resultado final real (não pelo que o teste esperava)."""
+    statuses = [attempt.get('status') for attempt in test.get('results', [])]
+    if test.get('expectedStatus') == 'skipped' or statuses[-1:] == ['skipped']:
+        return 'pulados'
+    if statuses[-1:] != ['passed']:
+        return 'falharam'
+    return 'instaveis' if len(statuses) > 1 else 'passaram'
+
+
+def error_messages(report, mask):
+    found = [mask(ANSI.sub('', message))[:1000] for test in tests_of(report) for attempt in test.get('results', [])
+             for message in [(attempt.get('error') or {}).get('message')] if message]
     found += [mask(ANSI.sub('', (error or {}).get('message', '')))[:1000] for error in report.get('errors', [])]
     return [message for message in found if message][:5]
 
@@ -162,13 +172,18 @@ def judge(code, stdout, stderr, report_text, timeout, mask):
                        '`npx playwright install chromium` nesta pasta (veja o README).', saida=output)
     try:
         report = json.loads(report_text) if report_text else None
-        stats = report['stats']
-        counts = {'passaram': int(stats.get('expected', 0)), 'falharam': int(stats.get('unexpected', 0)),
-                  'pulados': int(stats.get('skipped', 0)), 'instaveis': int(stats.get('flaky', 0))}
-    except (ValueError, TypeError, KeyError):
+        tests = list(tests_of(report))
+        counts = {name: 0 for name in ('passaram', 'falharam', 'pulados', 'instaveis')}
+        for test in tests:
+            counts[kind(test)] += 1
+        details = {'testes': counts, 'erros': error_messages(report, mask), 'saida': output}
+    except (ValueError, TypeError, AttributeError):
         return outcome('nao_executado', f'O Playwright terminou (código {code}) sem um relatório legível.',
                        saida=output)
-    details = {'testes': counts, 'erros': error_messages(report, mask), 'saida': output}
+    marked = [test.get('expectedStatus') for test in tests if test.get('expectedStatus') not in ('passed', 'skipped')]
+    if marked:
+        return outcome('falhou', f'Um teste está marcado como esperado falhar (test.fail; expectedStatus '
+                       f'"{marked[0]}"): a spec não comprovou o login.', **details)
     if counts['falharam'] == 0 and (counts['pulados'] or counts['passaram'] + counts['instaveis'] == 0):
         return outcome('nao_executado', f'A spec não rodou inteira ({counts["pulados"]} teste(s) pulado(s), '
                        f'{counts["passaram"] + counts["instaveis"]} executado(s)): ela não comprovou o login.',
@@ -179,8 +194,8 @@ def judge(code, stdout, stderr, report_text, timeout, mask):
 
 
 def run(config, base_url, timeout=DEFAULT_TIMEOUT):
-    try:
-        host = urllib.parse.urlsplit(base_url).hostname
+    try:  # `@` e `\` mudam o host que o navegador lê (`http://a\@127.0.0.1/` vai para `a`): recusados.
+        host = None if '@' in base_url or '\\' in base_url else urllib.parse.urlsplit(base_url).hostname
     except ValueError:
         host = None
     if host not in LOCAL_HOSTS:

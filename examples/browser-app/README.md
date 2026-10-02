@@ -44,9 +44,10 @@ A `<porta>` é a `port` do processo `app` na saída do `serve start`.
 
 O `run_spec.py` imprime um objeto JSON e sai com 0 (`passou`), 1 (`falhou`) ou 3
 (`nao_executado`). Só `passou` traz `aprovado: true`, e só quando a spec inteira rodou e
-passou: um teste pulado (`skip`, `fixme`) deixa o resultado `nao_executado`, e um `.only` na spec
-é proibido (`--forbid-only`). A `--base-url` precisa ser de host local (`127.0.0.1`,
-`localhost` ou `::1`); outra é recusada como `nao_executado`, antes de qualquer requisição e
+passou: um teste pulado (`skip`, `fixme`) deixa o resultado `nao_executado`, um teste marcado
+como esperado falhar (`test.fail`) deixa `falhou`, e um `.only` na spec é proibido
+(`--forbid-only`). A `--base-url` precisa ser de host local (`127.0.0.1`, `localhost` ou `::1`,
+sem `@` nem `\`); outra é recusada como `nao_executado`, antes de qualquer requisição e
 sem entregar a conta. Sem Node, sem `@playwright/test`, sem o navegador baixado, com o app fora
 do ar (ou sem rede), com tempo esgotado ou sem nenhum teste executado, o resultado também é
 `nao_executado` e o `motivo` diz o que faltou: isso nunca conta como aprovado. Login e senha

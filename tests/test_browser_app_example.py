@@ -235,11 +235,27 @@ class RunnerOutcomeTest(unittest.TestCase):
         with mock.patch.multiple(self.runner, **defaults):
             return self.runner.run(CONFIG, base_url)
 
-    def report(self, expected=0, unexpected=0, skipped=0, flaky=0, message=''):
-        tests = [{'results': [{'status': 'failed', 'error': {'message': message}}]}] if message else []
-        return json.dumps({'stats': {'expected': expected, 'unexpected': unexpected, 'skipped': skipped,
-                                     'flaky': flaky},
-                           'suites': [{'specs': [{'title': 'login', 'tests': tests}]}], 'errors': []})
+    def report(self, expected=0, unexpected=0, skipped=0, flaky=0, message='', tests=()):
+        """A Playwright JSON report with one test per count, inside nested suites (the runner reads the tests)."""
+        def test(*statuses, wanted='passed'):
+            return {'expectedStatus': wanted, 'results': [{'status': status, 'error': {'message': message}}
+                                                          for status in statuses]}
+        items = ([test('passed')] * expected + [test('failed')] * unexpected + [test('failed', 'passed')] * flaky
+                 + [test('skipped', wanted='skipped')] * skipped + list(tests))
+        return json.dumps({'suites': [{'suites': [{'specs': [{'title': 'login', 'tests': items}]}]}], 'errors': []})
+
+    def test_a_test_expected_to_fail_never_approves_the_run(self):
+        for wanted, status in (('failed', 'failed'), ('timedOut', 'timedOut'), ('failed', 'passed')):
+            marked = {'expectedStatus': wanted, 'annotations': [{'type': 'fail'}], 'results': [{'status': status}]}
+            for passed in (0, 1):
+                result = self.run_with(run_playwright=self.playwright(0, self.report(expected=passed,
+                                                                                     tests=[marked])))
+                self.assertEqual(result['resultado'], 'falhou', (wanted, status, result))
+                self.assertIs(result['aprovado'], False)
+                self.assertIn('test.fail', result['motivo'])
+        skipped = {'expectedStatus': 'skipped', 'annotations': [{'type': 'skip'}], 'results': [{'status': 'skipped'}]}
+        result = self.run_with(run_playwright=self.playwright(0, self.report(expected=1, tests=[skipped])))
+        self.assert_not_run(result, 'pulado')
 
     def playwright(self, code, report, stdout='', stderr=''):
         return lambda *args, **kwargs: (code, stdout, stderr, report)
@@ -307,7 +323,8 @@ class RunnerOutcomeTest(unittest.TestCase):
             return lambda *args, **kwargs: calls.append(name)
 
         for url in ('https://homologacao.exemplo.test/', 'http://localhost.exemplo.test:8080/',
-                    'http://127.0.0.1.exemplo.test/', 'http://10.0.0.5:3000/', 'http://[::1'):
+                    'http://127.0.0.1.exemplo.test/', 'http://10.0.0.5:3000/', 'http://[::1',
+                    'http://10.0.0.5:3000\\@127.0.0.1:4321/', 'http://conta@127.0.0.1:4321/'):
             result = self.run_with(base_url=url, app_answers=spy('app_answers'), run_playwright=spy('playwright'))
             self.assert_not_run(result, 'local')
             self.assertEqual(calls, [], url)
@@ -452,31 +469,49 @@ class RealSpecTest(ServeCase):
         mutants = {
             'test.skip': original.replace(login_test, "test.skip('entra com"),
             'test.fixme': original.replace(login_test, "test.fixme('entra com"),
-            'test.skip(true) no corpo': original.replace("async ({ page }) => {", "async ({ page }) => { test.skip(true);", 1),
+            'test.skip(true) no corpo': original.replace("async ({ page }) => {",
+                                                         "async ({ page }) => { test.skip(true);", 1),
             'test.describe.skip': original.replace(login_test, "test.describe.skip('grupo', () => {\n" + login_test)
                                           .replace(wrong_test, "});\n" + wrong_test),
             'test.only na senha errada': original.replace(wrong_test, "test.only('recusa a"),
         }
+        # With a wrong password in the config the login really fails; a test marked to fail must not turn that
+        # failure into an approval.
+        expected_to_fail = {
+            'test.fail declarado': original.replace(login_test, "test.fail('entra com"),
+            'test.fail() no corpo': original.replace("async ({ page }) => {", "async ({ page }) => { test.fail();", 1),
+            'test.fail(true, motivo) no corpo': original.replace(
+                "async ({ page }) => {", "async ({ page }) => { test.fail(true, 'bug conhecido');", 1),
+        }
         node_path = os.pathsep.join(item for item in (str(EXAMPLE / 'node_modules'), os.environ.get('NODE_PATH'))
                                     if item)
-        def run_copy(source):
+
+        def run_copy(source, password=None):
             with tempfile.TemporaryDirectory() as copy:
                 for item in ('run_spec.py', 'playwright.config.js'):
                     shutil.copy2(EXAMPLE / item, Path(copy) / item)
                 (Path(copy) / 'login.spec.js').write_text(source, encoding='utf-8')
-                done = subprocess.run([sys.executable, str(Path(copy) / 'run_spec.py'), '--config', str(CONFIG),
-                                       '--base-url', f'{base}/'], capture_output=True, text=True, encoding='utf-8',
-                                      errors='replace', timeout=600, env=utf8_env(NODE_PATH=node_path))
+                config = json.loads(CONFIG.read_text(encoding='utf-8'))
+                if password is not None:
+                    config['browserTest']['users'][0]['password'] = password
+                (Path(copy) / 'config.json').write_text(json.dumps(config), encoding='utf-8')
+                done = subprocess.run([sys.executable, str(Path(copy) / 'run_spec.py'), '--config',
+                                       str(Path(copy) / 'config.json'), '--base-url', f'{base}/'],
+                                      capture_output=True, text=True, encoding='utf-8', errors='replace',
+                                      timeout=600, env=utf8_env(NODE_PATH=node_path))
                 return done, json.loads(done.stdout)
 
         control, result = run_copy(original)
         if result['resultado'] == 'nao_executado':
             self.skipTest(f'spec real não executada: {result["motivo"]}')
         self.assertEqual((result['resultado'], control.returncode), ('passou', 0), result)
-        for name, source in mutants.items():
+        wrong = account()[1] + '-errada'
+        cases = [(name, source, None) for name, source in mutants.items()]
+        cases += [(name, source, wrong) for name, source in expected_to_fail.items()]
+        for name, source, password in cases:
             with self.subTest(name):
                 self.assertNotEqual(source, original)
-                done, result = run_copy(source)
+                done, result = run_copy(source, password)
                 self.assertNotEqual(result['resultado'], 'passou', result)
                 self.assertIs(result['aprovado'], False)
                 self.assertNotEqual(done.returncode, 0)
