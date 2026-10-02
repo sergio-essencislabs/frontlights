@@ -366,45 +366,43 @@ def verification_candidates(root):
     return []
 
 
-def validate_test_blocks(config):
-    """Refuse the browserTest and checks blocks with the rules of serve.py and checks.py; absent or null: nothing.
+def validate_test_blocks(config, path):
+    """Refuse the browserTest and checks blocks with the config-only rules of serve.py and checks.py.
 
-    The validators read a config file, so the loaded config goes to a temporary copy. The refusal text gets the
-    checks mask (test login and password, also percent-encoded), so it never echoes a secret.
+    Absent or null blocks: nothing is read. The validators read `path`, the file `config` was loaded from (no
+    copy of the test password is written anywhere). The refusal text gets the checks mask (test login and
+    password, also percent-encoded), so it never echoes a secret.
     """
     browser, block = config.get('browserTest'), config.get('checks')
     if browser is None and block is None:
         return
-    import tempfile
+    require(path is not None, 'browserTest/checks: o inspect precisa do caminho do config para validar os blocos')
     import checks
     import serve
-    with tempfile.TemporaryDirectory() as folder:
-        path = Path(folder) / 'config.json'
-        path.write_text(json.dumps(config), encoding='utf-8')
-        checks.load_user_secrets(path)
-        try:
-            if browser is not None:
-                checks.require_maskable_user_secrets(path)
-                serve.load_block(path)
-                checks.require_local_declarations(path)
-            if block is not None:
-                if not isinstance(block, dict):
-                    raise checks.Refused('checks precisa ser um objeto com regression, integration ou smoke.')
-                for name in ('regression', 'integration'):
-                    if name in block:
-                        checks.command_settings(path, name)
-                if 'smoke' in block:
-                    checks.smoke_settings(path)
-                checks.optional_name(block.get('backend'), 'checks.backend')
-        except (serve.Refusal, checks.Refused, checks.Infra) as refusal:
-            raise ValueError(checks.redact(str(refusal))) from None
+    checks.load_user_secrets(path)
+    try:
+        if browser is not None:
+            checks.require_maskable_user_secrets(path)
+            serve.load_block(path)
+            checks.require_local_declarations(path)
+        if block is not None:
+            if not isinstance(block, dict):
+                raise checks.Refused('checks precisa ser um objeto com regression, integration ou smoke.')
+            for name in ('regression', 'integration'):
+                if name in block:
+                    checks.command_settings(path, name)
+            if 'smoke' in block:
+                checks.smoke_settings(path)
+            checks.optional_name(block.get('backend'), 'checks.backend')
+    except (serve.Refusal, checks.Refused, checks.Infra) as refusal:
+        raise ValueError(checks.redact(str(refusal))) from None
 
 
-def inspect(config, root):
+def inspect(config, root, config_path=None):
     # A missing key is a typo, not a local project: only an explicit null disables GitHub.
     require('repository' in config and repository_or_local(config['repository']),
             'repository must be owner/name, or null for a local project')
-    validate_test_blocks(config)
+    validate_test_blocks(config, config_path)
     repo = config['repository']
     result = {'repository': repo, 'fetched_at': dt.datetime.now(dt.timezone.utc).isoformat(),
               'sources': {}, 'verification_commands': {},
@@ -739,7 +737,7 @@ def main():
         elif args.command == 'context':
             result = {'action': context_action(args.used, args.reserve)}
         elif args.command == 'inspect':
-            result = inspect(load(args.config), args.root)
+            result = inspect(load(args.config), args.root, args.config)
         elif args.command == 'evidence':
             result = git_evidence(args.root)
         elif args.command == 'monitoring':

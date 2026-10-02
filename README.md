@@ -268,9 +268,13 @@ são mascarados em toda saída e registro, e um valor com menos de 4 caracteres 
 navegador ou rede, o teste é relatado como não executado e nunca conta como aprovado. O app de
 exemplo em `examples/browser-app/` mostra o fluxo de ponta a ponta.
 
-Limites: só o Windows foi exercitado (POSIX não). O `inspect` valida esses blocos com as mesmas
-regras do `serve` e do `checks` (inclusive a recusa de shell embutido) e recusa o config inválido
-com a mensagem mascarada; sem os blocos, a saída dele não muda.
+Limites: só o Windows foi exercitado (POSIX não). O `inspect` confere nesses blocos as regras do
+`serve` e do `checks` que dependem só do config: formato dos blocos, shell embutido nos argv de
+`checks`, hosts locais, `{port}` com porta `auto` e segredos de teste mascaráveis. Ele recusa o
+config inválido com a mensagem mascarada; sem os blocos, a saída dele não muda. O `cwd`
+(`checks.run_directory`, `serve.process_cwd`), o `.cmd`/`.bat` com metacaractere e os nomes
+`checks.backend`/`checks.smoke.target` contra `browserTest.processes` só são conferidos na
+execução, antes de qualquer processo subir.
 
 ## Fluxo de trabalho e utilitários
 

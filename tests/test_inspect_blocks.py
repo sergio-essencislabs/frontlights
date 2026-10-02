@@ -1,4 +1,4 @@
-"""`inspect` valida os blocos browserTest e checks com as mesmas regras do serve e do checks.
+"""`inspect` valida os blocos browserTest e checks com as regras do serve e do checks que dependem só do config.
 
 Sem os blocos, a saída do `inspect` não muda. Só marcadores genéricos (repositório público).
 """
@@ -10,9 +10,12 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import quote
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
+import checks
 import frontlights
+import serve
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'scripts' / 'frontlights.py'
@@ -46,6 +49,14 @@ def with_checks(**checks):
     return {'repository': None, 'checks': checks}
 
 
+def inspect_file(config, root):
+    """Grava o config em uma pasta própria (fora da raiz inspecionada) e chama o inspect com o caminho real."""
+    with tempfile.TemporaryDirectory() as folder:
+        path = Path(folder) / 'config.json'
+        path.write_text(json.dumps(config), encoding='utf-8')
+        return frontlights.inspect(config, root, path)
+
+
 def stable(result):
     """Tira o horário da leitura, o único campo que muda entre duas execuções."""
     result = dict(result)
@@ -72,6 +83,25 @@ class InspectWithoutBlocksTests(unittest.TestCase):
             nulls = frontlights.inspect({'repository': None, 'browserTest': None, 'checks': None}, root)
         self.assertEqual(stable(nulls), stable(plain))
 
+    def test_no_validator_runs_and_nothing_is_read_without_blocks(self):
+        def forbidden(*args, **kwargs):
+            raise AssertionError('validador chamado sem os blocos')
+        names = ('read_config', 'load_user_secrets', 'require_maskable_user_secrets', 'require_local_declarations',
+                 'command_settings', 'smoke_settings', 'optional_name')
+        with tempfile.TemporaryDirectory() as root, patch.object(serve, 'load_block', forbidden), \
+                patch.object(frontlights.Path, 'write_text', forbidden):
+            patches = [patch.object(checks, name, forbidden) for name in names]
+            for item in patches:
+                item.start()
+            try:
+                for config in ({'repository': None}, {'repository': None, 'browserTest': None, 'checks': None}):
+                    with self.subTest(config=config):
+                        frontlights.inspect(config, root)
+                        frontlights.inspect(config, root, Path(root) / 'ausente.json')
+            finally:
+                for item in patches:
+                    item.stop()
+
     def test_cli_output_without_blocks_has_the_same_keys(self):
         with tempfile.TemporaryDirectory() as root:
             config = Path(root) / 'config.json'
@@ -87,8 +117,22 @@ class InspectValidBlocksTests(unittest.TestCase):
     def test_example_config_is_accepted_and_does_not_change_the_output(self):
         with tempfile.TemporaryDirectory() as root:
             plain = {k: v for k, v in local(EXAMPLE).items() if k not in ('browserTest', 'checks')}
-            self.assertEqual(stable(frontlights.inspect(local(EXAMPLE), root)),
+            self.assertEqual(stable(inspect_file(local(EXAMPLE), root)),
                              stable(frontlights.inspect(plain, root)))
+
+    def test_validators_read_the_real_config_file(self):
+        with tempfile.TemporaryDirectory() as root, \
+                patch.object(checks, 'load_user_secrets', wraps=checks.load_user_secrets) as secrets, \
+                patch.object(serve, 'load_block', wraps=serve.load_block) as block:
+            path = Path(root) / 'config.json'
+            path.write_text(json.dumps(local(EXAMPLE)), encoding='utf-8')
+            frontlights.inspect(local(EXAMPLE), root, path)
+        secrets.assert_called_once_with(path)
+        block.assert_called_once_with(path)
+
+    def test_blocks_without_a_config_path_are_refused(self):
+        with tempfile.TemporaryDirectory() as root, self.assertRaisesRegex(ValueError, 'caminho do config'):
+            frontlights.inspect(local(EXAMPLE), root)
 
     def test_example_config_through_the_cli(self):
         with tempfile.TemporaryDirectory() as root:
@@ -106,7 +150,7 @@ class InspectRefusesInvalidBlocksTests(unittest.TestCase):
     def refuse(self, config, pattern):
         with tempfile.TemporaryDirectory() as root, patch.object(frontlights, 'run') as network, \
                 self.assertRaisesRegex(ValueError, pattern) as caught:
-            frontlights.inspect(config, root)
+            inspect_file(config, root)
         network.assert_not_called()
         return str(caught.exception)
 
@@ -147,13 +191,24 @@ class InspectRefusesInvalidBlocksTests(unittest.TestCase):
         self.refuse(with_checks(backend=7), 'checks.backend')
 
     def test_checks_must_be_an_object(self):
-        self.refuse(with_checks() | {'checks': ['regression']}, 'checks')
+        message = self.refuse(with_checks() | {'checks': ['regression']}, 'checks')
+        self.assertEqual(message, 'checks precisa ser um objeto com regression, integration ou smoke.')
 
     def test_refusal_never_shows_the_test_password(self):
         # o nome do processo repete a senha, e a mensagem de recusa cita o nome
         config = with_browser(process(name=PASSWORD, health='http://127.0.0.1:8080/health'))
         message = self.refuse(config, r'\{port\}')
         self.assertNotIn(PASSWORD, message)
+
+    def test_refusal_never_shows_the_percent_encoded_test_password(self):
+        password = 's3nh@#&'
+        encoded = quote(password, safe='')
+        config = with_browser(process(name=encoded, health='http://127.0.0.1:8080/health'),
+                              users=[{'login': 'usuario@exemplo.test', 'password': password}])
+        message = self.refuse(config, r'\{port\}')
+        self.assertIn(checks.MASK, message)
+        self.assertNotIn(encoded, message)
+        self.assertNotIn(password, message)
 
     def test_cli_reports_the_refusal_as_json_without_the_password(self):
         config = with_browser(process(name=PASSWORD, health='http://127.0.0.1:8080/health'))
