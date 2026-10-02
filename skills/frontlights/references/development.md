@@ -123,6 +123,10 @@ syntax/build checks. Inspect the full vertical behavior, diff, regressions and
 acceptance coverage. Tests may execute arbitrary code; native permission and
 sandbox controls still apply. Unexpected effects stop the affected issue.
 
+When the issue's `## Navegador e testes ligados` turns tests on, follow
+[browser-testing.md](browser-testing.md) before review; its records join the
+evidence below.
+
 ## Review, checkpoints and renewal
 
 Require an independent reviewer to inspect the current diff and test evidence.

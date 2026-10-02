@@ -26,6 +26,16 @@ Only these seams receive tests. A missing or wrong seam goes back to the user.
 
 Focused regression, broader integration and actual type-check commands.
 
+## Navegador e testes ligados
+
+- Toca o frontend: <sim | não>
+- Conta: <conta 1 | contas 1 e 2>
+- Fluxo: <telas e ações a exercitar, com o resultado esperado>
+- Testes ligados: <navegador, integração, regressão, permissões entre contas, smoke>; casos extras: <nenhum>
+
+Contas e processos vêm de `browserTest` no `.frontlights/config.json` do projeto,
+nunca deste texto: aqui não entram login, senha nem URL.
+
 ## Dependencies
 
 Depends on: none

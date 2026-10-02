@@ -15,7 +15,8 @@ named workers, GuardianS, initialization prompts or a second coordinator. Read
 `${CLAUDE_PLUGIN_ROOT}/docs/protocol.md` and `${CLAUDE_PLUGIN_ROOT}/docs/security.md`
 before execution. The references are `references/grilling.md` (stage 3),
 `references/prd.md` (stage 4), `references/issues.md` (stage 5),
-`references/development.md` (stage 6, with `tdd-tests.md` and `tdd-mocking.md`),
+`references/development.md` (stage 6, with `tdd-tests.md`, `tdd-mocking.md` and
+`browser-testing.md`),
 `references/roadmap-sync.md` (the roadmap question of stage 1, when the user
 says yes), `references/progress-report.md` (the progress question that follows it,
 when the user says yes) and `references/remote-control.md`, read only when the user asks for
@@ -266,7 +267,8 @@ configured board.
 
 ## 6. Bounded development
 
-Read `references/development.md`. If the user intends to be away, rerun the
+Read `references/development.md`, and `references/browser-testing.md` for each
+issue whose plan turns on browser or other tests. If the user intends to be away, rerun the
 stage 0 preflight and report it in one line; if the host is gone, repeat the
 `claude rc` guidance. Do not turn this into a question. Inventory hooks,
 permission settings, confirmation requirements and integration access without
