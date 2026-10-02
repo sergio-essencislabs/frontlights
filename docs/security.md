@@ -105,6 +105,27 @@ O resumo para a diretoria (`scripts/progress_report.py`) executa comandos lidos 
 
 Os testes usam transporte e datas simulados e não homologam o RoadS real.
 
+O teste de navegador (`scripts/serve.py`) e as verificações (`scripts/checks.py`) também
+executam comandos lidos do `.frontlights/config.json` (blocos `browserTest` e `checks`):
+
+- **Comandos sem shell:** cada `argv` é uma lista executada diretamente. O filtro de shell
+  embutido (cmd, sh, powershell, `.bat`, `&&`, `|`, `python -c`, wrappers como `env` e `xargs`)
+  é uma barreira contra erro de configuração, não prova de inocuidade: ele olha só o argv, não
+  enxerga o que `python script.py`, `npm test` ou outro executável fazem por dentro e não
+  reconhece shells renomeados nem wrappers e interpretadores fora da lista.
+- **Só hosts locais:** `health`, `baseUrl` e o backend de integração precisam estar em
+  `127.0.0.1`, `localhost` ou `::1`; outro host é recusado antes de qualquer requisição.
+- **Senha em texto:** `browserTest.users` guarda login e senha de contas **de teste** em texto
+  no config do projeto de destino, fora do Git. É um risco aceito pelo mantenedor, válido só para
+  contas de teste, nunca para contas reais ou de produção. Os dois valores são mascarados em toda
+  saída e registro (também codificados em URL); um valor com menos de 4 caracteres ou com o texto
+  do marcador de máscara é recusado, porque não pode ser ocultado com segurança.
+- **Sem aprovação do bloco:** ao contrário do resumo para a diretoria, esses blocos não têm
+  aprovação assinada, e o `inspect` ainda não os valida. Revise-os antes de rodar num projeto
+  clonado.
+
+Os testes desses utilitários rodaram só no Windows; o caminho POSIX não foi exercitado.
+
 A conexão do celular exige confirmação do usuário na sessão atual do Claude, ou
 uma confirmação registrada em `.frontlights/monitoring.json` cujo host continua o
 mesmo processo: mesmo pid e início anterior à confirmação. Host reiniciado ou pid

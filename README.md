@@ -235,6 +235,38 @@ comando). Qualquer mudança nele pede nova aprovação. Os coletores não recebe
 comando de envio o recebe, pela variável de ambiente. Este repositório não traz coletor nenhum. O
 utilitário é `python scripts/progress_report.py status|approve|window|collect|push --root <projeto>`.
 
+### Teste de navegador e verificações (opcional)
+
+No fim de uma issue cujo plano liga o teste de navegador, o Frontlights sobe o ambiente da
+própria branch, roda as verificações e entra no app com as contas de teste. Os blocos
+`browserTest` e `checks` ficam no `.frontlights/config.json` do projeto (veja
+`examples/config.json`):
+
+- `python scripts/serve.py start|status|stop --config <config> --root <worktree> --issue <n>`
+  sobe, consulta ou derruba os processos de `browserTest.processes` (lista de argumentos, sem
+  shell), espera o `health` de cada um e grava os pids em `.frontlights/serve/<n>.json`;
+- `"port": "auto"` reserva uma porta livre por processo na pasta comum do Git, vista por todas
+  as worktrees, e a entrega em `PORT`, `FRONTLIGHTS_PORT_<NOME>` e `{port}` no argv; o `health`
+  precisa ter `{port}` no lugar da porta (`http://127.0.0.1:{port}/health`). Um projeto cujo
+  servidor fixa a própria porta usa `port` fixo, e aí só uma issue por vez pode subi-lo;
+- `python scripts/checks.py regression|integration|smoke --config <config> --root <worktree> --issue <n>`
+  roda a suíte na base e na branch (só falha nova bloqueia; `regression` pede também
+  `--base <checkout-da-base>`), o comando de integração contra o backend da branch e os
+  caminhos de smoke. Códigos: 0 passou, 1 falha de produto, 2 config recusada (nada rodou),
+  3 infraestrutura;
+- só hosts locais (`127.0.0.1`, `localhost`, `::1`) são aceitos; nunca aponte um teste para
+  homologação ou produção.
+
+`browserTest.users` traz a conta 1 e, para o teste de permissões entre contas, a conta 2, com
+login e senha **em texto** no `.frontlights/config.json` do projeto de destino, fora do Git. É
+um risco aceito só para contas de teste: nunca use uma conta real ou de produção. Login e senha
+são mascarados em toda saída e registro, e um valor com menos de 4 caracteres é recusado. Sem
+navegador ou rede, o teste é relatado como não executado e nunca conta como aprovado. O app de
+exemplo em `examples/browser-app/` mostra o fluxo de ponta a ponta.
+
+Limites: só o Windows foi exercitado (POSIX não); o `inspect` ainda não valida esses blocos, o
+que fica para a próxima rodada.
+
 ## Fluxo de trabalho e utilitários
 
 Verificação do host do Remote Control (sem pergunta; orienta `claude rc` quando falta)
