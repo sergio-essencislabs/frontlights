@@ -26,5 +26,21 @@
       "draftGuide": "docs/progress-draft.md",
       "shotsDir": ".frontlights/progress/shots"
     }
+  },
+  "browserTest": {
+    "baseUrl": "http://127.0.0.1:{port}/",
+    "users": [
+      {"login": "usuario1@exemplo.test", "password": "senha-ficticia"},
+      {"login": "usuario2@exemplo.test", "password": "senha-ficticia"}
+    ],
+    "processes": [
+      {"name": "web", "argv": ["python", "APP_SCRIPT", "{port}"], "port": "auto", "health": "http://127.0.0.1:{port}/health", "timeoutSeconds": 60}
+    ]
+  },
+  "checks": {
+    "backend": "web",
+    "regression": {"argv": ["python", "-m", "unittest", "discover", "-s", "tests"], "timeoutSeconds": 900},
+    "integration": {"argv": ["python", "INTEGRATION_SCRIPT", "{backend_url}"], "timeoutSeconds": 300},
+    "smoke": {"target": "web", "paths": ["/", "/health"], "expectStatus": [200, 302], "timeoutSeconds": 30}
   }
 }

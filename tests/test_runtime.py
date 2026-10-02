@@ -178,6 +178,26 @@ class ReleaseManifestTests(unittest.TestCase):
         self.assertTrue(all(t['repository'] == 'OWNER/REPOSITORY' for t in sync['issueTargets'].values()))
         self.assertNotIn('guardian', json.dumps(example).lower())
 
+    def test_example_config_browser_and_checks_blocks_load_without_refusal(self):
+        import checks
+        import serve
+        path = ROOT / 'examples' / 'config.json'
+        example = json.loads(path.read_text(encoding='utf-8'))
+        processes = serve.load_block(path)
+        self.assertTrue(processes and all(p['port'] == 'auto' for p in processes))
+        self.assertTrue(all(p['health'].startswith('http://127.0.0.1:{port}/') for p in processes))
+        checks.require_maskable_user_secrets(path)
+        checks.require_local_declarations(path)
+        for name in ('regression', 'integration'):
+            with self.subTest(check=name):
+                self.assertTrue(checks.command_settings(path, name)['argv'])
+        self.assertTrue(checks.smoke_settings(path)['paths'])
+        logins = [user['login'] for user in example['browserTest']['users']]
+        self.assertEqual(logins, ['usuario1@exemplo.test', 'usuario2@exemplo.test'])
+        self.assertTrue(all(user['password'] == 'senha-ficticia' for user in example['browserTest']['users']))
+        hosts = re.findall(r'https?://([^/:"]+)', json.dumps({k: example[k] for k in ('browserTest', 'checks')}))
+        self.assertTrue(hosts and set(hosts) <= {'127.0.0.1', 'localhost'})
+
     def test_work_is_named_by_issue_never_by_retired_gt_ids(self):
         skill = ROOT / 'skills' / 'frontlights'
         text = (skill / 'SKILL.md').read_text(encoding='utf-8')
