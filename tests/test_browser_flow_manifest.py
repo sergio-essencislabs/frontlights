@@ -24,9 +24,10 @@ LOCAL_HOSTS = {'127.0.0.1', 'localhost', '[::1]'}
 NAMED_HOSTS = {'127.0.0.1', 'localhost', 'exemplo.test'}
 FILE_EXTENSIONS = {'js', 'ts', 'mjs', 'cjs', 'json', 'md', 'py', 'yml', 'yaml', 'toml', 'txt'}
 CONFIG_KEYS = ('browsertest.', 'checks.', 'os.', 'sys.', 'subprocess.')
-# the word may be quoted or bold (`"login":`, `**senha**:`) and the value may open with a quote or backtick
-CREDENTIAL = re.compile(r'\b(?:senha|password|passwd|login|usu[aá]rio|user)\b["*`]*(?:\s*([:=])\s*|\s+)["`]?'
-                        r'([^\s,;)`"]+)', re.I)
+# the word may be quoted or bold (`"login":`, `'senha':`, `**senha**:`), a table cell (`| senha | x |`)
+# and the value may open with a quote or backtick
+CREDENTIAL = re.compile(r'\b(?:senha|password|passwd|login|usu[aá]rio|user)\b["\'*`]*(?:\s*([:=|])\s*|\s+)["\'`]?'
+                        r'([^\s,;)`"\'|]+)', re.I)
 VERSION = re.compile(r'\d+(?:\.\d+){0,2}(?::\d+)?|[a-z](?:\.[a-z])+')  # 3.12, 0.13.0, 3000:3000, e.g, i.e
 HOST = re.compile(r'(?<![\w.-])(?:[\w-]+(?:\.[\w-]+)+(?::\d+)?|[\w-]+:\d+\b)')
 
@@ -163,11 +164,13 @@ class BrowserFlowManifestTests(unittest.TestCase):
 
     def test_credential_scan_catches_json_backtick_and_bold_forms(self):
         for leak in ('{"login": "conta1", "password": "Teste@123"}', 'password: `Teste@123`',
-                     '**login**: conta1', 'senha: Teste@123', 'login=conta1', 'password Teste@123'):
+                     '**login**: conta1', 'senha: Teste@123', 'login=conta1', 'password Teste@123',
+                     '| senha | Teste@123 |', '| login | conta1 |', "'senha': 'x9'",
+                     "{'login': 'conta1', 'password': 'Teste@123'}"):
             with self.subTest(leak=leak):
                 self.assertTrue(credential_leaks(leak))
         for clean in ('login: `<conta 1>`', 'password: {senha}', '"login": "<login>"', 'the login and password',
-                      '**senha**: `<senha da conta 2>`'):
+                      '**senha**: `<senha da conta 2>`', '| senha | <senha da conta 2> |', '| login | {login} |'):
             with self.subTest(clean=clean):
                 self.assertEqual(credential_leaks(clean), [])
 

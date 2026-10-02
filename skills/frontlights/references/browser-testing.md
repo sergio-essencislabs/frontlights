@@ -3,9 +3,10 @@
 Read this in stage 6 after the TDD loop of an issue whose plan has the section
 `## Navegador e testes ligados` (`templates/issue.md`). It decides what runs, with
 which helper, what to ask and what to record. Everything the user reads stays in
-Portuguese. The helpers only talk to the issue's own branch on `127.0.0.1`,
-`localhost` or `::1`; never point a test at a real, staging or production
-environment. Installing Playwright or a browser in the target project is out of
+Portuguese. `checks integration` and `checks smoke` refuse a non-local host
+before any request; `serve start` does not check the `health` host, so keep
+`health` and `baseUrl` on `127.0.0.1`, `localhost` or `::1`, on the issue's own
+branch; never point a test at a real, staging or production environment. Installing Playwright or a browser in the target project is out of
 scope: use what the session and the project already have.
 
 ## What the plan turns on
