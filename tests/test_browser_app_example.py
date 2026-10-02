@@ -268,7 +268,78 @@ class RunnerOutcomeTest(unittest.TestCase):
 
     def test_a_run_where_no_test_executed_is_not_approved(self):
         result = self.run_with(run_playwright=self.playwright(0, self.report(expected=0, skipped=2)))
-        self.assert_not_run(result, 'nenhum teste')
+        self.assert_not_run(result, 'pulado')
+        result = self.run_with(run_playwright=self.playwright(1, self.report()))
+        self.assert_not_run(result)
+
+    def test_a_run_with_a_skipped_test_is_not_approved_even_if_the_others_passed(self):
+        for passed in (1, 2, 5):
+            result = self.run_with(run_playwright=self.playwright(0, self.report(expected=passed, skipped=1)))
+            self.assert_not_run(result, 'pulado')
+
+    def test_a_failure_next_to_a_skipped_test_is_still_reported_as_failed(self):
+        result = self.run_with(run_playwright=self.playwright(1, self.report(unexpected=1, skipped=1,
+                                                                              message='expect falhou')))
+        self.assertEqual(result['resultado'], 'falhou', result)
+
+    def test_playwright_is_called_so_that_a_focused_test_only_makes_the_run_fail(self):
+        seen = []
+
+        class Process:
+            returncode = 1
+
+            def __init__(self, argv, **kwargs):
+                seen.append(argv)
+
+            def communicate(self, timeout=None):
+                return '', ''
+
+        with tempfile.TemporaryDirectory() as scratch, mock.patch.object(self.runner.subprocess, 'Popen', Process):
+            env = {'PLAYWRIGHT_JSON_OUTPUT_NAME': str(Path(scratch) / 'relatorio.json')}
+            self.runner.run_playwright('node', 'cli.js', scratch, env, 10)
+        self.assertEqual(len(seen), 1)
+        self.assertIn('--forbid-only', seen[0])
+
+    def test_a_base_url_outside_the_local_hosts_is_refused_before_any_request_or_handing_the_account(self):
+        calls = []
+
+        def spy(name):
+            return lambda *args, **kwargs: calls.append(name)
+
+        for url in ('https://homologacao.exemplo.test/', 'http://localhost.exemplo.test:8080/',
+                    'http://127.0.0.1.exemplo.test/', 'http://10.0.0.5:3000/', 'http://[::1'):
+            result = self.run_with(base_url=url, app_answers=spy('app_answers'), run_playwright=spy('playwright'))
+            self.assert_not_run(result, 'local')
+            self.assertEqual(calls, [], url)
+
+    def test_a_base_url_on_a_local_host_reaches_the_spec(self):
+        for url in ('http://127.0.0.1:4321/', 'http://localhost:4321/', 'http://LOCALHOST:4321/',
+                    'http://[::1]:4321/'):
+            seen = {}
+
+            def fake(node, cli, cwd, env, timeout):
+                seen.update(env)
+                return 0, '', '', self.report(expected=2)
+
+            result = self.run_with(base_url=url, run_playwright=fake)
+            self.assertEqual(result['resultado'], 'passou', (url, result))
+            self.assertEqual(seen['FRONTLIGHTS_BASE_URL'], url)
+
+    def test_a_secret_cut_at_any_point_of_the_output_or_of_an_error_never_leaks_a_fragment(self):
+        fragments = {secret[start:start + 5] for secret in (self.login, self.password)
+                     for start in range(len(secret) - 4)}
+        for padding in range(0, 2600, 3):
+            text = 'x' * padding + self.password + ' ' + self.login + 'y' * padding
+
+            def fake(node, cli, cwd, env, timeout, text=text):
+                report = json.loads(self.report(unexpected=1, message=text))
+                report['errors'] = [{'message': text}]
+                return 1, '', text, json.dumps(report)
+
+            result = self.run_with(run_playwright=fake)
+            shown = json.dumps([result['saida'], result['erros']], ensure_ascii=False)
+            leaked = [fragment for fragment in fragments if fragment in shown]
+            self.assertEqual(leaked, [], padding)
 
     def test_an_unreadable_report_is_not_approved(self):
         result = self.run_with(run_playwright=self.playwright(0, None))
@@ -370,6 +441,45 @@ class RealSpecTest(ServeCase):
         self.assertEqual(result['resultado'], 'passou', result)
         self.assertEqual(done.returncode, 0)
         self.assertGreaterEqual(result['testes']['passaram'], 1)
+
+    def test_a_real_spec_that_does_not_run_the_login_test_is_never_approved(self):
+        self.require_playwright()
+        _, base = self.start()
+        original = (EXAMPLE / 'login.spec.js').read_text(encoding='utf-8')
+        login_test, wrong_test = "test('entra com", "test('recusa a"
+        self.assertIn(login_test, original)
+        self.assertIn(wrong_test, original)
+        mutants = {
+            'test.skip': original.replace(login_test, "test.skip('entra com"),
+            'test.fixme': original.replace(login_test, "test.fixme('entra com"),
+            'test.skip(true) no corpo': original.replace("async ({ page }) => {", "async ({ page }) => { test.skip(true);", 1),
+            'test.describe.skip': original.replace(login_test, "test.describe.skip('grupo', () => {\n" + login_test)
+                                          .replace(wrong_test, "});\n" + wrong_test),
+            'test.only na senha errada': original.replace(wrong_test, "test.only('recusa a"),
+        }
+        node_path = os.pathsep.join(item for item in (str(EXAMPLE / 'node_modules'), os.environ.get('NODE_PATH'))
+                                    if item)
+        def run_copy(source):
+            with tempfile.TemporaryDirectory() as copy:
+                for item in ('run_spec.py', 'playwright.config.js'):
+                    shutil.copy2(EXAMPLE / item, Path(copy) / item)
+                (Path(copy) / 'login.spec.js').write_text(source, encoding='utf-8')
+                done = subprocess.run([sys.executable, str(Path(copy) / 'run_spec.py'), '--config', str(CONFIG),
+                                       '--base-url', f'{base}/'], capture_output=True, text=True, encoding='utf-8',
+                                      errors='replace', timeout=600, env=utf8_env(NODE_PATH=node_path))
+                return done, json.loads(done.stdout)
+
+        control, result = run_copy(original)
+        if result['resultado'] == 'nao_executado':
+            self.skipTest(f'spec real não executada: {result["motivo"]}')
+        self.assertEqual((result['resultado'], control.returncode), ('passou', 0), result)
+        for name, source in mutants.items():
+            with self.subTest(name):
+                self.assertNotEqual(source, original)
+                done, result = run_copy(source)
+                self.assertNotEqual(result['resultado'], 'passou', result)
+                self.assertIs(result['aprovado'], False)
+                self.assertNotEqual(done.returncode, 0)
 
 
 if __name__ == '__main__':
