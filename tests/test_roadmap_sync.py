@@ -1,4 +1,5 @@
 import datetime as dt
+import http.client
 import json
 import os
 import sys
@@ -18,6 +19,7 @@ CURRENT = 'sprint:sprint-2026-09-28'
 NEXT = 'sprint:sprint-2026-10-05'
 ADD_ID = '7f1c2d3e-0000-4000-8000-000000000001'
 REMOVE_ID = '7f1c2d3e-0000-4000-8000-000000000003'
+MOVE_ID = '7f1c2d3e-0000-4000-8000-000000000004'
 
 
 class Transport:
@@ -507,6 +509,19 @@ class SyncBoardTests(RoadmapSyncTestCase):
         self.assertIn('rejected the credential', self.approve_and_fetch(
             board=(401, {'error': 'unauthorized'}), discard_staged=True)[0]['syncBoard']['message'])
 
+    def test_a_transport_exception_on_the_board_sync_does_not_abort_the_fetch(self):
+        for error in (TimeoutError('timed out'), http.client.IncompleteRead(b'parcial'), ConnectionResetError()):
+            with self.subTest(error=type(error).__name__):
+                rs._SECRETS.clear()
+                result, transport = self.approve_and_fetch(board=error, discard_staged=True)
+                self.assertTrue(result['ok'], result['message'])
+                self.assertTrue(result['syncBoardFailed'])
+                self.assertEqual(result['syncBoard']['reason'], 'request_failed')
+                self.assertIn(type(error).__name__, result['syncBoard']['message'])
+                self.assertNotIn('parcial', result['syncBoard']['message'])
+                self.assertEqual(len(transport.calls), 3)
+                self.assertIn('plan', result)
+
     def test_board_error_inside_a_successful_answer_is_reported(self):
         board = board_fixture()
         board['roadmap']['error'] = 'Falha ao ler o Project.'
@@ -543,6 +558,28 @@ class RoadmapStateTests(RoadmapSyncTestCase):
                 self.assertFalse(result['ok'])
                 self.assertIn('schemaVersion', result['message'])
                 self.assertEqual(len(transport.calls), 2)
+                self.assertFalse((self.project / '.frontlights' / 'roadmap-sync' / 'plan.json').exists())
+
+    def test_an_unknown_schema_version_is_not_echoed(self):
+        state = state_fixture()
+        state['schemaVersion'] = 'v' * 5000 + '<!-- injetado -->'
+        result, _ = self.approve_and_fetch(state=state)
+        self.assertFalse(result['ok'])
+        self.assertIn('schemaVersion', result['message'])
+        self.assertNotIn('<!--', result['message'])
+        self.assertNotIn('vvvvvvvvvv', result['message'])
+        self.assertLess(len(result['message']), 400)
+
+    def test_dates_outside_the_supported_years_are_refused(self):
+        for start, end in (('0001-01-01', '0001-01-05'), ('9999-12-27', '9999-12-31'),
+                           ('1999-12-27', '1999-12-31'), ('2101-01-03', '2101-01-07')):
+            with self.subTest(start=start):
+                state = state_fixture()
+                state['sprints'][1].update(startDate=start, endDate=end)
+                result, _ = self.approve_and_fetch(state=state, discard_staged=True)
+                self.assertFalse(result['ok'])
+                self.assertIn('roadmap-state', result['message'])
+                self.assertIn('2000', result['message'])
                 self.assertFalse((self.project / '.frontlights' / 'roadmap-sync' / 'plan.json').exists())
 
     def test_invalid_dates_are_refused(self):
@@ -676,6 +713,57 @@ class SprintTargetTests(RoadmapSyncTestCase):
         state['removedPending'][0]['laneId'] = 'atual'
         result, _ = self.approve_and_fetch(state=state)
         self.assertIn(REMOVE_ID, result['plan']['targets'][CURRENT]['changeIds'])
+
+    def moved_out(self, lane_to):
+        """Change 4 moves item d out of the current sprint: it leaves the sprint's items and, when
+        it lands in a group or another sprint, that lane lists the change."""
+        state, payload = state_fixture(), fixture()
+        moved = state['sprints'][0]['items'].pop(1)
+        if lane_to == 'g1':
+            state['groups'][0]['items'].append({k: v for k, v in moved.items() if k != 'overLimit'})
+        else:
+            state['sprints'][1]['items'].append(dict(moved, position=2))
+        payload['changes'][3]['payload'] = {'from': 'atual', 'to': lane_to}
+        return state, payload
+
+    def test_a_move_out_of_a_sprint_to_a_group_targets_the_origin_sprint(self):
+        state, payload = self.moved_out('g1')
+        result, _ = self.approve_and_fetch(payload, state=state)
+        self.assertTrue(result['ok'], result['message'])
+        self.assertIn(MOVE_ID, result['plan']['targets'][CURRENT]['changeIds'])
+        self.assertEqual(next(c for c in result['plan']['changes'] if c['id'] == MOVE_ID)['sprintTargets'], [CURRENT])
+
+    def test_a_move_to_another_sprint_targets_both_sprints(self):
+        state, payload = self.moved_out('proxima')
+        result, _ = self.approve_and_fetch(payload, state=state)
+        self.assertTrue(result['ok'], result['message'])
+        targets = result['plan']['targets']
+        self.assertIn(MOVE_ID, targets[CURRENT]['changeIds'])
+        self.assertEqual(targets[NEXT]['changeIds'], [MOVE_ID])
+        self.assertEqual(next(c for c in result['plan']['changes'] if c['id'] == MOVE_ID)['sprintTargets'], [CURRENT, NEXT])
+
+    def test_a_move_from_a_group_into_a_sprint_targets_the_destination(self):
+        state, payload = state_fixture(), fixture()
+        state['sprints'][0]['items'].pop(1)
+        payload['changes'][3]['payload'] = {'from': 'g1', 'to': 'proxima'}
+        for listed in (False, True):
+            with self.subTest(listed=listed):
+                if listed:
+                    state['sprints'][1]['items'].append(dict(state_fixture()['sprints'][0]['items'][1], position=2))
+                result, _ = self.approve_and_fetch(payload, state=state, discard_staged=True)
+                self.assertTrue(result['ok'], result['message'])
+                self.assertEqual(result['plan']['targets'][NEXT]['changeIds'], [MOVE_ID])
+                self.assertNotIn(MOVE_ID, result['plan']['targets'][CURRENT]['changeIds'])
+
+    def test_unsafe_patterns_are_refused_before_any_network_call(self):
+        for overrides in ({'weekFolderPattern': '../fora_{dd_MM}'},
+                          {'weekFolderPattern': '{yyyy}', 'sprintFilePattern': 'ROADMAP.md'}):
+            with self.subTest(overrides=overrides):
+                self.write_config(**overrides)
+                result, transport = self.approve_and_fetch()
+                self.assertFalse(result['ok'])
+                self.assertEqual(transport.calls, [])
+                self.assertNotIn('syncBoard', result)
 
     def test_two_sprints_on_the_same_file_are_refused(self):
         self.write_config(weekFolderPattern='{yyyy}/fixa', sprintFilePattern='SPRINT.md')

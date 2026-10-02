@@ -55,13 +55,20 @@ their language; quote the helper's English messages only when useful.
   written `issue-N`.
 - `add` creates an entry; `modify` updates the existing entry in place (a modify whose only news is
   `item.githubIssueUrl` adds the issue link to the entry, it never duplicates it); `move_lane` moves
-  the entry between lanes or into or out of the sprint; `remove` (`itemMissing` true, identified by
+  the entry between lanes or into or out of a sprint (an exit is recorded in the sprint it left,
+  an entry in the sprint it joined); `remove` (`itemMissing` true, identified by
   `itemId` and `item.title`) records the removal in the roadmap. A change whose `knownAction` is
   false is described to the user and handled only as they direct.
 - Put each change in the roadmap and, for every name in `change.sprintTargets`, in that sprint's
   file. A sprint gets a file when one of its items within the limit lists the change in
-  `pendingChangeIds`, or when `removedPending` puts the removal in that sprint's lane; nothing else
-  links a change to a sprint. A change with an empty `sprintTargets` goes in the roadmap only.
+  `pendingChangeIds`, when `removedPending` puts the removal in that sprint's lane, or when a
+  `move_lane` leaves that sprint's lane (`payload.from`, so the sprint the item left records its
+  exit) or enters it (`payload.to`, when no item of that sprint lists it); these are the only links
+  from a change to a sprint. A move between two sprints therefore reaches both files. A change with
+  an empty `sprintTargets` goes in the roadmap only.
+- Known limit: `laneId` (`atual`, `proxima`, `terceira`) is positional and means the lane in the
+  roadmap-state read by this fetch. A move queued before the week turned names the lane as it was
+  then; when its `from`/`to` no longer match the sprint the user remembers, say so and ask.
 
 ## Steps
 

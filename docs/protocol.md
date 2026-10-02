@@ -111,11 +111,15 @@ ou diff posterior torna essa evidência antiga.
 
 A sincronização do roadmap (`scripts/roadmap_sync.py`) segue esta ordem no `fetch`: `POST
 sync-board`, `GET roadmap-state` e `GET pending-changes`, todos sob o `endpoint` aprovado e com o
-mesmo segredo. Uma falha do `sync-board` não interrompe o `fetch`: o resultado a relata
-(`syncBoard`, `syncBoardFailed`) e a skill pergunta se segue com o último estado. Sem
-`roadmap-state` válido (endpoint ausente, `schemaVersion` diferente de 1, campo de tipo errado ou
-data inválida), o `fetch` é recusado sem alternativa automática. Cada sprint com mudança recebe o
-seu `SPRINT_*.md`, montado com as datas do RoadS; pasta e arquivo novos só são criados dentro do
+mesmo segredo. Os padrões de caminho (`roadmapFile`, `weekFolderPattern`, `sprintFilePattern`)
+são conferidos antes de qualquer chamada de rede. Uma falha do `sync-board`, inclusive tempo
+esgotado ou resposta cortada, não interrompe o `fetch`: o resultado a relata (`syncBoard`,
+`syncBoardFailed`) e a skill pergunta se segue com o último estado. Sem `roadmap-state` válido
+(endpoint ausente, `schemaVersion` diferente de 1, campo de tipo errado, data inválida ou fora dos
+anos 2000 a 2100), o `fetch` é recusado sem alternativa automática. Cada sprint com mudança recebe o
+seu `SPRINT_*.md`, montado com as datas do RoadS; um `move_lane` alcança a sprint de origem e a
+de destino (o `laneId` vale a lane do estado lido nesse `fetch`). Pasta e arquivo novos só são
+criados dentro do
 `scrumRoot`, sem junção nem link no caminho, e passam pelo mesmo diff e aprovação. Itens com
 `overLimit` ficam fora da sprint e são avisados; `snapshotStale` indica cópia do quadro com mais de
 24 h ou ausente. Marcas, backups, recusa de encolhimento e confirmação continuam como antes.

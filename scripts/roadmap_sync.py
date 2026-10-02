@@ -41,6 +41,7 @@ import argparse
 import datetime as dt
 import hashlib
 import hmac
+import http.client
 import json
 import os
 from pathlib import Path
@@ -64,6 +65,7 @@ FIELD_LIMITS = {'action': 100, 'title': 400, 'description': 4000, 'produto': 200
                 'effort': 100, 'lane': 200, 'laneId': 200, 'githubIssueUrl': 500, 'payload': 2000,
                 'timezone': 100, 'reason': 100, 'message': 1000, 'error': 1000}
 STATE_SCHEMA_VERSION = 1
+STATE_YEARS = (2000, 2100)
 ITEM_STATUSES = ('open', 'development', 'blocker', 'done', 'none')
 SNAPSHOT_MAX_AGE = dt.timedelta(hours=24)
 TEMPLATE_LOOKBACK_WEEKS = 26
@@ -538,6 +540,10 @@ def normalise_changes(payload, issue_targets=None):
                 'githubIssueUrl': issue_url or None, 'lane': field('lane'), 'laneId': field('laneId', 'lane_id') or None},
             'itemMissing': not change.get('item'),
             '_created': created,
+            # The lanes a move_lane leaves and enters, compared with the state's sprint laneIds.
+            '_move': tuple(safe_string(payload.get(key), f'change {change_id} payload.{key}', FIELD_LIMITS['laneId']).strip() or None
+                           if isinstance(payload.get(key), str) else None for key in ('from', 'to'))
+                     if action == 'move_lane' else (None, None),
         })
     return changes
 
@@ -602,9 +608,13 @@ def state_time(value, field, optional=True):
 def state_date(value, field):
     require(isinstance(value, str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}', value), _state_refusal(field, 'is not a YYYY-MM-DD date'))
     try:
-        return dt.date.fromisoformat(value)
+        parsed = dt.date.fromisoformat(value)
     except ValueError:
         raise Refusal(_state_refusal(field, 'is not a valid calendar date'))
+    # Week arithmetic (the template walks back, patterns expand) overflows near year 1 and 9999.
+    require(STATE_YEARS[0] <= parsed.year <= STATE_YEARS[1],
+            _state_refusal(field, f'is outside the years {STATE_YEARS[0]} to {STATE_YEARS[1]}'))
+    return parsed
 
 
 def state_item(raw, where, in_sprint):
@@ -639,7 +649,7 @@ def normalise_state(payload):
     require(isinstance(payload, dict), 'RoadS answered roadmap-state with something that is not an object')
     version = payload.get('schemaVersion')
     require(isinstance(version, int) and not isinstance(version, bool) and version == STATE_SCHEMA_VERSION,
-            f'RoadS answered roadmap-state with schemaVersion {version!r}; only {STATE_SCHEMA_VERSION} is understood. '
+            f'RoadS answered roadmap-state with a schemaVersion that is not {STATE_SCHEMA_VERSION}, the only one understood. '
             'Nothing was written or acknowledged; update Frontlights or take it to the RoadS owner.')
     state_as_of = state_time(payload.get('asOf'), 'asOf', optional=False)
     synced = state_time(payload.get('snapshotSyncedAt'), 'snapshotSyncedAt')
@@ -1037,6 +1047,10 @@ def sync_board(ctx, transport):
         text = request(ctx, transport, 'POST', endpoint_url(ctx.endpoint, 'sync-board'))
     except Refusal as error:
         return {'ok': False, 'ran': False, 'reason': 'request_failed', 'message': str(error)}
+    except (OSError, http.client.HTTPException, ValueError) as error:
+        # A read that times out or ends early escapes the transport; only its type is reported.
+        return {'ok': False, 'ran': False, 'reason': 'request_failed',
+                'message': f'network error contacting RoadS ({type(error).__name__})'}
     return board_result(text)
 
 
@@ -1055,17 +1069,23 @@ def read_state(ctx, transport):
 def sprint_targets(ctx, state, changes):
     """Each sprint of the state with a pending change gets its own file. The link is the
     service's: a change belongs to a sprint when an item of that sprint lists it in
-    pendingChangeIds, or when removedPending puts its removal in that sprint's lane. A change
-    reaching a sprint only through an item past the limit (overLimit) is listed apart and not
-    written into that sprint file."""
+    pendingChangeIds, when removedPending puts its removal in that sprint's lane, or when a
+    move_lane leaves that sprint's lane (payload.from) or enters it (payload.to) without any
+    item of that sprint listing it. The laneId is positional: it is the lane of the state read
+    by this fetch. A change reaching a sprint only through an item past the limit (overLimit) is
+    listed apart and not written into that sprint file."""
     change_ids = {c['id'] for c in changes}
     sprints, files = [], {}
     for sprint in state['sprints']:
         within = [i for i in sprint['items'] if not i['overLimit']]
         over = [i for i in sprint['items'] if i['overLimit']]
+        listed = {cid for item in sprint['items'] for cid in item['pendingChangeIds']}
         write = {cid for item in within for cid in item['pendingChangeIds'] if cid in change_ids}
         write |= {r['changeId'] for r in state['removedPending']
                   if r['laneId'] and r['laneId'] == sprint['laneId'] and r['changeId'] in change_ids}
+        lane = sprint['laneId']
+        write |= {c['id'] for c in changes if lane and c['_move'][0] == lane != c['_move'][1]}
+        write |= {c['id'] for c in changes if lane and c['_move'][1] == lane and c['id'] not in listed}
         left_out = {cid for item in over for cid in item['pendingChangeIds'] if cid in change_ids} - write
         name = 'sprint:' + sprint['sprintId'] if write else None
         public = {key: value for key, value in sprint.items() if key != '_dates'}
@@ -1095,6 +1115,11 @@ def _fetch(root, today, transport, since, discard_staged, result):
     assert_approved(ctx)
     paths = targets(ctx, today)
     roadmap_path = safe_target(ctx.scrum_root, paths['roadmap'])
+    # The patterns are checked before any network call, on this week's sprint file.
+    week_sprint = safe_target(ctx.scrum_root, paths['sprint'])
+    require(os.path.normcase(week_sprint) != os.path.normcase(roadmap_path),
+            'roadmapFile and the sprint patterns resolve to the same file; fix roadmapFile, weekFolderPattern or '
+            'sprintFilePattern so each sprint has its own file.')
     edits = staging_edits(ctx.staging_dir)
     require(not edits or discard_staged, (
         f'Refusing to fetch: the staging directory holds drafted prose that was never applied ({", ".join(edits)}) in '
@@ -1146,7 +1171,7 @@ def _fetch(root, today, transport, since, discard_staged, result):
         change['marker'] = marker_text(change['id'], nonce)
         change['declinedMarker'] = marker_text(change['id'], nonce, True)
         change['sprintTargets'] = [name for name, info in files.items() if change['id'] in info['changeIds']]
-        del change['_created']
+        del change['_created'], change['_move']
     run = secrets.token_hex(8)
     staging_new = ctx.staging_dir.with_name(ctx.staging_dir.name + '.new-' + run)
     staging_previous = ctx.staging_dir.with_name(ctx.staging_dir.name + '.previous-' + run)
