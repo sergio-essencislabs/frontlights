@@ -89,7 +89,14 @@ def board(project, repo=...):
 
 
 def board_fields(project, issue):
-    """Board values for one issue: defaults plus the per-issue choices, with nothing left open."""
+    """Board values for one issue: defaults plus the per-issue choices, with nothing left open.
+
+    A sub-issue (`parent` set) joins the board only through its parent: it takes no values.
+    """
+    if issue.get('parent') is not None:
+        require('project_fields' not in issue,
+                f'{issue["id"]}: sub-issue não leva project_fields; entra no quadro só pelo pai')
+        return {}
     chosen = issue.get('project_fields', {})
     require(isinstance(chosen, dict) and all(nonempty(k) and nonempty(v) for k, v in chosen.items()),
             f'{issue["id"]}: project_fields must map field names to non-empty values')
@@ -127,6 +134,10 @@ def validate_plan(plan, project=None):
         require(isinstance(deps, list) and all(number(x) for x in deps) and len(deps) == len(set(deps)),
                 'dependencies must be unique integer ids')
         require(issue.get('status') in {'ready', 'running', 'blocked', 'verified', 'proposed'}, 'invalid status')
+        if issue.get('parent') is not None:
+            require(number(issue['parent']),
+                    f'{issue["id"]}: parent precisa ser o id (inteiro positivo) de uma issue deste plano')
+            require(issue['parent'] != issue['id'], f'{issue["id"]}: parent não pode ser a própria issue')
         if project is not None:
             board_fields(project, issue)
         if issue.get('url'):
@@ -147,7 +158,40 @@ def validate_plan(plan, project=None):
         visited.add(node)
     for node in graph:
         visit(node)
+    sub_issues(issues)
     return plan
+
+
+SUB_ISSUES_MAX = 100   # GitHub: sub-issues per parent
+SUB_ISSUES_DEPTH = 8   # GitHub: levels of nesting below a top-level issue
+
+
+def sub_issues(issues):
+    """Parent links must stay inside the plan and within GitHub's sub-issue limits.
+
+    `parent` names another issue of this same plan, so the check needs no network.
+    Only the plan's children are counted; the children a parent already has on
+    GitHub are checked before publishing (`subIssuesSummary.total`).
+    """
+    by_id = {i['id']: i for i in issues}
+    children = {}
+    for i in issues:
+        parent = i.get('parent')
+        if parent is None:
+            continue
+        require(parent in by_id, f'{i["id"]}: parent {parent} não está no plano; inclua a issue de origem no plano')
+        children[parent] = children.get(parent, 0) + 1
+    for parent, count in children.items():
+        require(count <= SUB_ISSUES_MAX,
+                f'{parent}: {count} filhas passam do limite de {SUB_ISSUES_MAX} sub-issues por pai do GitHub')
+    for i in issues:
+        seen, node, depth = {i['id']}, i, 0
+        while node.get('parent') is not None:
+            require(node['parent'] not in seen, f'{i["id"]}: ciclo em parent')
+            seen.add(node['parent'])
+            node, depth = by_id[node['parent']], depth + 1
+        require(depth <= SUB_ISSUES_DEPTH,
+                f'{i["id"]}: {depth} níveis de sub-issue passam do limite de {SUB_ISSUES_DEPTH} do GitHub')
 
 
 def schedule(plan, limit):

@@ -22,7 +22,7 @@ case. `to-development` writes tests only at these seams, so approving the issue
 approves them; name them in the approval table too.
 
 Run `frontlights.py validate-plan --plan <plan.json> --config <.frontlights/config.json>`;
-this checks structure, DAG and board fields, not semantic verticality. Review every vertical demonstration manually. Check
+this checks structure, DAG, board fields and `parent` links (see Follow-ups), not semantic verticality. Review every vertical demonstration manually. Check
 missing cross-layer tests, hidden sequencing, generated/shared files, migrations,
 ports, shared services, dependency cycles and context size. Add dependencies or
 shared ownership for resources that cannot safely run together. Split oversized
@@ -44,8 +44,9 @@ duplicates. Record partial publication and resume remaining writes idempotently.
 ## Project board
 
 When `.frontlights/config.json` has `project` (reported by `inspect` as
-`sources.project`), every issue this stage creates or adopts belongs on that board;
-never publish one outside it. Plan it with the issue:
+`sources.project`), every top-level issue this stage creates or adopts belongs on
+that board; never publish one outside it. A sub-issue joins only through its parent
+and takes none of the board writes below (see Follow-ups). Plan it with the issue:
 
 - For each issue, record `issue_type` (or rely on `project.issue_type`) and
   `project_fields` for every board field whose default is `null`. Choose values
@@ -73,8 +74,71 @@ you found with `gh project list --owner <owner>`, "no board", free text). Record
 the answer in `.frontlights/config.json` as `project` (or `"project": null`) before
 publishing, so later sessions do not ask again. A local project has no board.
 
-Put `Depends on: #N, #M` in each canonical issue body (or `none`); verify dependency
-IDs and content after publication. Link local snapshots to returned issue URLs.
+Put `Depends on: #N, #M` and `Parent: #P` in each canonical issue body (or `none`);
+verify dependency IDs, parent and content after publication. Link local snapshots to returned issue URLs.
 An issue update preserves user text outside the approved plan. Surface divergence
 between approved draft and GitHub rather than overwriting it silently. Return
 verified issue links/graph to the coordinator for batch authorization.
+
+## Follow-ups
+
+Findings from an independent review, a test run or a live check that belong to an
+issue never become one new issue each. Classify every finding by the first
+destination that fits:
+
+1. Fix it in the same PR, when it is inside the issue's approved scope and ownership.
+2. A checklist item (`- [ ] ...`) in the source issue's body, for a small leftover
+   that does not need its own branch or review.
+3. A sub-issue of the source issue, for work of its own that still belongs to that
+   outcome.
+4. A top-level issue only for new scope or for a problem that crosses several
+   issues; then make it a sub-issue of the epic that gathers them, when one exists.
+
+No finding becomes a top-level issue by default. Show the whole batch (each finding,
+its proposed destination with the reason, and the full text of every checklist item
+and sub-issue body) under the show-before-approval rule, then decide it in a
+single `AskUserQuestion`: one option approves the proposed destinations and their named
+writes, others adjust them. Approving the batch approves exactly those writes; it
+is not an implementation authorization for the new work.
+
+Record each sub-issue in `plan.json` with `parent` set to the id of the source issue,
+which must be in the same plan (a published issue keeps its GitHub number as id), so
+`validate-plan` checks the link without network. A sub-issue takes no
+`project_fields`. The check counts only the plan's children (GitHub allows 100 per
+parent), so before publishing read the parent's `subIssuesSummary.total` with `gh issue
+view <parent> --json subIssuesSummary` and keep that total plus the new children at
+100 or fewer. When the parent is itself a sub-issue, include its ancestors too, so
+the depth check (8 levels below a top-level issue) sees the whole chain.
+
+Publish a sub-issue in this order, pausing a few seconds between creations to stay
+under the secondary rate limit:
+
+- Read what the child inherits: `gh issue view <parent> --repo <repo> --json
+  assignees,labels,issueType,state`.
+- Create it already linked: `gh issue create --repo <repo> --title <title> --body-file <file> --parent <parent>`
+  plus one `--assignee <login>` per parent assignee, one `--label <name>` per parent
+  label and `--type <issueType.name>` when the parent has a type. Put `Parent: #<parent>`
+  in the body. For an issue that already exists, link it with `gh issue edit <child>
+  --repo <repo> --parent <parent>` (or `gh issue edit <parent> --repo <repo>
+  --add-sub-issue <child>`).
+- A `gh` without these flags falls back to the REST route: `gh api
+  repos/<owner>/<repo>/issues/<parent>/sub_issues --method POST -F sub_issue_id=<id>`,
+  where `<id>` is the child's numeric `id` from `gh api repos/<owner>/<repo>/issues/<child>`
+  (not its number).
+- Run no board command for the child: the parent's card shows the children's
+  progress (x/y).
+
+Verify by rereading GitHub: `gh issue view <child> --repo <repo> --json
+parent,projectItems,assignees,labels,issueType` must show `parent.number` equal to the
+parent, an empty `projectItems` and the inherited values; `gh issue view <parent>
+--repo <repo> --json subIssuesSummary` must show the total grown by the new children
+(the REST listing `gh api repos/<owner>/<repo>/issues/<parent>/sub_issues` is the
+fallback). A child that landed on a board anyway (a project auto-add rule, say) is a
+divergence to report, not to undo. A failed link is a partial publication: retry only
+the link, never by creating the issue again.
+
+A parent is reported complete only when every child is closed
+(`subIssuesSummary.completed` equal to `total`); otherwise list the open children.
+A late finding, after the parent was merged or closed, still becomes a sub-issue of
+it: say that the parent must be reopened for its progress to count, and leave that
+decision to the user; never reopen, close, move or archive an issue yourself.
