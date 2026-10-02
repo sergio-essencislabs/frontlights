@@ -127,7 +127,8 @@ executam comandos lidos do `.frontlights/config.json` (blocos `browserTest` e `c
   saída e registro (também codificados em URL); um valor com menos de 4 caracteres ou com o texto
   do marcador de máscara é recusado, porque não pode ser ocultado com segurança.
 - **Sem aprovação do bloco:** ao contrário do resumo para a diretoria, esses blocos não têm
-  aprovação assinada, e o `inspect` ainda não os valida. Revise-os antes de rodar num projeto
+  aprovação assinada. O `inspect` os valida com as mesmas regras do `serve` e do `checks`, o que
+  barra erro de configuração, não comando mal-intencionado. Revise-os antes de rodar num projeto
   clonado.
 
 Os testes desses utilitários rodaram só no Windows; o caminho POSIX não foi exercitado.

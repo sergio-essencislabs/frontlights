@@ -268,8 +268,9 @@ são mascarados em toda saída e registro, e um valor com menos de 4 caracteres 
 navegador ou rede, o teste é relatado como não executado e nunca conta como aprovado. O app de
 exemplo em `examples/browser-app/` mostra o fluxo de ponta a ponta.
 
-Limites: só o Windows foi exercitado (POSIX não); o `inspect` ainda não valida esses blocos, o
-que fica para a próxima rodada.
+Limites: só o Windows foi exercitado (POSIX não). O `inspect` valida esses blocos com as mesmas
+regras do `serve` e do `checks` (inclusive a recusa de shell embutido) e recusa o config inválido
+com a mensagem mascarada; sem os blocos, a saída dele não muda.
 
 ## Fluxo de trabalho e utilitários
 
