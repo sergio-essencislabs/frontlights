@@ -79,7 +79,15 @@ do plugin enquanto ele executa trabalho no projeto consumidor. Estrutura recomen
     plan.json        mudanças buscadas no RoadS, marcas e destinos
     state.json       último asOf confirmado
     staging/         cópias temporárias do ROADMAP e do SPRINT
+  progress-report/
+    approval.json    aprovação do bloco exato `roadmapSync.progress` (hash assinado com a chave do usuário)
 ```
+
+O passo do resumo para a diretoria (`scripts/progress_report.py`) vem logo depois da pergunta do
+roadmap e só existe quando o bloco `roadmapSync.progress` está habilitado. A ordem é: `status`,
+aprovação do bloco, `window`, `collect`, conferência dos números pelo usuário, arquivo de textos
+(guia `draftGuide`, roadmap e sprint da semana), prints em `shotsDir` com `captions.json`, rascunho
+mostrado na íntegra, aprovação e `push --draft`. Nada é enviado sem a aprovação do rascunho completo.
 
 A unidade de trabalho é a issue do GitHub, identificada pelo número, para que o
 quadro e os registros locais coincidam. O plugin não cria identificadores

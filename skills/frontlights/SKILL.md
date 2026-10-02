@@ -1,6 +1,6 @@
 ---
 name: frontlights
-description: Starts a single planning and delivery session for whatever the user asks, from discovery through approved vertical GitHub issues and bounded implementation, right-sized to the request. First tells the user to keep `claude rc` running in a PowerShell window when no Remote Control host is detected, without asking, then always asks whether to update the sprint and roadmap files from RoadS. RoadS observations are an optional input when configured.
+description: Starts a single planning and delivery session for whatever the user asks, from discovery through approved vertical GitHub issues and bounded implementation, right-sized to the request. First tells the user to keep `claude rc` running in a PowerShell window when no Remote Control host is detected, without asking, then always asks whether to update the sprint and roadmap files from RoadS, and, when the project configures a progress block, whether to also prepare the progress summary in RoadS. RoadS observations are an optional input when configured.
 disable-model-invocation: true
 user-invocable: false
 ---
@@ -17,7 +17,8 @@ before execution. The references are `references/grilling.md` (stage 3),
 `references/prd.md` (stage 4), `references/issues.md` (stage 5),
 `references/development.md` (stage 6, with `tdd-tests.md` and `tdd-mocking.md`),
 `references/roadmap-sync.md` (the roadmap question of stage 1, when the user
-says yes) and `references/remote-control.md`, read only when the user asks for
+says yes), `references/progress-report.md` (the progress question that follows it,
+when the user says yes) and `references/remote-control.md`, read only when the user asks for
 guided Remote Control setup (power settings, phone test). `references/learning.md`
 is read only when the user turns learning mode on in the grilling or asks for an
 explanation there.
@@ -142,6 +143,19 @@ absent, a draft left staged, or not configured in this project. Options: "Sim,
 sincronizar agora" and "Não, seguir com o pedido". On yes, read
 `references/roadmap-sync.md` and follow it, then come back to the request. On
 no, make no call to RoadS and go on.
+
+**Progress question, right after the roadmap question.** Once the roadmap question and
+everything it triggered are done, and also when the roadmap had nothing pending or the
+user answered no to it, run the read-only `python
+"${CLAUDE_PLUGIN_ROOT}/scripts/progress_report.py" status --root <project>` (no
+network). Only when it reports `ask` true (the project has an enabled
+`roadmapSync.progress` block) ask with `AskUserQuestion`:
+"Atualizar também o Resumo para a diretoria no RoadS?"
+Put what `status` reports in the question text: ready, the block not yet approved, the
+secret absent. Options: "Sim, preparar o resumo agora" and "Não, seguir com o pedido".
+On yes, read `references/progress-report.md` and follow it, then come back to the
+request. On no, make no call to RoadS and run nothing. When `ask` is false (no block,
+or a disabled one), say nothing about it, ask nothing and go on exactly as before.
 
 The user's own request is the starting point and the authority on scope. Accept
 any kind of work: a product feature, a bug, a refactor, research, a one-off

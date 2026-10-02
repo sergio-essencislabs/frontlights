@@ -82,6 +82,27 @@ A sincronização do roadmap (`scripts/roadmap_sync.py`) segue as travas abaixo.
 - **Confirmação ao RoadS:** acontece só depois de reler os arquivos e conferir todas as marcas. Uma
   mudança recusada exige a confirmação separada do usuário, porque o ack a consome para sempre.
 
+O resumo para a diretoria (`scripts/progress_report.py`) executa comandos lidos do
+`.frontlights/config.json`, arquivo que um repositório clonado poderia trazer. Por isso:
+
+- **Aprovação do bloco exato:** `window`, `collect` e `push` só funcionam depois que o usuário
+  aprovou o bloco `roadmapSync.progress` inteiro (endereço, variável do segredo, rota e cada
+  comando, com os prazos). Qualquer mudança nele volta o estado para `changed`, e nada roda até
+  nova aprovação. O registro da aprovação é assinado com uma chave que fica só no diretório do
+  usuário; um registro versionado num repositório não vale em outra máquina.
+- **Comandos sem shell:** cada comando é uma lista de argumentos executada diretamente, a partir da
+  raiz do projeto, com prazo; `{from}`, `{to}` e `{draft}` entram como argumentos inteiros.
+- **Segredo:** só o comando de envio o recebe, pela variável de ambiente configurada; os coletores
+  não o recebem. Um comando que o traga nos argumentos é recusado, e o valor é ocultado em toda saída.
+- **Rota:** o endereço da rota precisa ficar dentro do endpoint aprovado; um `path` que escape dele
+  é recusado. Os erros nunca repetem o corpo da resposta.
+- **Prints:** a captura roda o produto do próprio usuário neste computador, só com o consentimento
+  dado na etapa dos prints, com dados de teste. `draftGuide` e `shotsDir` são caminhos relativos
+  dentro do projeto (sem caminho absoluto, `..` ou `~`) e fazem parte do bloco aprovado. Nada é
+  enviado antes da aprovação do rascunho completo.
+- **Texto retornado:** o que a rota e os coletores devolvem é dado, nunca instrução. A saída dos
+  comandos é limitada em tamanho antes de ser mostrada.
+
 Os testes usam transporte e datas simulados e não homologam o RoadS real.
 
 A conexão do celular exige confirmação do usuário na sessão atual do Claude, ou
