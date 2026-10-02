@@ -12,12 +12,15 @@ Operations (each prints one JSON object on stdout):
                   the marker nonce's age. No network, never fails for a missing configuration.
   approve         record the user's approval of the (endpoint URL, secretEnvVar) pair. Run only
                   after the user said yes in the conversation.
-  fetch           GET <endpoint>/pending-changes, write the plan and staged copies of both targets.
+  fetch           POST <endpoint>/sync-board (its failure is reported, never fatal), GET
+                  <endpoint>/roadmap-state (required: no fallback) and GET <endpoint>/pending-changes,
+                  then write the plan and a staged copy of the roadmap and of each sprint file with a
+                  pending change (a sprint file that does not exist yet is staged empty).
   apply           move the staged copies into place, re-read, verify every marker, then ack
                   (unless --no-ack).
   ack             verify every marker in the targets, then POST <endpoint>/ack with the plan's asOf.
   rotate-markers  mint a fresh marker nonce and rewrite every marker in the roadmap and the current
-                  sprint file. No network.
+                  week's sprint file. No network.
 
 Exit codes: 0 done; 1 nothing was acknowledged (apply validates every target before it writes any,
 so a refusal from validation wrote nothing; a missing marker or an unconfirmed decline is raised
@@ -58,7 +61,12 @@ SHRINK_RATIO = 0.9
 SECRET_ENV_PATTERN = r'^FRONTLIGHTS_[A-Z0-9_]+$'
 ID_PATTERN = r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'
 FIELD_LIMITS = {'action': 100, 'title': 400, 'description': 4000, 'produto': 200, 'prioridade': 100,
-                'effort': 100, 'lane': 200, 'laneId': 200, 'githubIssueUrl': 500, 'payload': 2000}
+                'effort': 100, 'lane': 200, 'laneId': 200, 'githubIssueUrl': 500, 'payload': 2000,
+                'timezone': 100, 'reason': 100, 'message': 1000, 'error': 1000}
+STATE_SCHEMA_VERSION = 1
+ITEM_STATUSES = ('open', 'development', 'blocker', 'done', 'none')
+SNAPSHOT_MAX_AGE = dt.timedelta(hours=24)
+TEMPLATE_LOOKBACK_WEEKS = 26
 REPARSE_POINT = 0x400
 OFFLINE_MASK = 0x1000 | 0x40000 | 0x400000  # OFFLINE | RECALL_ON_OPEN | RECALL_ON_DATA_ACCESS
 MANIFEST = '.staging-origin.json'
@@ -264,12 +272,30 @@ def expand_pattern(pattern, start, end):
     return text.replace('{yyyy}', start.strftime('%Y')).replace('{MM}', start.strftime('%m')).replace('{dd}', start.strftime('%d'))
 
 
-def targets(ctx, today):
-    start, end = sprint_week(today)
+def sprint_relative(ctx, start, end):
     folder = expand_pattern(ctx.sync['weekFolderPattern'], start, end)
     leaf = expand_pattern(ctx.sync['sprintFilePattern'], start, end)
+    return folder.rstrip('/\\') + '/' + leaf
+
+
+def targets(ctx, today):
+    start, end = sprint_week(today)
     return {'week': (start, end), 'roadmap': expand_pattern(ctx.sync['roadmapFile'], start, end),
-            'sprint': folder.rstrip('/\\') + '/' + leaf}
+            'sprint': sprint_relative(ctx, start, end)}
+
+
+def sprint_template(ctx, start, end):
+    """The most recent existing sprint file before this sprint, walking back one week at a time
+    with the same length; a new sprint file follows its headings and sections."""
+    for weeks in range(1, TEMPLATE_LOOKBACK_WEEKS + 1):
+        earlier = start - dt.timedelta(weeks=weeks)
+        try:
+            path = safe_target(ctx.scrum_root, sprint_relative(ctx, earlier, earlier + (end - start)))
+        except Refusal:
+            continue
+        if os.path.isfile(path):
+            return path
+    return None
 
 
 def reparse_tag(path):
@@ -528,6 +554,159 @@ def as_of(payload, changes):
     return (newest[0], 'max-createdAt') if newest else (None, None)
 
 
+def _state_refusal(field, what):
+    return f'RoadS returned a roadmap-state whose {field} {what}; nothing was written or acknowledged'
+
+
+def state_id(value, field, optional=False):
+    if value is None and optional:
+        return None
+    text = str(value) if isinstance(value, (str, int)) and not isinstance(value, bool) else ''
+    require(re.fullmatch(ID_PATTERN, text), _state_refusal(field, 'is not a usable id'))
+    return text
+
+
+def state_text(value, field, limit, optional=True):
+    require(isinstance(value, str) or (optional and value is None), _state_refusal(field, 'is not text'))
+    return safe_string(value, f'roadmap-state {field}', limit)
+
+
+def state_int(value, field, minimum, optional=False):
+    if value is None and optional:
+        return None
+    require(isinstance(value, int) and not isinstance(value, bool) and value >= minimum,
+            _state_refusal(field, f'is not an integer of at least {minimum}'))
+    return value
+
+
+def state_bool(value, field):
+    require(isinstance(value, bool), _state_refusal(field, 'is not true or false'))
+    return value
+
+
+def state_list(value, field, optional=False):
+    if value is None and optional:
+        return []
+    require(isinstance(value, list), _state_refusal(field, 'is not a list'))
+    return value
+
+
+def state_time(value, field, optional=True):
+    if value is None and optional:
+        return None
+    parsed = timestamp(value, f'roadmap-state {field}') if isinstance(value, str) else None
+    require(parsed, _state_refusal(field, 'is not an ISO 8601 instant'))
+    return parsed
+
+
+def state_date(value, field):
+    require(isinstance(value, str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}', value), _state_refusal(field, 'is not a YYYY-MM-DD date'))
+    try:
+        return dt.date.fromisoformat(value)
+    except ValueError:
+        raise Refusal(_state_refusal(field, 'is not a valid calendar date'))
+
+
+def state_item(raw, where, in_sprint):
+    require(isinstance(raw, dict), _state_refusal(where, 'is not an object'))
+    item_id = state_id(raw.get('id'), f'{where}.id')
+    where = f'{where} ({item_id})'
+    url = state_text(raw.get('githubIssueUrl'), f'{where}.githubIssueUrl', FIELD_LIMITS['githubIssueUrl'])
+    if not re.fullmatch(r'https?://[^\s<>"]+', url) or re.search(r'&(?:lt|gt);', url):
+        url = ''
+    status = raw.get('status')
+    require(status in ITEM_STATUSES, _state_refusal(f'{where}.status', 'is not one of ' + '|'.join(ITEM_STATUSES)))
+    updated = state_time(raw.get('updatedAt'), f'{where}.updatedAt')
+    pending = [state_id(value, f'{where}.pendingChangeIds') for value in state_list(raw.get('pendingChangeIds'), f'{where}.pendingChangeIds')]
+    return {
+        'id': item_id, 'position': state_int(raw.get('position'), f'{where}.position', 1),
+        'title': state_text(raw.get('title'), f'{where}.title', FIELD_LIMITS['title'], optional=False),
+        'description': state_text(raw.get('description'), f'{where}.description', FIELD_LIMITS['description']),
+        'produto': state_text(raw.get('produto'), f'{where}.produto', FIELD_LIMITS['produto']),
+        'prioridade': state_text(raw.get('prioridade'), f'{where}.prioridade', FIELD_LIMITS['prioridade']),
+        'effort': state_text(raw.get('effort'), f'{where}.effort', FIELD_LIMITS['effort']),
+        'githubIssueUrl': url or None, 'issueNumber': state_int(raw.get('issueNumber'), f'{where}.issueNumber', 1, optional=True),
+        'status': status, 'done': state_bool(raw.get('done'), f'{where}.done'),
+        # overLimit is the service's decision and exists only on sprint items.
+        'overLimit': state_bool(raw.get('overLimit'), f'{where}.overLimit') if in_sprint else False,
+        'updatedAt': updated[0] if updated else None, 'pendingChangeIds': pending}
+
+
+def normalise_state(payload):
+    """Defensive reading of GET roadmap-state (schemaVersion 1). An unknown schema version, a
+    field of the wrong type, an invalid date or a duplicate sprint refuses the whole answer:
+    nothing is guessed, and there is no fallback to the local week."""
+    require(isinstance(payload, dict), 'RoadS answered roadmap-state with something that is not an object')
+    version = payload.get('schemaVersion')
+    require(isinstance(version, int) and not isinstance(version, bool) and version == STATE_SCHEMA_VERSION,
+            f'RoadS answered roadmap-state with schemaVersion {version!r}; only {STATE_SCHEMA_VERSION} is understood. '
+            'Nothing was written or acknowledged; update Frontlights or take it to the RoadS owner.')
+    state_as_of = state_time(payload.get('asOf'), 'asOf', optional=False)
+    synced = state_time(payload.get('snapshotSyncedAt'), 'snapshotSyncedAt')
+    sprints, seen = [], set()
+    for index, raw in enumerate(state_list(payload.get('sprints'), 'sprints')):
+        where = f'sprints[{index}]'
+        require(isinstance(raw, dict), _state_refusal(where, 'is not an object'))
+        sprint_id = state_id(raw.get('sprintId'), f'{where}.sprintId')
+        require(sprint_id not in seen, _state_refusal(f'sprint {sprint_id}', 'appears twice'))
+        seen.add(sprint_id)
+        start, end = state_date(raw.get('startDate'), f'{where}.startDate'), state_date(raw.get('endDate'), f'{where}.endDate')
+        require(end >= start, _state_refusal(f'sprint {sprint_id}', 'ends before it starts'))
+        items = [state_item(item, f'{where}.items[{n}]', True) for n, item in enumerate(state_list(raw.get('items'), f'{where}.items'))]
+        sprints.append({'sprintId': sprint_id, 'laneId': state_text(raw.get('laneId'), f'{where}.laneId', FIELD_LIMITS['laneId']),
+                        'title': state_text(raw.get('title'), f'{where}.title', FIELD_LIMITS['title']),
+                        'startDate': start.isoformat(), 'endDate': end.isoformat(), '_dates': (start, end),
+                        'items': sorted(items, key=lambda i: i['position'])})
+    groups = []
+    for index, raw in enumerate(state_list(payload.get('groups'), 'groups', optional=True)):
+        where = f'groups[{index}]'
+        require(isinstance(raw, dict), _state_refusal(where, 'is not an object'))
+        groups.append({'laneId': state_text(raw.get('laneId'), f'{where}.laneId', FIELD_LIMITS['laneId']),
+                       'title': state_text(raw.get('title'), f'{where}.title', FIELD_LIMITS['title']),
+                       'items': [state_item(item, f'{where}.items[{n}]', False)
+                                 for n, item in enumerate(state_list(raw.get('items'), f'{where}.items'))]})
+    removed = []
+    for index, raw in enumerate(state_list(payload.get('removedPending'), 'removedPending', optional=True)):
+        where = f'removedPending[{index}]'
+        require(isinstance(raw, dict), _state_refusal(where, 'is not an object'))
+        removed.append({'changeId': state_id(raw.get('changeId'), f'{where}.changeId'),
+                        'itemId': state_id(raw.get('itemId'), f'{where}.itemId', optional=True),
+                        'title': state_text(raw.get('title'), f'{where}.title', FIELD_LIMITS['title']),
+                        'laneId': state_text(raw.get('laneId'), f'{where}.laneId', FIELD_LIMITS['laneId'])})
+    stale = synced is None or state_as_of[1] - synced[1] > SNAPSHOT_MAX_AGE
+    return {'asOf': state_as_of[0], 'snapshotSyncedAt': synced[0] if synced else None, 'snapshotStale': stale,
+            'maxSprintItems': state_int(payload.get('maxSprintItems'), 'maxSprintItems', 1, optional=True),
+            'timezone': state_text(payload.get('timezone'), 'timezone', FIELD_LIMITS['timezone']),
+            'sprints': sprints, 'groups': groups, 'removedPending': removed}
+
+
+def board_result(text):
+    """The sync-board answer, reduced to what the user is told. Never raises: a board sync that
+    failed is reported, and the user decides whether to go on with the last state."""
+    try:
+        answer = json.loads(text)
+        require(isinstance(answer, dict) and isinstance(answer.get('ok'), bool), 'not the contract JSON')
+        if not answer['ok']:
+            reason = answer.get('reason')
+            return {'ok': False, 'ran': False,
+                    'reason': safe_string(reason, 'sync-board reason', FIELD_LIMITS['reason']) if isinstance(reason, str) and reason else 'error',
+                    'message': safe_string(answer.get('message'), 'sync-board message', FIELD_LIMITS['message'])}
+        roadmap = answer.get('roadmap') if isinstance(answer.get('roadmap'), dict) else {}
+
+        def count(name):
+            value = roadmap.get(name)
+            return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+        synced = timestamp(answer.get('syncedAt'), 'sync-board syncedAt') if isinstance(answer.get('syncedAt'), str) else None
+        result = {'ok': True, 'ran': answer.get('ran') is True, 'syncedAt': synced[0] if synced else None,
+                  'added': count('added'), 'removed': count('removed'), 'issuesCreated': count('issuesCreated')}
+        if roadmap.get('error'):
+            result['error'] = safe_string(roadmap['error'], 'sync-board roadmap.error', FIELD_LIMITS['error'])
+        return result
+    except (ValueError, Refusal):
+        return {'ok': False, 'ran': False, 'reason': 'invalid_response',
+                'message': 'RoadS answered sync-board outside the contract (not JSON, another shape, or an HTML comment sequence)'}
+
+
 # ---------------------------------------------------------------- transport
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -598,11 +777,16 @@ def read_plan(ctx):
     plan = read_json(ctx.plan_path)
     require(plan.get('project') == ctx.name, 'The stored plan belongs to another project; run fetch again.')
     staging = os.path.normcase(os.path.abspath(ctx.staging_dir)) + os.sep
-    for name in ('roadmap', 'sprint'):
-        target = (plan.get('targets') or {}).get(name) or {}
-        require(target.get('path'), f'The stored plan has no {name} target; run fetch again.')
+    stored = plan.get('targets')
+    require(isinstance(stored, dict) and isinstance(stored.get('roadmap'), dict), 'The stored plan has no roadmap target; run fetch again.')
+    seen = set()
+    for name, target in stored.items():
+        require(isinstance(target, dict) and target.get('path'), f'The stored plan has no {name} target; run fetch again.')
         require(safe_target(ctx.scrum_root, relative_to_root(ctx, target['path'])) == target['path'],
                 'The stored plan does not match the configuration; run fetch again.')
+        require(os.path.normcase(target['path']) not in seen,
+                'The stored plan resolves two targets to the same path; check the patterns.')
+        seen.add(os.path.normcase(target['path']))
         staged = target.get('staged') or ''
         require(os.path.normcase(os.path.abspath(staged)).startswith(staging),
                 f'The stored plan points the {name} staged copy outside the staging directory; run fetch again.')
@@ -610,8 +794,6 @@ def read_plan(ctx):
             tag = reparse_tag(staged)
             require(not os.path.isdir(staged) and (tag == 0 or cloud_tag(tag)),
                     f'The stored plan points the {name} staged copy at a directory or reparse point; run fetch again.')
-    require(plan['targets']['roadmap']['path'] != plan['targets']['sprint']['path'],
-            'The stored plan resolves the roadmap and the sprint file to the same path; check the patterns.')
     if plan.get('asOf'):
         parsed = timestamp(plan['asOf'], 'the stored plan asOf')
         require(parsed and parsed[0] == plan['asOf'], 'The stored plan asOf was altered since fetch; run fetch again.')
@@ -622,7 +804,7 @@ def read_plan(ctx):
 
 
 def marker_report(plan, nonce):
-    texts = [read_text(plan['targets']['roadmap']['path']), read_text(plan['targets']['sprint']['path'])]
+    texts = [read_text(target['path']) for target in plan['targets'].values()]
     missing, declined = [], []
     for change in plan['changes']:
         states = {marker_state(text, change['id'], nonce) for text in texts} - {None}
@@ -848,16 +1030,71 @@ def op_approve(root):
             'message': f'Approved: {pair["secretEnvVar"]} may be sent to {pair["endpoint"]}.'}
 
 
+def sync_board(ctx, transport):
+    """POST <endpoint>/sync-board, the board's own "Sincronizar". Its failure never aborts the
+    fetch: it is reported, and the user decides whether to go on with the last state."""
+    try:
+        text = request(ctx, transport, 'POST', endpoint_url(ctx.endpoint, 'sync-board'))
+    except Refusal as error:
+        return {'ok': False, 'ran': False, 'reason': 'request_failed', 'message': str(error)}
+    return board_result(text)
+
+
+def read_state(ctx, transport):
+    """GET <endpoint>/roadmap-state. Without it there is no plan: no fallback to the local week."""
+    try:
+        text = request(ctx, transport, 'GET', endpoint_url(ctx.endpoint, 'roadmap-state'))
+        payload = json.loads(text)
+    except (Refusal, ValueError) as error:
+        detail = str(error) if isinstance(error, Refusal) else 'the body is not JSON'
+        raise Refusal(f'Could not read roadmap-state from RoadS ({detail}). There is no fallback: without it the sprints '
+                      'cannot be resolved, so nothing was written or acknowledged.')
+    return normalise_state(payload)
+
+
+def sprint_targets(ctx, state, changes):
+    """Each sprint of the state with a pending change gets its own file. The link is the
+    service's: a change belongs to a sprint when an item of that sprint lists it in
+    pendingChangeIds, or when removedPending puts its removal in that sprint's lane. A change
+    reaching a sprint only through an item past the limit (overLimit) is listed apart and not
+    written into that sprint file."""
+    change_ids = {c['id'] for c in changes}
+    sprints, files = [], {}
+    for sprint in state['sprints']:
+        within = [i for i in sprint['items'] if not i['overLimit']]
+        over = [i for i in sprint['items'] if i['overLimit']]
+        write = {cid for item in within for cid in item['pendingChangeIds'] if cid in change_ids}
+        write |= {r['changeId'] for r in state['removedPending']
+                  if r['laneId'] and r['laneId'] == sprint['laneId'] and r['changeId'] in change_ids}
+        left_out = {cid for item in over for cid in item['pendingChangeIds'] if cid in change_ids} - write
+        name = 'sprint:' + sprint['sprintId'] if write else None
+        public = {key: value for key, value in sprint.items() if key != '_dates'}
+        sprints.append({**public, 'items': within, 'outOfLimit': over, 'target': name})
+        if name:
+            start, end = sprint['_dates']
+            files[name] = {'sprint': public, 'dates': (start, end), 'relative': sprint_relative(ctx, start, end),
+                           'changeIds': sorted(write), 'outOfLimitChangeIds': sorted(left_out)}
+    left_out_items = [item for sprint in sprints for item in sprint['outOfLimit'] if set(item['pendingChangeIds']) & change_ids]
+    return sprints, files, left_out_items
+
+
 def op_fetch(root, today, transport, since=None, discard_staged=False):
+    # A refusal after the board sync still reports what the board sync did.
+    result = {}
+    try:
+        return _fetch(root, today, transport, since, discard_staged, result)
+    except (Refusal, ValueError, OSError, KeyError, TypeError) as error:
+        result.update(ok=False, exitCode=1, message=str(error))
+        return result
+
+
+def _fetch(root, today, transport, since, discard_staged, result):
     ctx = Context(root)
-    result = {'project': ctx.name}
+    result['project'] = ctx.name
     read_secret(ctx.secret_env)
     assert_approved(ctx)
     paths = targets(ctx, today)
     roadmap_path = safe_target(ctx.scrum_root, paths['roadmap'])
-    sprint_path = safe_target(ctx.scrum_root, paths['sprint'])
-    require(os.path.normcase(roadmap_path) != os.path.normcase(sprint_path),
-            f'roadmapFile and sprintFilePattern both resolve to {roadmap_path}; fix the patterns.')
     edits = staging_edits(ctx.staging_dir)
     require(not edits or discard_staged, (
         f'Refusing to fetch: the staging directory holds drafted prose that was never applied ({", ".join(edits)}) in '
@@ -867,6 +1104,17 @@ def op_fetch(root, today, transport, since=None, discard_staged=False):
         stamp = timestamp(since)
         require(stamp, '--since must be an ISO 8601 timestamp')
         query = 'since=' + urllib.parse.quote(stamp[0], safe='')
+    board = sync_board(ctx, transport)
+    result.update(syncBoard=board, syncBoardFailed=not board['ok'])
+    notes = []
+    if not board['ok']:
+        notes.append(f' The RoadS board sync failed ({board["reason"]}: {board["message"]}). What follows is the last state '
+                     'RoadS holds: ask the user whether to go on with it before drafting anything.')
+    state = read_state(ctx, transport)
+    result.update(stateAsOf=state['asOf'], snapshotSyncedAt=state['snapshotSyncedAt'], snapshotStale=state['snapshotStale'])
+    if state['snapshotStale']:
+        notes.append(' The RoadS snapshot is ' + (f'stale (synced at {state["snapshotSyncedAt"]}, more than 24 h before {state["asOf"]})'
+                                                  if state['snapshotSyncedAt'] else 'missing (never synced)') + '; tell the user.')
     text = request(ctx, transport, 'GET', endpoint_url(ctx.endpoint, 'pending-changes', query))
     try:
         payload = json.loads(text)
@@ -874,45 +1122,68 @@ def op_fetch(root, today, transport, since=None, discard_staged=False):
         raise Refusal('RoadS answered with a body that is not JSON')
     changes = normalise_changes(payload, ctx.issue_targets)
     if not changes:
-        result.update(ok=True, exitCode=0, pending=0, message='Nothing pending. No file was written and nothing was acknowledged.')
+        result.update(ok=True, exitCode=0, pending=0,
+                      message='Nothing pending. No file was written and nothing was acknowledged.' + ''.join(notes))
         return result
+    sprints, files, left_out = sprint_targets(ctx, state, changes)
+    if left_out:
+        notes.append(f' {len(left_out)} item(s) with a pending change are outside the sprint limit (overLimit): write them in '
+                     'the roadmap only and tell the user which ones stayed out.')
+    resolved = {'roadmap': roadmap_path}
+    for name, info in files.items():
+        resolved[name] = safe_target(ctx.scrum_root, info['relative'])
+    clash = len({os.path.normcase(p) for p in resolved.values()}) != len(resolved)
+    require(not clash, 'Two targets resolve to the same file (' + ', '.join(sorted(resolved)) + '); fix roadmapFile, '
+                       'weekFolderPattern or sprintFilePattern so each sprint has its own file.')
     nonce, minted = marker_nonce(ctx)
     result['markerNonceMinted'] = minted
     stamp, source = as_of(payload, changes)
-    roadmap_text, sprint_text = read_text(roadmap_path), read_text(sprint_path)
+    texts = {name: read_text(path) for name, path in resolved.items()}
     for change in changes:
-        states = {marker_state(roadmap_text, change['id'], nonce), marker_state(sprint_text, change['id'], nonce)} - {None}
+        states = {marker_state(text, change['id'], nonce) for text in texts.values()} - {None}
         change['alreadyApplied'] = bool(states)
         change['markerState'] = 'applied' if 'applied' in states else 'declined' if states else None
         change['marker'] = marker_text(change['id'], nonce)
         change['declinedMarker'] = marker_text(change['id'], nonce, True)
+        change['sprintTargets'] = [name for name, info in files.items() if change['id'] in info['changeIds']]
         del change['_created']
     run = secrets.token_hex(8)
     staging_new = ctx.staging_dir.with_name(ctx.staging_dir.name + '.new-' + run)
     staging_previous = ctx.staging_dir.with_name(ctx.staging_dir.name + '.previous-' + run)
     remove_stale_staging(ctx)
     staging_new.mkdir(parents=True)
-    leaves = {'roadmap': 'roadmap--' + Path(roadmap_path).name, 'sprint': 'sprint--' + Path(sprint_path).name}
-    (staging_new / leaves['roadmap']).write_bytes((roadmap_text or '').encode('utf-8'))
-    (staging_new / leaves['sprint']).write_bytes((sprint_text or '').encode('utf-8'))
+    # A sprint file that does not exist yet is staged empty; apply creates its folder and file.
+    leaves = {name: ('roadmap--' if name == 'roadmap' else f'sprint--{files[name]["sprint"]["sprintId"]}--') + Path(path).name
+              for name, path in resolved.items()}
+    for name, leaf in leaves.items():
+        (staging_new / leaf).write_bytes((texts[name] or '').encode('utf-8'))
     write_manifest(staging_new, {leaf: sha256(staging_new / leaf) for leaf in leaves.values()})
     if ctx.staging_dir.exists():
         os.replace(ctx.staging_dir, staging_previous)
     os.replace(staging_new, ctx.staging_dir)
     remove_tree(staging_previous)
+    plan_targets = {}
+    for name, path in resolved.items():
+        target = {'kind': 'roadmap' if name == 'roadmap' else 'sprint', 'path': path, 'exists': texts[name] is not None,
+                  'sha256': sha256(path), 'staged': str(ctx.staging_dir / leaves[name])}
+        if name != 'roadmap':
+            info = files[name]
+            target.update(sprintId=info['sprint']['sprintId'], title=info['sprint']['title'],
+                          startDate=info['sprint']['startDate'], endDate=info['sprint']['endDate'],
+                          createsFolder=not os.path.isdir(os.path.dirname(path)),
+                          template=None if texts[name] is not None else sprint_template(ctx, *info['dates']),
+                          changeIds=info['changeIds'], outOfLimitChangeIds=info['outOfLimitChangeIds'])
+        plan_targets[name] = target
     pending = [c['id'] for c in changes if not c['alreadyApplied']]
     start, end = paths['week']
     plan = {'schemaVersion': 1, 'project': ctx.name, 'markerNonceId': nonce_id(nonce), 'asOf': stamp, 'asOfSource': source,
-            'week': {'start': start.isoformat(), 'end': end.isoformat()}, 'maxSprintItems': ctx.max_sprint_items,
-            'targets': {
-                'roadmap': {'path': roadmap_path, 'exists': roadmap_text is not None, 'sha256': sha256(roadmap_path),
-                            'staged': str(ctx.staging_dir / leaves['roadmap'])},
-                'sprint': {'path': sprint_path, 'exists': sprint_text is not None, 'sha256': sha256(sprint_path),
-                           'staged': str(ctx.staging_dir / leaves['sprint'])}},
-            'pending': pending, 'changes': changes}
+            'stateAsOf': state['asOf'], 'week': {'start': start.isoformat(), 'end': end.isoformat()},
+            'maxSprintItems': state['maxSprintItems'] or ctx.max_sprint_items, 'sprints': sprints,
+            'targets': plan_targets, 'pending': pending, 'changes': changes}
     write_json_atomic(plan, ctx.plan_path)
     message = (f'{len(pending)} change(s) to apply; {len(changes) - len(pending)} already marked.' if pending
                else 'Every returned change is already marked in the files; run ack to acknowledge them.')
+    message += ''.join(notes)
     if minted:
         message += (' This run minted a new marker nonce, so no existing marker counts any more. If this project has synced '
                     'before, marker.json was lost: changes already written are offered again; check and decline duplicates.')
@@ -944,8 +1215,7 @@ def _apply(root, transport, no_ack, allow_shrink, confirm_declined, result):
     plan_ids = {c['id'] for c in plan['changes']}
     planned, seen = [], set()
     # Phase one decides everything and touches nothing; phase two only writes.
-    for name in ('roadmap', 'sprint'):
-        target = plan['targets'][name]
+    for name, target in plan['targets'].items():
         relative = relative_to_root(ctx, target['path'])
         path = safe_target(ctx.scrum_root, relative)
         require(path == target['path'], 'The stored plan does not match the configuration; run fetch again.')
@@ -974,10 +1244,18 @@ def _apply(root, transport, no_ack, allow_shrink, confirm_declined, result):
         invented = [i for i in staged_markers if i not in current_markers and i not in plan_ids]
         require(not invented, f'Refusing to write the {name} file: the staged copy carries a marker for {", ".join(invented)}, '
                               'which is not in this plan. Nothing was written. Copy markers from the plan only.')
+        # RoadS decides the sprint limit: a change that touches this sprint only through an item
+        # past the limit is written in the roadmap and reported, never into this sprint file.
+        over = [i for i in staged_markers if i not in current_markers and i in (target.get('outOfLimitChangeIds') or [])]
+        require(not over, f'Refusing to write the {name} file: the staged copy carries a marker for {", ".join(over)}, '
+                          'whose item is past the sprint limit (overLimit). Nothing was written. Write it in the roadmap only.')
         planned.append((name, target, path, relative, staged))
     written, backups = [], []
     try:
         for name, target, path, relative, staged in planned:
+            # Checked again before a missing folder is created, so mkdir cannot follow a junction
+            # that appeared after fetch, and again before the write.
+            safe_target(ctx.scrum_root, relative)
             Path(path).parent.mkdir(parents=True, exist_ok=True)
             safe_target(ctx.scrum_root, relative)
             replaced = os.path.isfile(path)

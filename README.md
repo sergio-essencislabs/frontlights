@@ -174,27 +174,41 @@ uma rota JSON de observações. Integrações ausentes são informadas explicita
 Toda sessão `/frontlights` começa perguntando se a sprint e o roadmap devem ser atualizados
 de acordo com o RoadS. Com a resposta "sim", o Frontlights:
 
-1. busca as mudanças que um Scrum Master fez no Roadmap do RoadS;
-2. escreve a prosa em cópias temporárias do `ROADMAP.md` do ano e do `SPRINT_*.md` da semana;
-3. mostra o diff para aprovação;
-4. grava, com backup ao lado de cada arquivo;
-5. confere as marcas ocultas de cada mudança;
-6. só então confirma ao RoadS.
+1. pede ao RoadS que sincronize o quadro (o mesmo "Sincronizar" do botão) e informa quantos
+   itens entraram e saíram. Se o RoadS sincronizou há menos de 30 s, só avisa. Se a
+   sincronização falhar, pergunta se você quer seguir com o último estado;
+2. lê o estado do roadmap (sprints, datas, itens e limite) e busca as mudanças que um Scrum
+   Master fez no Roadmap do RoadS. Sem esse estado, a sincronização para com um erro claro: não há
+   alternativa automática. Se a cópia do quadro no RoadS tiver mais de 24 h, ou nunca tiver sido
+   feita, você é avisado;
+3. escreve a prosa em cópias temporárias do `ROADMAP.md` do ano e do `SPRINT_*.md` de cada
+   sprint que tem mudança. A pasta e o arquivo de uma sprint nova são criados dentro do
+   `scrumRoot`, seguindo os títulos e as seções do `SPRINT_*.md` mais recente;
+4. mostra o diff para aprovação;
+5. grava, com backup ao lado de cada arquivo;
+6. confere as marcas ocultas de cada mudança;
+7. só então confirma ao RoadS.
+
+Quem decide o limite de itens por sprint é o RoadS: o Frontlights escreve na sprint só os itens
+dentro do limite e avisa, sem perguntar, quais ficaram de fora; as mudanças desses itens vão só
+para o roadmap.
 
 Quem escreve os arquivos é sempre esta máquina: o RoadS não alcança a pasta onde eles ficam.
 
 Configure o bloco `roadmapSync` no `.frontlights/config.json` do projeto (veja
 `examples/config.json`):
 
-- `endpoint` é a base `/api/frontlights` do RoadS, que responde `GET pending-changes` e
-  `POST ack`;
+- `endpoint` é a base `/api/frontlights` do RoadS, que responde `POST sync-board`,
+  `GET roadmap-state`, `GET pending-changes` e `POST ack`. A aprovação vale para essa base, com
+  o mesmo segredo para os quatro;
 - `secretEnvVar` nomeia a variável do segredo, que precisa começar por `FRONTLIGHTS_`. Defina o
   valor no seu próprio terminal, com
   `setx FRONTLIGHTS_API_SECRET "<valor emitido pelo RoadS>"`, e reinicie o Claude;
 - `scrumRoot` é a pasta onde ficam os arquivos, e aceita `%USERPROFILE%`;
-- `roadmapFile`, `weekFolderPattern` e `sprintFilePattern` montam os caminhos. `{yyyy}` vem da
-  segunda-feira da sprint. Em cada padrão, o primeiro `{dd_MM}` é a segunda e o seguinte, a sexta;
-- `maxSprintItems` limita a sprint a 4 itens;
+- `roadmapFile`, `weekFolderPattern` e `sprintFilePattern` montam os caminhos. As datas de
+  início e fim de cada sprint vêm do RoadS; o `ROADMAP.md` usa o ano da semana atual. `{yyyy}` vem
+  do início da sprint. Em cada padrão, o primeiro `{dd_MM}` é o início e o seguinte, o fim;
+- `maxSprintItems` é o limite local, usado só quando o RoadS não informa o dele (4);
 - `issueTargets` diz, para cada produto do RoadS, o repositório e o quadro onde a issue nasce.
   Produto sem destino não gera issue.
 

@@ -88,9 +88,9 @@ do plugin enquanto ele executa trabalho no projeto consumidor. Estrutura recomen
   roadmap-sync/
     approval.json    par (endereço, variável) aprovado pelo usuário
     marker.json      segredo local das marcas; nunca sai da máquina
-    plan.json        mudanças buscadas no RoadS, marcas e destinos
+    plan.json        mudanças buscadas no RoadS, sprints do roadmap-state (itens dentro e fora do limite), marcas e destinos
     state.json       último asOf confirmado
-    staging/         cópias temporárias do ROADMAP e do SPRINT
+    staging/         cópias temporárias do ROADMAP e do SPRINT de cada sprint com mudança (vazia para sprint nova)
   progress-report/
     approval.json    aprovação do bloco exato `roadmapSync.progress` (hash assinado com a chave do usuário)
   serve/<n>.json     pids e portas dos processos que o `serve start` subiu para a issue
@@ -108,6 +108,17 @@ config recusada e 3 infraestrutura. Toda falha vira pergunta por `AskUserQuestio
 navegador ou rede, o teste é registrado como não executado e não conta como aprovado. Os
 registros nunca trazem login nem senha: a conta aparece como `conta 1` ou `conta 2`. Um commit
 ou diff posterior torna essa evidência antiga.
+
+A sincronização do roadmap (`scripts/roadmap_sync.py`) segue esta ordem no `fetch`: `POST
+sync-board`, `GET roadmap-state` e `GET pending-changes`, todos sob o `endpoint` aprovado e com o
+mesmo segredo. Uma falha do `sync-board` não interrompe o `fetch`: o resultado a relata
+(`syncBoard`, `syncBoardFailed`) e a skill pergunta se segue com o último estado. Sem
+`roadmap-state` válido (endpoint ausente, `schemaVersion` diferente de 1, campo de tipo errado ou
+data inválida), o `fetch` é recusado sem alternativa automática. Cada sprint com mudança recebe o
+seu `SPRINT_*.md`, montado com as datas do RoadS; pasta e arquivo novos só são criados dentro do
+`scrumRoot`, sem junção nem link no caminho, e passam pelo mesmo diff e aprovação. Itens com
+`overLimit` ficam fora da sprint e são avisados; `snapshotStale` indica cópia do quadro com mais de
+24 h ou ausente. Marcas, backups, recusa de encolhimento e confirmação continuam como antes.
 
 O passo do resumo para a diretoria (`scripts/progress_report.py`) vem logo depois da pergunta do
 roadmap e só existe quando o bloco `roadmapSync.progress` está habilitado. A ordem é: `status`,

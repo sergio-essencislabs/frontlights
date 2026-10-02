@@ -1,6 +1,6 @@
 {
   "name": "frontlights",
-  "version": "0.13.1",
+  "version": "0.14.0",
   "author": {"name": "Sergio Mendes"},
   "description": "Guided discovery, approved PRDs, vertical GitHub issues and bounded delivery, right-sized to the request. RoadS is an optional input."
 }

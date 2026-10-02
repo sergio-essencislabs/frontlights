@@ -10,13 +10,19 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
 import roadmap_sync as rs
 
-FIXTURE = Path(__file__).resolve().parent / 'fixtures' / 'roadmap-sync' / 'pending-changes.json'
+FIXTURES = Path(__file__).resolve().parent / 'fixtures' / 'roadmap-sync'
+FIXTURE = FIXTURES / 'pending-changes.json'
 MONDAY = dt.date(2026, 9, 28)
 SECRET = 'fixture-secret-value'
+CURRENT = 'sprint:sprint-2026-09-28'
+NEXT = 'sprint:sprint-2026-10-05'
+ADD_ID = '7f1c2d3e-0000-4000-8000-000000000001'
+REMOVE_ID = '7f1c2d3e-0000-4000-8000-000000000003'
 
 
 class Transport:
-    """Records every request and answers from a queue of (status, body)."""
+    """Records every request and answers from a queue of (status, body); an exception in the
+    queue is raised instead, as the real transport does for a network error."""
 
     def __init__(self, *answers):
         self.answers = list(answers)
@@ -24,12 +30,30 @@ class Transport:
 
     def __call__(self, method, url, headers, body):
         self.calls.append({'method': method, 'url': url, 'headers': headers, 'body': body})
-        status, body_out = self.answers.pop(0) if self.answers else (200, '{"acked": 1}')
+        answer = self.answers.pop(0) if self.answers else (200, '{"acked": 1}')
+        if isinstance(answer, Exception):
+            raise answer
+        status, body_out = answer
         return status, body_out if isinstance(body_out, str) else json.dumps(body_out)
 
 
 def fixture():
     return json.loads(FIXTURE.read_text(encoding='utf-8'))
+
+
+def state_fixture():
+    return json.loads((FIXTURES / 'roadmap-state.json').read_text(encoding='utf-8'))
+
+
+def board_fixture():
+    return json.loads((FIXTURES / 'sync-board.json').read_text(encoding='utf-8'))
+
+
+def fetch_answers(payload=None, state=None, board=None):
+    """What one fetch reads, in order: sync-board, roadmap-state, pending-changes."""
+    return [board if isinstance(board, (tuple, Exception)) else (200, board if board is not None else board_fixture()),
+            state if isinstance(state, tuple) else (200, state if state is not None else state_fixture()),
+            (200, payload if payload is not None else fixture())]
 
 
 class RoadmapSyncTestCase(unittest.TestCase):
@@ -68,16 +92,17 @@ class RoadmapSyncTestCase(unittest.TestCase):
     def run_op(self, operation, transport=None, today=MONDAY, **kwargs):
         return rs.run(operation, str(self.project), today=today, transport=transport or Transport(), **kwargs)
 
-    def approve_and_fetch(self, payload=None, **kwargs):
+    def approve_and_fetch(self, payload=None, state=None, board=None, **kwargs):
         self.assertTrue(self.run_op('approve')['ok'])
-        transport = Transport((200, payload if payload is not None else fixture()))
+        transport = Transport(*fetch_answers(payload, state, board))
         result = self.run_op('fetch', transport, **kwargs)
         return result, transport
 
     def draft(self, plan, declined=(), skip=()):
-        """What the session does in step 4: append prose and paste each marker from the plan."""
-        for name in ('roadmap', 'sprint'):
-            staged = Path(plan['targets'][name]['staged'])
+        """What the session does in step 4: append prose and paste each marker from the plan, in the
+        roadmap for every change and in each sprint file for the changes it lists."""
+        for name, target in plan['targets'].items():
+            staged = Path(target['staged'])
             # Bytes, not text mode: write_text turns a CRLF draft into LF on Linux.
             text = staged.read_bytes().decode('utf-8')
             newline = '\r\n' if '\r\n' in text else '\n'
@@ -85,7 +110,7 @@ class RoadmapSyncTestCase(unittest.TestCase):
             for change in plan['changes']:
                 if change['id'] in skip or change['alreadyApplied']:
                     continue
-                if name == 'roadmap' or change['action'] == 'move_lane':
+                if name == 'roadmap' or change['id'] in target['changeIds']:
                     marker = change['declinedMarker'] if change['id'] in declined else change['marker']
                     added += f"\n## {change['item']['title']}\n\nProsa sobre a mudança. {marker}\n"
             staged.write_bytes((text + added.replace('\n', newline)).encode('utf-8'))
@@ -152,11 +177,16 @@ class FetchTests(RoadmapSyncTestCase):
     def test_fetch_sends_the_bearer_only_to_the_approved_path_and_builds_the_plan(self):
         result, transport = self.approve_and_fetch()
         self.assertTrue(result['ok'], result['message'])
-        call = transport.calls[0]
-        self.assertEqual(call['method'], 'GET')
-        self.assertEqual(call['url'], 'https://roads.example.test/api/frontlights/pending-changes')
-        self.assertEqual(call['headers']['Authorization'], f'Bearer {SECRET}')
+        base = 'https://roads.example.test/api/frontlights/'
+        self.assertEqual([(c['method'], c['url'], c['body']) for c in transport.calls],
+                         [('POST', base + 'sync-board', None), ('GET', base + 'roadmap-state', None),
+                          ('GET', base + 'pending-changes', None)])
+        for call in transport.calls:
+            self.assertEqual(call['headers']['Authorization'], f'Bearer {SECRET}')
         plan = result['plan']
+        self.assertEqual(list(plan['targets']), ['roadmap', CURRENT])
+        self.assertEqual(plan['targets'][CURRENT]['path'], str(self.sprint))
+        self.assertEqual(plan['targets']['roadmap']['path'], str(self.roadmap))
         self.assertEqual(plan['asOf'], '2026-09-28T12:00:00.000Z')
         self.assertEqual(plan['asOfSource'], 'server')
         self.assertEqual(len(plan['pending']), 4)
@@ -229,7 +259,7 @@ class FetchTests(RoadmapSyncTestCase):
         self.run_op('approve')
         for status, fragment in ((302, 'redirect'), (401, 'rejected the credential'), (500, 'HTTP 500')):
             with self.subTest(status=status):
-                result = self.run_op('fetch', Transport((status, '')))
+                result = self.run_op('fetch', Transport((status, ''), (status, ''), (status, '')))
                 self.assertFalse(result['ok'])
                 self.assertIn(fragment, result['message'])
                 self.assertNotIn(SECRET, rs.protect(json.dumps(result)))
@@ -242,11 +272,13 @@ class FetchTests(RoadmapSyncTestCase):
         result, _ = self.approve_and_fetch()
         staged = Path(result['plan']['targets']['roadmap']['staged'])
         staged.write_text(staged.read_text(encoding='utf-8') + '\nRascunho.\n', encoding='utf-8')
-        again = self.run_op('fetch', Transport((200, fixture())))
+        refused_transport = Transport(*fetch_answers())
+        again = self.run_op('fetch', refused_transport)
         self.assertFalse(again['ok'])
         self.assertIn('drafted prose', again['message'])
+        self.assertEqual(refused_transport.calls, [])
         self.assertIn('Rascunho.', staged.read_text(encoding='utf-8'))
-        discarded = self.run_op('fetch', Transport((200, fixture())), discard_staged=True)
+        discarded = self.run_op('fetch', Transport(*fetch_answers()), discard_staged=True)
         self.assertTrue(discarded['ok'])
         self.assertNotIn('Rascunho.', staged.read_text(encoding='utf-8'))
 
@@ -269,7 +301,7 @@ class ApplyTests(RoadmapSyncTestCase):
         state = json.loads((self.project / '.frontlights' / 'roadmap-sync' / 'state.json').read_text())
         self.assertEqual(state['lastAckAsOf'], '2026-09-28T12:00:00.000Z')
         # A second fetch of the same changes sees them as already applied.
-        second = self.run_op('fetch', Transport((200, fixture())))
+        second = self.run_op('fetch', Transport(*fetch_answers()))
         self.assertEqual(second['plan']['pending'], [])
 
     def test_missing_marker_writes_but_does_not_acknowledge_and_the_retry_works(self):
@@ -294,7 +326,7 @@ class ApplyTests(RoadmapSyncTestCase):
         written = self.roadmap.read_text(encoding='utf-8')
         payload = fixture()
         payload['changes'] = [dict(payload['changes'][0], id='7f1c2d3e-0000-4000-8000-0000000000ff')]
-        second = self.run_op('fetch', Transport((200, payload)))
+        second = self.run_op('fetch', Transport(*fetch_answers(payload)))
         staged = Path(second['plan']['targets']['roadmap']['staged'])
         staged.write_text('# Roadmap 2026\n', encoding='utf-8')
         shrink = self.run_op('apply')
@@ -313,7 +345,7 @@ class ApplyTests(RoadmapSyncTestCase):
         result, _ = self.approve_and_fetch()
         self.draft(result['plan'])
         nonce = json.loads((self.project / '.frontlights' / 'roadmap-sync' / 'marker.json').read_text())['nonce']
-        staged = Path(result['plan']['targets']['sprint']['staged'])
+        staged = Path(result['plan']['targets'][CURRENT]['staged'])
         staged.write_text(staged.read_text(encoding='utf-8') + rs.marker_text('outra-mudanca', nonce), encoding='utf-8')
         applied = self.run_op('apply')
         self.assertFalse(applied['ok'])
@@ -431,6 +463,265 @@ class PathAndMarkerTests(RoadmapSyncTestCase):
         self.assertEqual(len(rotated['rotatedMarkers']), 4)
         nonce = json.loads((self.project / '.frontlights' / 'roadmap-sync' / 'marker.json').read_text())['nonce']
         self.assertEqual(len(rs.marker_inventory(self.roadmap.read_text(encoding='utf-8'), nonce)), 4)
+
+
+class SyncBoardTests(RoadmapSyncTestCase):
+    def test_board_sync_runs_first_and_its_counts_are_reported(self):
+        result, transport = self.approve_and_fetch()
+        self.assertTrue(result['ok'], result['message'])
+        self.assertEqual(result['syncBoard'], {'ok': True, 'ran': True, 'syncedAt': '2026-09-28T11:59:00Z',
+                                               'added': 2, 'removed': 1, 'issuesCreated': 0})
+        self.assertFalse(result['syncBoardFailed'])
+        self.assertTrue(transport.calls[0]['url'].endswith('/sync-board'))
+
+    def test_cooldown_only_informs(self):
+        board = {'ok': True, 'ran': False, 'syncedAt': '2026-09-28T11:50:00Z',
+                 'roadmap': {'added': 0, 'removed': 0, 'issuesCreated': 0}}
+        result, _ = self.approve_and_fetch(board=board)
+        self.assertTrue(result['ok'], result['message'])
+        self.assertFalse(result['syncBoard']['ran'])
+        self.assertFalse(result['syncBoardFailed'])
+        self.assertIn('plan', result)
+
+    def test_a_failed_board_sync_does_not_abort_the_fetch(self):
+        failures = {
+            'refused': ({'ok': False, 'reason': 'no_access', 'message': 'Sem acesso ao quadro.'}, 'no_access'),
+            'unauthorized': ((401, {'error': 'unauthorized'}), 'request_failed'),
+            'server error': ((500, ''), 'request_failed'),
+            'network': (rs.Refusal('network error contacting RoadS (URLError)'), 'request_failed'),
+            'not json': ((200, 'oops'), 'invalid_response'),
+            'comment sequence': ({'ok': False, 'reason': 'error', 'message': 'x <!-- y'}, 'invalid_response'),
+        }
+        for label, (board, reason) in failures.items():
+            with self.subTest(label):
+                rs._SECRETS.clear()
+                result, transport = self.approve_and_fetch(board=board, discard_staged=True)
+                self.assertTrue(result['ok'], result['message'])
+                self.assertTrue(result['syncBoardFailed'])
+                self.assertFalse(result['syncBoard']['ok'])
+                self.assertEqual(result['syncBoard']['reason'], reason)
+                self.assertIn('ask the user', result['message'])
+                self.assertEqual(len(transport.calls), 3)
+                self.assertIn('plan', result)
+                self.assertNotIn(SECRET, rs.protect(json.dumps(result)))
+        self.assertIn('rejected the credential', self.approve_and_fetch(
+            board=(401, {'error': 'unauthorized'}), discard_staged=True)[0]['syncBoard']['message'])
+
+    def test_board_error_inside_a_successful_answer_is_reported(self):
+        board = board_fixture()
+        board['roadmap']['error'] = 'Falha ao ler o Project.'
+        result, _ = self.approve_and_fetch(board=board)
+        self.assertEqual(result['syncBoard']['error'], 'Falha ao ler o Project.')
+
+
+class RoadmapStateTests(RoadmapSyncTestCase):
+    def test_valid_state_is_exposed_per_sprint(self):
+        result, _ = self.approve_and_fetch()
+        self.assertTrue(result['ok'], result['message'])
+        plan = result['plan']
+        self.assertEqual(plan['maxSprintItems'], 4)
+        self.assertEqual(plan['stateAsOf'], '2026-09-28T12:00:00Z')
+        sprints = {s['sprintId']: s for s in plan['sprints']}
+        current = sprints['sprint-2026-09-28']
+        self.assertEqual((current['startDate'], current['endDate'], current['target']), ('2026-09-28', '2026-10-02', CURRENT))
+        self.assertEqual([i['position'] for i in current['items']], [1, 2, 3])
+        self.assertEqual(current['outOfLimit'], [])
+        self.assertIsNone(sprints['sprint-2026-10-05']['target'])
+        self.assertEqual(plan['targets'][CURRENT]['changeIds'],
+                         ['7f1c2d3e-0000-4000-8000-000000000002', '7f1c2d3e-0000-4000-8000-000000000004'])
+        by_id = {c['id']: c for c in plan['changes']}
+        self.assertEqual(by_id['7f1c2d3e-0000-4000-8000-000000000004']['sprintTargets'], [CURRENT])
+        self.assertEqual(by_id[ADD_ID]['sprintTargets'], [])
+        self.assertFalse(result['snapshotStale'])
+
+    def test_unknown_schema_version_is_refused(self):
+        for version in (2, '1', True, None):
+            with self.subTest(version=version):
+                state = state_fixture()
+                state['schemaVersion'] = version
+                result, transport = self.approve_and_fetch(state=state)
+                self.assertFalse(result['ok'])
+                self.assertIn('schemaVersion', result['message'])
+                self.assertEqual(len(transport.calls), 2)
+                self.assertFalse((self.project / '.frontlights' / 'roadmap-sync' / 'plan.json').exists())
+
+    def test_invalid_dates_are_refused(self):
+        for start, end in (('2026-13-01', '2026-13-05'), ('28/09/2026', '02/10/2026'), ('2026-09-28', '2026-09-27'),
+                           ('2026-09-28T00:00:00Z', '2026-10-02'), (None, '2026-10-02')):
+            with self.subTest(start=start, end=end):
+                state = state_fixture()
+                state['sprints'][0].update(startDate=start, endDate=end)
+                result, _ = self.approve_and_fetch(state=state)
+                self.assertFalse(result['ok'])
+                self.assertIn('roadmap-state', result['message'])
+
+    def test_fields_of_the_wrong_type_are_refused(self):
+        mutations = {
+            'sprints not a list': lambda s: s.update(sprints={}),
+            'items not a list': lambda s: s['sprints'][0].update(items=None),
+            'position as text': lambda s: s['sprints'][0]['items'][0].update(position='1'),
+            'position zero': lambda s: s['sprints'][0]['items'][0].update(position=0),
+            'overLimit as text': lambda s: s['sprints'][0]['items'][0].update(overLimit='false'),
+            'overLimit missing': lambda s: s['sprints'][0]['items'][0].pop('overLimit'),
+            'done as number': lambda s: s['sprints'][0]['items'][0].update(done=0),
+            'pendingChangeIds as text': lambda s: s['sprints'][0]['items'][0].update(pendingChangeIds='x'),
+            'pending id unusable': lambda s: s['sprints'][0]['items'][0].update(pendingChangeIds=['../x']),
+            'title as number': lambda s: s['sprints'][0]['items'][0].update(title=5),
+            'unknown status': lambda s: s['sprints'][0]['items'][0].update(status='archived'),
+            'issueNumber as text': lambda s: s['sprints'][0]['items'][0].update(issueNumber='12'),
+            'bad updatedAt': lambda s: s['sprints'][0]['items'][0].update(updatedAt='ontem'),
+            'bad asOf': lambda s: s.update(asOf='agora'),
+            'bad snapshotSyncedAt': lambda s: s.update(snapshotSyncedAt=12),
+            'maxSprintItems as text': lambda s: s.update(maxSprintItems='4'),
+            'duplicate sprint': lambda s: s['sprints'].append(dict(s['sprints'][0])),
+            'removedPending not a list': lambda s: s.update(removedPending={}),
+            'comment sequence': lambda s: s['sprints'][0].update(title='a <!-- b'),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label):
+                state = state_fixture()
+                mutate(state)
+                result, _ = self.approve_and_fetch(state=state)
+                self.assertFalse(result['ok'], label)
+                self.assertFalse((self.project / '.frontlights' / 'roadmap-sync' / 'plan.json').exists())
+
+    def test_missing_roadmap_state_is_refused_without_fallback(self):
+        for answer in ((404, '{"error":"not_found"}'), (500, ''), (200, 'not json')):
+            with self.subTest(answer=answer):
+                result, transport = self.approve_and_fetch(state=answer)
+                self.assertFalse(result['ok'])
+                self.assertIn('roadmap-state', result['message'])
+                self.assertIn('no fallback', result['message'])
+                self.assertEqual([c['url'].rsplit('/', 1)[1] for c in transport.calls], ['sync-board', 'roadmap-state'])
+                self.assertIn('syncBoard', result)
+                self.assertFalse((self.project / '.frontlights' / 'roadmap-sync' / 'plan.json').exists())
+
+    def test_snapshot_older_than_a_day_or_missing_is_stale(self):
+        for synced, stale in ((None, True), ('2026-09-27T11:59:59Z', True), ('2026-09-27T12:00:00Z', False),
+                              ('2026-09-28T11:55:00Z', False)):
+            with self.subTest(synced=synced):
+                state = state_fixture()
+                state['snapshotSyncedAt'] = synced
+                result, _ = self.approve_and_fetch(state=state, discard_staged=True)
+                self.assertTrue(result['ok'], result['message'])
+                self.assertIs(result['snapshotStale'], stale)
+                self.assertEqual(result['snapshotSyncedAt'], synced)
+                if stale:
+                    self.assertIn('snapshot', result['message'])
+
+    def test_snapshot_is_reported_even_when_nothing_is_pending(self):
+        state = state_fixture()
+        state['snapshotSyncedAt'] = None
+        result, _ = self.approve_and_fetch({'asOf': None, 'changes': []}, state=state)
+        self.assertEqual(result['pending'], 0)
+        self.assertTrue(result['snapshotStale'])
+        self.assertIn('syncBoard', result)
+
+
+class SprintTargetTests(RoadmapSyncTestCase):
+    def next_sprint_state(self):
+        state = state_fixture()
+        state['sprints'][1]['items'][0]['pendingChangeIds'] = [ADD_ID]
+        return state
+
+    def test_a_new_sprint_gets_a_new_folder_and_file_inside_the_scrum_root(self):
+        result, _ = self.approve_and_fetch(state=self.next_sprint_state())
+        self.assertTrue(result['ok'], result['message'])
+        plan = result['plan']
+        target = plan['targets'][NEXT]
+        expected = self.scrum / '2026' / '05_10' / 'SPRINT_05_10_a_09_10.md'
+        self.assertEqual(target['path'], str(expected))
+        self.assertEqual((target['exists'], target['createsFolder']), (False, True))
+        self.assertEqual(target['template'], str(self.sprint))
+        self.assertEqual(target['changeIds'], [ADD_ID])
+        self.assertEqual(Path(target['staged']).read_bytes(), b'')
+        self.assertFalse(expected.parent.exists())
+        self.draft(plan)
+        applied = self.run_op('apply', Transport((200, {'acked': 4})))
+        self.assertTrue(applied['ok'], applied['message'])
+        self.assertIn(str(expected), applied['written'])
+        self.assertIn(plan['changes'][0]['marker'], expected.read_text(encoding='utf-8'))
+
+    def test_template_is_null_without_an_earlier_sprint_file(self):
+        self.sprint.unlink()
+        result, _ = self.approve_and_fetch(state=self.next_sprint_state())
+        self.assertIsNone(result['plan']['targets'][NEXT]['template'])
+        self.assertFalse(result['plan']['targets'][CURRENT]['exists'])
+
+    def test_a_sprint_path_outside_the_scrum_root_is_refused(self):
+        self.write_config(weekFolderPattern='../fora_{dd_MM}')
+        result, _ = self.approve_and_fetch(state=self.next_sprint_state())
+        self.assertFalse(result['ok'])
+        self.assertFalse((self.scrum.parent / 'fora_05_10').exists())
+        self.assertFalse((self.project / '.frontlights' / 'roadmap-sync' / 'plan.json').exists())
+
+    def test_a_junction_on_the_way_to_a_new_sprint_is_refused(self):
+        outside = self.scrum.parent / 'outside'
+        outside.mkdir()
+        link = self.scrum / '2026' / '05_10'
+        if sys.platform.startswith('win'):
+            import subprocess
+            made = subprocess.run(['cmd', '/c', 'mklink', '/J', str(link), str(outside)], capture_output=True)
+            if made.returncode != 0:
+                self.skipTest('cannot create a junction here')
+        else:
+            os.symlink(outside, link, target_is_directory=True)
+        result, _ = self.approve_and_fetch(state=self.next_sprint_state())
+        self.assertFalse(result['ok'])
+        self.assertIn('reparse point', result['message'])
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_a_removal_from_a_sprint_lane_targets_that_sprint(self):
+        state = state_fixture()
+        state['removedPending'][0]['laneId'] = 'atual'
+        result, _ = self.approve_and_fetch(state=state)
+        self.assertIn(REMOVE_ID, result['plan']['targets'][CURRENT]['changeIds'])
+
+    def test_two_sprints_on_the_same_file_are_refused(self):
+        self.write_config(weekFolderPattern='{yyyy}/fixa', sprintFilePattern='SPRINT.md')
+        result, _ = self.approve_and_fetch(state=self.next_sprint_state())
+        self.assertFalse(result['ok'])
+        self.assertIn('same', result['message'])
+
+
+class OverLimitTests(RoadmapSyncTestCase):
+    def over_limit_state(self):
+        state = state_fixture()
+        items = state['sprints'][0]['items']
+        items.append(dict(items[2], id='5a5a5a5a-0000-4000-8000-00000000000f', position=4, title='Quarto item'))
+        items.append(dict(items[2], id='5a5a5a5a-0000-4000-8000-00000000000a', position=5, title='Exportar em CSV',
+                          overLimit=True, pendingChangeIds=[ADD_ID]))
+        return state
+
+    def test_an_over_limit_item_is_listed_as_left_out_and_not_written(self):
+        result, _ = self.approve_and_fetch(state=self.over_limit_state())
+        self.assertTrue(result['ok'], result['message'])
+        plan = result['plan']
+        current = next(s for s in plan['sprints'] if s['sprintId'] == 'sprint-2026-09-28')
+        self.assertEqual([i['position'] for i in current['items']], [1, 2, 3, 4])
+        self.assertEqual([(i['position'], i['title']) for i in current['outOfLimit']], [(5, 'Exportar em CSV')])
+        self.assertNotIn(ADD_ID, plan['targets'][CURRENT]['changeIds'])
+        self.assertEqual(plan['targets'][CURRENT]['outOfLimitChangeIds'], [ADD_ID])
+        self.assertEqual(next(c for c in plan['changes'] if c['id'] == ADD_ID)['sprintTargets'], [])
+        self.assertIn('outside the sprint limit', result['message'])
+
+    def test_a_marker_for_an_over_limit_change_in_that_sprint_file_is_refused(self):
+        result, _ = self.approve_and_fetch(state=self.over_limit_state())
+        plan = result['plan']
+        self.draft(plan)
+        staged = Path(plan['targets'][CURRENT]['staged'])
+        marker = next(c for c in plan['changes'] if c['id'] == ADD_ID)['marker']
+        staged.write_text(staged.read_text(encoding='utf-8') + f'\nFora do limite. {marker}\n', encoding='utf-8')
+        applied = self.run_op('apply')
+        self.assertFalse(applied['ok'])
+        self.assertIn('limit', applied['message'])
+        self.assertEqual(applied['written'], [])
+
+    def test_the_service_limit_wins_over_the_configuration(self):
+        state = state_fixture()
+        state['maxSprintItems'] = 3
+        result, _ = self.approve_and_fetch(state=state)
+        self.assertEqual(result['plan']['maxSprintItems'], 3)
 
 
 if __name__ == '__main__':

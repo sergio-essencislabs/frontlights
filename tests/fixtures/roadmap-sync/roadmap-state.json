@@ -1,0 +1,101 @@
+{
+  "schemaVersion": 1,
+  "asOf": "2026-09-28T12:00:00Z",
+  "snapshotSyncedAt": "2026-09-28T11:55:00Z",
+  "maxSprintItems": 4,
+  "timezone": "America/Sao_Paulo",
+  "sprints": [
+    {
+      "sprintId": "sprint-2026-09-28",
+      "laneId": "atual",
+      "title": "Sprint da semana",
+      "startDate": "2026-09-28",
+      "endDate": "2026-10-02",
+      "items": [
+        {
+          "id": "5a5a5a5a-0000-4000-8000-00000000000b",
+          "position": 1,
+          "title": "Proteger a página de login",
+          "description": "Limitar tentativas que falham.",
+          "produto": "Example Product",
+          "prioridade": "Medium",
+          "effort": "Very High",
+          "githubIssueUrl": "https://github.com/OWNER/REPOSITORY/issues/12",
+          "issueNumber": 12,
+          "status": "development",
+          "done": false,
+          "overLimit": false,
+          "updatedAt": "2026-09-28T10:30:00Z",
+          "pendingChangeIds": ["7f1c2d3e-0000-4000-8000-000000000002"]
+        },
+        {
+          "id": "5a5a5a5a-0000-4000-8000-00000000000d",
+          "position": 2,
+          "title": "Tela de lotes de amostras",
+          "description": "Listar os lotes de amostras por conta.",
+          "produto": "Other Product",
+          "prioridade": "Low",
+          "effort": null,
+          "githubIssueUrl": "https://github.com/OWNER/OTHER/issues/3",
+          "issueNumber": 3,
+          "status": "open",
+          "done": false,
+          "overLimit": false,
+          "updatedAt": "2026-09-28T11:30:00Z",
+          "pendingChangeIds": ["7f1c2d3e-0000-4000-8000-000000000004"]
+        },
+        {
+          "id": "5a5a5a5a-0000-4000-8000-00000000000e",
+          "position": 3,
+          "title": "Item sem mudança",
+          "description": null,
+          "produto": "Example Product",
+          "prioridade": "Low",
+          "effort": "Low",
+          "githubIssueUrl": null,
+          "issueNumber": null,
+          "status": "none",
+          "done": false,
+          "overLimit": false,
+          "updatedAt": null,
+          "pendingChangeIds": []
+        }
+      ]
+    },
+    {
+      "sprintId": "sprint-2026-10-05",
+      "laneId": "proxima",
+      "title": "Próxima sprint",
+      "startDate": "2026-10-05",
+      "endDate": "2026-10-09",
+      "items": [
+        {
+          "id": "5a5a5a5a-0000-4000-8000-00000000000a",
+          "position": 1,
+          "title": "Exportar o relatório de amostras em CSV",
+          "description": "Usuários baixam o relatório de amostras em CSV.",
+          "produto": "Example Product",
+          "prioridade": "High",
+          "effort": "Medium",
+          "githubIssueUrl": null,
+          "issueNumber": null,
+          "status": "none",
+          "done": false,
+          "overLimit": false,
+          "updatedAt": "2026-09-28T10:05:00Z",
+          "pendingChangeIds": []
+        }
+      ]
+    }
+  ],
+  "groups": [
+    {
+      "laneId": "g1",
+      "title": "Grupo de exemplo",
+      "items": []
+    }
+  ],
+  "removedPending": [
+    {"changeId": "7f1c2d3e-0000-4000-8000-000000000003", "itemId": null, "title": "Relatório antigo em PDF", "laneId": "g1"}
+  ]
+}

@@ -646,8 +646,8 @@ class PluginContractTests(unittest.TestCase):
         plugin = json.loads(self.read('.claude-plugin', 'plugin.json'))
         market = json.loads(self.read('.claude-plugin', 'marketplace.json'))
         entry = next(p for p in market['plugins'] if p['name'] == plugin['name'])
-        self.assertEqual(plugin['version'], '0.13.1')
-        self.assertEqual(entry['version'], '0.13.1')
+        self.assertEqual(plugin['version'], '0.14.0')
+        self.assertEqual(entry['version'], '0.14.0')
 
     def test_docs_describe_the_approval(self):
         self.assertIn('progress_report.py', self.read('README.md'))
